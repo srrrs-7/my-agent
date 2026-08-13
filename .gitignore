@@ -1,0 +1,21 @@
+/target
+target/
+**/*.rs.bk
+*.pdb
+
+# secrets / local config
+.env
+.env.*
+!.env.example
+
+# per-developer Claude Code overrides (the shared policy lives in .claude/settings.json)
+.claude/settings.local.json
+
+# editor / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# agent runtime artifacts
+/.agent/

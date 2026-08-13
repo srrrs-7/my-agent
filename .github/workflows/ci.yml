@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The same container the developers use, so "works on my machine" and
+      # "works in CI" are the same machine.
+      - name: Build the dev image
+        run: make image
+
+      - name: Format, lint and test
+        run: make check
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    # Advisory: a new CVE in a transitive dependency should not block a PR that
+    # did not introduce it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the dev image
+        run: make image
+      - name: cargo audit
+        run: make audit

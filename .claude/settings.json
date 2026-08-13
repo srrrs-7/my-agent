@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(make help)",
+      "Bash(make check)",
+      "Bash(make test)",
+      "Bash(make lint)",
+      "Bash(make fmt)",
+      "Bash(make fmt-check)",
+      "Bash(make build)",
+      "Bash(make release)",
+      "Bash(make tools)",
+      "Bash(make deps)",
+      "Bash(make image)",
+      "Bash(make env)",
+      "Bash(make cargo)",
+      "Bash(date)",
+      "Bash(git status)",
+      "Bash(git diff)",
+      "Bash(git mv management/issues/)",
+      "Bash(git log)",
+      "Bash(git show)",
+      "Bash(git branch)",
+      "Bash(rg)",
+      "Bash(grep)",
+      "Bash(find)",
+      "Bash(ls)",
+      "Bash(wc)"
+    ],
+    "deny": [
+      "Bash(cargo)",
+      "Bash(rustc)",
+      "Bash(rustup)",
+      "Read(./.env)"
+    ]
+  }
+}

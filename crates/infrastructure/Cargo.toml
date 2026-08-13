@@ -1,0 +1,27 @@
+[package]
+name = "agent-infrastructure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Adapter layer: HTTP LLM clients, the sandboxed filesystem, configuration and telemetry."
+
+[dependencies]
+agent-domain = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+agent-test-support = { workspace = true }
+tempfile = "3"

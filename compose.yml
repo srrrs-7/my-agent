@@ -1,0 +1,73 @@
+name: my-agent
+
+# ---------------------------------------------------------------------------
+# Shared definition for every container that runs the Rust toolchain.
+# All development runtime operations happen in here, never on the host.
+# ---------------------------------------------------------------------------
+x-dev: &dev
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    target: dev
+    args:
+      UID: ${UID:-1000}
+      GID: ${GID:-1000}
+  image: my-agent-dev:local
+  user: "${UID:-1000}:${GID:-1000}"
+  working_dir: /workspace
+  init: true
+  volumes:
+    # source tree (the agent's sandbox root)
+    - .:/workspace
+    # build + dependency caches: named volumes keep them out of the bind mount
+    # (much faster on macOS) and out of the host filesystem entirely.
+    - cargo-registry:/usr/local/cargo/registry
+    - cargo-git:/usr/local/cargo/git
+    - cargo-target:/target
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    CARGO_TARGET_DIR: /target
+    RUST_BACKTRACE: ${RUST_BACKTRACE:-0}
+    RUST_LOG: ${RUST_LOG:-warn}
+    AGENT_WORKSPACE: ${AGENT_WORKSPACE:-/workspace}
+  extra_hosts:
+    # lets the container reach an Ollama / LM Studio running on the host
+    - "host.docker.internal:host-gateway"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  # `make sh`, `make build`, `make test`, ... all run here.
+  dev:
+    <<: *dev
+
+  # `make run` / `make ask` - runs the agent itself.
+  app:
+    <<: *dev
+    stdin_open: true
+    tty: true
+    entrypoint: ["cargo", "run", "--quiet", "--bin", "agent", "--"]
+
+  # Optional local LLM. Start with: make ollama-up
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  ollama:

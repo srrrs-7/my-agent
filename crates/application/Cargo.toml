@@ -1,0 +1,21 @@
+[package]
+name = "agent-application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Use-case layer: the agent loop, context assembly and the tool implementations."
+
+[dependencies]
+agent-domain = { workspace = true }
+
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,12 @@
+.git
+target
+**/target
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea
+.vscode
+docs
+*.md
+!README.md
