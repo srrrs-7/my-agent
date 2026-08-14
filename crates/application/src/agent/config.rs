@@ -23,6 +23,17 @@ pub struct AgentLoopConfig {
     /// Messages at the tail that trimming may never drop.
     pub keep_recent_messages: usize,
 
+    /// Fold the oldest turns into an LLM-written summary before falling back to
+    /// dropping them. Costs one extra request, and only when the history would
+    /// otherwise lose content - see [`super::compaction`].
+    pub compact: bool,
+
+    /// Messages left verbatim after a compaction. Larger than
+    /// [`Self::keep_recent_messages`] on purpose: that one is a floor trimming
+    /// must not cross, this one is how much recent conversation is worth
+    /// keeping in its original words once the rest is a summary.
+    pub compact_keep_recent: usize,
+
     /// Run read-only tool calls of the same turn concurrently. Mutating calls
     /// always run sequentially, in the order the model asked for them.
     pub parallel_read_only_tools: bool,
@@ -49,6 +60,8 @@ impl Default for AgentLoopConfig {
             max_tool_output_bytes: 32 * 1024,
             max_history_bytes: 256 * 1024,
             keep_recent_messages: 6,
+            compact: true,
+            compact_keep_recent: 12,
             parallel_read_only_tools: true,
             stream: true,
         }

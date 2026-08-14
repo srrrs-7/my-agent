@@ -18,6 +18,7 @@ use agent_application::tools::ToolRegistry;
 use agent_application::tools::file::{ReadFileTool, WriteFileTool};
 use agent_domain::error::ApprovalError;
 use agent_domain::model::llm::{ModelId, ProviderId};
+use agent_domain::model::message::Message;
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 use agent_domain::ports::events::{FinishReason, NullEventSink};
@@ -63,7 +64,28 @@ impl Fixture {
         Self::build(responses, false, prompt).await
     }
 
+    async fn with_config(responses: Vec<Response>, config: AgentLoopConfig) -> Self {
+        Self::assemble(responses, Arc::new(DefaultPromptBuilder), config).await
+    }
+
     async fn build(responses: Vec<Response>, stream: bool, prompt: Arc<dyn PromptBuilder>) -> Self {
+        Self::assemble(
+            responses,
+            prompt,
+            AgentLoopConfig {
+                max_iterations: 5,
+                stream,
+                ..AgentLoopConfig::default()
+            },
+        )
+        .await
+    }
+
+    async fn assemble(
+        responses: Vec<Response>,
+        prompt: Arc<dyn PromptBuilder>,
+        config: AgentLoopConfig,
+    ) -> Self {
         let workspace = tempfile::tempdir().unwrap();
         let server = MockLlmServer::start(responses).await;
         let root = Arc::new(WorkspaceRoot::new(workspace.path().to_path_buf()).unwrap());
@@ -102,11 +124,7 @@ impl Fixture {
                 context: Arc::new(WorkspaceContextProvider::new(root)),
                 prompt,
             },
-            AgentLoopConfig {
-                max_iterations: 5,
-                stream,
-                ..AgentLoopConfig::default()
-            },
+            config,
         );
 
         Self {
@@ -391,5 +409,102 @@ async fn a_replaced_system_prompt_is_sent_verbatim_and_tools_still_work() {
     assert!(
         tool_result(&requests[1], "call_1").contains("secret"),
         "the tool actually executed against the real filesystem"
+    );
+}
+
+/// What a compaction actually puts on the wire.
+///
+/// Every other test of this feature stops at the port. This one is the only
+/// place the summarisation request is serialised by a real provider and read
+/// back as JSON - which is where the claim "this request works on every
+/// backend" either holds or does not. It is also the request that runs when
+/// the session is already in trouble, so it is the worst one to get wrong.
+#[tokio::test]
+async fn a_compaction_reaches_the_provider_as_a_toolless_single_message_request() {
+    let fixture = Fixture::with_config(
+        vec![
+            Response::assistant_text("RECORD OF THE SESSION"),
+            Response::assistant_text("carrying on"),
+        ],
+        AgentLoopConfig {
+            max_iterations: 3,
+            // Small enough that the seeded history below overflows it.
+            max_history_bytes: 4 * 1024,
+            compact: true,
+            compact_keep_recent: 2,
+            // The canned replies are plain JSON. Note that this only affects
+            // the ordinary turn: a summary is never streamed, since nobody is
+            // watching it being written.
+            stream: false,
+            ..AgentLoopConfig::default()
+        },
+    )
+    .await;
+
+    let mut session = Session::new("compaction-e2e");
+    session
+        .conversation
+        .push(Message::user("write a parser, and keep it dependency-free"));
+    for turn in 0..4 {
+        session
+            .conversation
+            .push(Message::assistant_text("x".repeat(2_000)));
+        session
+            .conversation
+            .push(Message::user(format!("note {turn}")));
+    }
+
+    let outcome = fixture.agent.run(&mut session, "carry on").await.unwrap();
+    assert_eq!(outcome.final_text, "carrying on");
+
+    let requests = fixture.server.json_requests().await;
+    assert_eq!(requests.len(), 2, "one summary, then the turn itself");
+
+    let summary = &requests[0];
+    let messages = summary["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages.len(),
+        2,
+        "a system prompt and exactly one user message: {summary}"
+    );
+    assert_eq!(messages[0]["role"], "system");
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Every user message"),
+        "the summariser instructions must reach the model: {summary}"
+    );
+    assert_eq!(messages[1]["role"], "user");
+    assert!(
+        messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("write a parser, and keep it dependency-free"),
+        "what the user asked for must be in the transcript: {summary}"
+    );
+    assert!(
+        summary.get("tools").is_none(),
+        "a summary request must not carry tool definitions: {summary}"
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.get("tool_calls").is_some()),
+        "no tool_call blocks may ride along on a toolless request: {summary}"
+    );
+
+    // ...and the turn that follows must be built on the summary.
+    let turn = &requests[1];
+    let first = turn["messages"][1]["content"].as_str().unwrap();
+    assert!(
+        first.contains("RECORD OF THE SESSION"),
+        "the model's next turn must open with the summary: {first}"
+    );
+    assert!(
+        turn["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "the ordinary turn still advertises tools"
     );
 }

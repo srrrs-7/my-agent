@@ -15,10 +15,11 @@ use agent_application::tools::file::{ReadFileTool, WriteFileTool};
 use agent_domain::error::{ApprovalError, FsError, LlmError};
 use agent_domain::model::context::ContextSnapshot;
 use agent_domain::model::llm::{
-    ChatRequest, ChatResponse, ModelId, ProviderCapabilities, ProviderId, StopReason, TokenUsage,
+    ChatRequest, ChatResponse, ModelId, ProviderCapabilities, ProviderId, StopReason, TaskKind,
+    TokenUsage,
 };
-use agent_domain::model::message::{ContentBlock, Message};
-use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName};
+use agent_domain::model::message::{ContentBlock, Message, Role};
+use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName, ToolResult};
 use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 use agent_domain::ports::context::ContextProvider;
@@ -225,6 +226,25 @@ fn loop_with(
     events: Arc<dyn EventSink>,
     max_iterations: u32,
 ) -> AgentLoop {
+    loop_with_config(
+        provider,
+        tools,
+        approval,
+        events,
+        AgentLoopConfig {
+            max_iterations,
+            ..AgentLoopConfig::default()
+        },
+    )
+}
+
+fn loop_with_config(
+    provider: Arc<dyn LlmProvider>,
+    tools: Arc<ToolRegistry>,
+    approval: Arc<dyn ApprovalGate>,
+    events: Arc<dyn EventSink>,
+    config: AgentLoopConfig,
+) -> AgentLoop {
     AgentLoop::new(
         AgentDependencies {
             llm: provider,
@@ -234,10 +254,7 @@ fn loop_with(
             context: Arc::new(FakeContext),
             prompt: Arc::new(DefaultPromptBuilder),
         },
-        AgentLoopConfig {
-            max_iterations,
-            ..AgentLoopConfig::default()
-        },
+        config,
     )
 }
 
@@ -856,4 +873,278 @@ async fn web_fetch_is_denied_under_a_denying_gate_without_running() {
             )
         });
     assert!(denied, "the denial must be reported back to the model");
+}
+
+// --- history compaction ------------------------------------------------------
+
+/// Answers ordinary turns from a script but refuses to summarise.
+///
+/// The fallback exists for exactly this: the compaction request is an extra
+/// call that can fail on its own (a rate limit, a model with no spare context),
+/// and a failure there must not take the turn down with it.
+struct RefusesToSummarize(Arc<ScriptedProvider>);
+
+#[async_trait]
+impl LlmProvider for RefusesToSummarize {
+    fn id(&self) -> ProviderId {
+        self.0.id()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.0.capabilities()
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
+        if request.metadata.task_kind == TaskKind::Summarize {
+            return Err(LlmError::InvalidResponse("no summary for you".into()));
+        }
+        self.0.chat(request).await
+    }
+}
+
+/// A history well past any small budget, ending on a complete tool turn.
+fn crowded_session(id: &str) -> Session {
+    let mut session = Session::new(id);
+    session
+        .conversation
+        .push(Message::user("build a parser, and keep it dependency-free"));
+    for turn in 0..6 {
+        let call = ToolCall::new(
+            ToolCallId::new(format!("c{turn}")),
+            ToolName::new("read_file").unwrap(),
+            json!({"path": format!("src/{turn}.rs")}),
+        );
+        session
+            .conversation
+            .push(Message::assistant(vec![ContentBlock::ToolCall(
+                call.clone(),
+            )]));
+        session
+            .conversation
+            .push(Message::tool_results(vec![ToolResult::ok(
+                &call,
+                "x".repeat(4_000),
+            )]));
+    }
+    session
+}
+
+fn compacting_config(max_history_bytes: usize) -> AgentLoopConfig {
+    AgentLoopConfig {
+        max_iterations: 3,
+        max_history_bytes,
+        compact: true,
+        compact_keep_recent: 2,
+        ..AgentLoopConfig::default()
+    }
+}
+
+/// Tool results in `messages` whose call is nowhere to be found.
+///
+/// This is invariant §4 seen from the provider's side: it is what makes a
+/// request get rejected outright, so it is worth checking on the bytes that
+/// would actually be sent rather than on the conversation that produced them.
+fn orphaned_results(messages: &[Message]) -> Vec<String> {
+    let calls: std::collections::HashSet<&str> = messages
+        .iter()
+        .flat_map(Message::tool_calls)
+        .map(|call| call.id.as_str())
+        .collect();
+
+    messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult(result) => Some(result.call_id.as_str()),
+            _ => None,
+        })
+        .filter(|id| !calls.contains(id))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn an_overflowing_history_is_folded_into_a_summary_instead_of_being_dropped() {
+    let provider = ScriptedProvider::new(vec![assistant("RECORD OF THE SESSION"), assistant("ok")]);
+    let events = Arc::new(RecordingSink::default());
+    let agent = loop_with_config(
+        provider.clone(),
+        registry(MemoryFileSystem::default().into()),
+        Arc::new(AlwaysApprove),
+        events.clone(),
+        compacting_config(8 * 1024),
+    );
+
+    let mut session = crowded_session("c1");
+    agent.run(&mut session, "carry on").await.unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].metadata.task_kind,
+        TaskKind::Summarize,
+        "the first call must be the summary, before the turn itself"
+    );
+    assert!(
+        requests[0].tools.is_empty(),
+        "a summary request advertises no tools"
+    );
+
+    let turn = &requests[1];
+    assert_eq!(
+        turn.metadata.task_kind,
+        TaskKind::Agentic,
+        "the turn itself is not a summary"
+    );
+    assert!(
+        turn.messages[0].text().contains("RECORD OF THE SESSION"),
+        "the summary must be what the model now sees first: {:?}",
+        turn.messages[0].text()
+    );
+
+    let compacted = events
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event, AgentEvent::HistoryCompacted { .. }));
+    assert!(compacted, "the user must be told the history was compacted");
+}
+
+#[tokio::test]
+async fn a_compacted_history_is_still_well_formed() {
+    // `compact_keep_recent: 3` leaves a complete tool turn in the tail, so the
+    // pairing check below has something to be wrong about. With a smaller tail
+    // the whole history folds away and the check would pass on an empty set.
+    let provider = ScriptedProvider::new(vec![assistant("RECORD"), assistant("ok")]);
+    let agent = loop_with_config(
+        provider.clone(),
+        registry(MemoryFileSystem::default().into()),
+        Arc::new(AlwaysApprove),
+        Arc::new(NullEventSink),
+        AgentLoopConfig {
+            // 4 puts the requested cut squarely on a tool result *and* leaves a
+            // complete tool turn in the tail, so this exercises both boundary
+            // rules and still has a pair left to check.
+            compact_keep_recent: 4,
+            ..compacting_config(8 * 1024)
+        },
+    );
+
+    let mut session = crowded_session("c2");
+    agent.run(&mut session, "carry on").await.unwrap();
+
+    let sent = &provider.requests()[1].messages;
+    assert!(
+        sent[0].text().contains("RECORD"),
+        "the compaction must actually have run, or the rest of this test is \
+         checking an untouched history: {:?}",
+        sent[0].text()
+    );
+    assert_eq!(
+        sent[0].role,
+        Role::User,
+        "the history must open with a user message"
+    );
+    assert!(
+        sent.iter().any(Message::has_tool_calls),
+        "the tail must still hold a tool turn, or this test proves nothing"
+    );
+    assert!(
+        orphaned_results(sent).is_empty(),
+        "tool results left without their call: {:?}",
+        orphaned_results(sent)
+    );
+}
+
+#[tokio::test]
+async fn a_failed_summary_falls_back_to_trimming_and_the_turn_still_finishes() {
+    let scripted = ScriptedProvider::new(vec![assistant("answered anyway")]);
+    let provider = Arc::new(RefusesToSummarize(scripted));
+    let events = Arc::new(RecordingSink::default());
+    let agent = loop_with_config(
+        provider,
+        registry(MemoryFileSystem::default().into()),
+        Arc::new(AlwaysApprove),
+        events.clone(),
+        compacting_config(8 * 1024),
+    );
+
+    let mut session = crowded_session("c3");
+    let outcome = agent.run(&mut session, "carry on").await.unwrap();
+
+    assert_eq!(outcome.final_text, "answered anyway");
+    assert_eq!(outcome.reason, FinishReason::Completed);
+
+    let recorded = events.events.lock().unwrap();
+    assert!(
+        recorded
+            .iter()
+            .any(|event| matches!(event, AgentEvent::HistoryTrimmed { .. })),
+        "the old path must still run when the summary does not arrive"
+    );
+    assert!(
+        !recorded
+            .iter()
+            .any(|event| matches!(event, AgentEvent::HistoryCompacted { .. })),
+        "a failed compaction must not be reported as one"
+    );
+}
+
+#[tokio::test]
+async fn a_history_inside_its_budget_costs_no_extra_request() {
+    let provider = ScriptedProvider::new(vec![assistant("ok")]);
+    let agent = loop_with_config(
+        provider.clone(),
+        registry(MemoryFileSystem::default().into()),
+        Arc::new(AlwaysApprove),
+        Arc::new(NullEventSink),
+        compacting_config(1024 * 1024),
+    );
+
+    let mut session = crowded_session("c4");
+    agent.run(&mut session, "carry on").await.unwrap();
+
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .all(|request| request.metadata.task_kind != TaskKind::Summarize),
+        "compaction must not run while the history still fits"
+    );
+}
+
+#[tokio::test]
+async fn compaction_can_be_turned_off() {
+    let provider = ScriptedProvider::new(vec![assistant("ok")]);
+    let events = Arc::new(RecordingSink::default());
+    let agent = loop_with_config(
+        provider.clone(),
+        registry(MemoryFileSystem::default().into()),
+        Arc::new(AlwaysApprove),
+        events.clone(),
+        AgentLoopConfig {
+            compact: false,
+            ..compacting_config(8 * 1024)
+        },
+    );
+
+    let mut session = crowded_session("c5");
+    agent.run(&mut session, "carry on").await.unwrap();
+
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .all(|request| request.metadata.task_kind != TaskKind::Summarize),
+        "AGENT_COMPACT=false must mean no extra request at all"
+    );
+    assert!(
+        events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::HistoryTrimmed { .. })),
+        "trimming still has to keep the budget"
+    );
 }

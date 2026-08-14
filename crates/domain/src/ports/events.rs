@@ -29,8 +29,18 @@ pub enum AgentEvent {
         iteration: u32,
         limit: u32,
     },
+    /// Old turns were dropped outright. What they contained is gone.
     HistoryTrimmed {
         dropped_messages: usize,
+    },
+    /// Old turns were folded into a summary instead of being dropped. Distinct
+    /// from [`Self::HistoryTrimmed`] because the two mean opposite things to
+    /// someone reading the output: one says context was lost, the other says it
+    /// was preserved in a smaller form - at the cost of one extra request.
+    HistoryCompacted {
+        folded_messages: usize,
+        before_bytes: usize,
+        after_bytes: usize,
     },
     ModelResponded {
         provider: ProviderId,

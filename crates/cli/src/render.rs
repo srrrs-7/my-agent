@@ -111,6 +111,23 @@ impl EventSink for TerminalRenderer {
                 ));
             }
 
+            AgentEvent::HistoryCompacted {
+                folded_messages,
+                before_bytes,
+                after_bytes,
+            } => {
+                // Deliberately not a warning: unlike a trim, nothing was lost.
+                self.status(self.paint(
+                    DIM,
+                    &format!(
+                        "~ compacted {folded_messages} old messages into a summary \
+                         ({} KB -> {} KB)",
+                        before_bytes / 1024,
+                        after_bytes / 1024
+                    ),
+                ));
+            }
+
             AgentEvent::ModelResponded {
                 model,
                 usage,

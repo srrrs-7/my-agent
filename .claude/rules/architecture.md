@@ -56,6 +56,16 @@ Arc<dyn LlmProvider>
 （`task_kind` / `iteration` / `requires_tools` / 任意の `hints`）は全リクエストに同行しています。
 **プロンプト文字列を解析して分岐するルータを書かないでください** — その材料は既にあります。
 
+## 履歴の圧縮
+
+`fit_history` は 2 段です。圧縮（`agent/compaction.rs`）が意味を保つ方、刈り込み
+（`Conversation::trim_to_budget`）が予算を保証する方で、後者は常に走ります。
+
+境界の計算は domain（`compaction_split` / `replace_prefix`）にあります。
+「どこで切ってよいか」は `tool_call` / `tool_result` の対を壊さないという不変条件
+（`invariants.md` §4）そのものだからです。**要約の中身を決めるコードを domain に置かないでください** —
+それはユースケースです。
+
 ## ループとディスパッチャの分割
 
 `loop_runner.rs` はループ制御だけ、`dispatch.rs` はツール実行だけを持ちます。

@@ -149,6 +149,8 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             max_tool_output_bytes: settings.agent_loop.max_tool_output_bytes,
             max_history_bytes: settings.agent_loop.max_history_bytes,
             keep_recent_messages: 6,
+            compact: settings.agent_loop.compact,
+            compact_keep_recent: settings.agent_loop.compact_keep_recent,
             parallel_read_only_tools: settings.agent_loop.parallel_read_only_tools,
             stream: settings.agent_loop.stream,
         },

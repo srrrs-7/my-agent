@@ -101,6 +101,10 @@ pub struct LoopSettings {
     pub max_iterations: u32,
     pub max_tool_output_bytes: usize,
     pub max_history_bytes: usize,
+    /// Fold the oldest turns into a summary before resorting to dropping them.
+    pub compact: bool,
+    /// Messages left verbatim after a compaction.
+    pub compact_keep_recent: usize,
     pub tool_timeout: Duration,
     pub parallel_read_only_tools: bool,
     pub stream: bool,
@@ -252,6 +256,8 @@ impl LoopSettings {
             max_iterations: reader.parsed("AGENT_MAX_ITERATIONS", 25)?,
             max_tool_output_bytes: reader.parsed("AGENT_MAX_TOOL_OUTPUT_BYTES", 32 * 1024)?,
             max_history_bytes: reader.parsed("AGENT_MAX_HISTORY_BYTES", 256 * 1024)?,
+            compact: reader.parsed("AGENT_COMPACT", true)?,
+            compact_keep_recent: reader.parsed("AGENT_COMPACT_KEEP_RECENT", 12)?,
             tool_timeout: Duration::from_secs(reader.parsed("AGENT_TOOL_TIMEOUT_SECS", 60)?),
             parallel_read_only_tools: reader.parsed("AGENT_PARALLEL_READ_TOOLS", true)?,
             stream: reader.parsed("AGENT_STREAM", true)?,
@@ -373,6 +379,21 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
             }
         },
     );
+    description.insert(
+        "history".into(),
+        format!(
+            "{} bytes; {}",
+            settings.agent_loop.max_history_bytes,
+            if settings.agent_loop.compact {
+                format!(
+                    "compacted into a summary, keeping {} recent messages",
+                    settings.agent_loop.compact_keep_recent
+                )
+            } else {
+                "oldest turns dropped".to_string()
+            }
+        ),
+    );
     description.insert("router".into(), settings.llm.router.as_str().into());
     description.insert(
         "default provider".into(),
@@ -408,6 +429,27 @@ mod tests {
             env.set("AGENT_WORKSPACE", "/workspace");
         }
         Settings::from_source(&env)
+    }
+
+    #[test]
+    fn history_compaction_is_on_by_default() {
+        // The alternative is not "no cost" but "the oldest turns are deleted",
+        // and the oldest turn is where the user said what they wanted.
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert!(settings.agent_loop.compact);
+        assert_eq!(settings.agent_loop.compact_keep_recent, 12);
+    }
+
+    #[test]
+    fn compaction_can_be_turned_off_for_a_metered_endpoint() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_COMPACT", "false"),
+            ("AGENT_COMPACT_KEEP_RECENT", "4"),
+        ])
+        .unwrap();
+        assert!(!settings.agent_loop.compact);
+        assert_eq!(settings.agent_loop.compact_keep_recent, 4);
     }
 
     #[test]

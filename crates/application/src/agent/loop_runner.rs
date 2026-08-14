@@ -5,7 +5,9 @@
 //!       |
 //!       v
 //!   +-------------------------------------------------------+
-//!   | 1. trim history to the context budget                  |
+//!   | 1. fit the history to the context budget:              |
+//!   |      compact (fold old turns into a summary), then     |
+//!   |      trim (drop what still does not fit)               |
 //!   | 2. ask the model (system prompt + history + tool defs) |
 //!   | 3. no tool calls?  -> answer the user, done            |
 //!   | 4. dispatch the calls (see `dispatch.rs`)              |
@@ -35,6 +37,7 @@ use agent_domain::ports::prompt::PromptBuilder;
 use futures::StreamExt as _;
 use tracing::{debug, warn};
 
+use super::compaction::{CompactionConfig, HistoryCompactor};
 use super::config::AgentLoopConfig;
 use super::dispatch::{DispatchConfig, ToolDispatcher};
 use super::session::Session;
@@ -76,6 +79,7 @@ pub struct AgentDependencies {
 pub struct AgentLoop {
     llm: Arc<dyn LlmProvider>,
     dispatcher: ToolDispatcher,
+    compactor: HistoryCompactor,
     events: Arc<dyn EventSink>,
     context: Arc<dyn ContextProvider>,
     prompt: Arc<dyn PromptBuilder>,
@@ -101,9 +105,21 @@ impl AgentLoop {
                 parallel_read_only_tools: config.parallel_read_only_tools,
             },
         );
+        // Built here rather than taken as a dependency: it needs the same
+        // provider the loop already holds, and giving callers a second one to
+        // wire would let the two drift apart.
+        let compactor = HistoryCompactor::new(
+            llm.clone(),
+            CompactionConfig {
+                enabled: config.compact,
+                keep_recent_messages: config.compact_keep_recent,
+                model: config.model.clone(),
+            },
+        );
         Self {
             llm,
             dispatcher,
+            compactor,
             events,
             context,
             prompt,
@@ -135,7 +151,7 @@ impl AgentLoop {
         for iteration in 1..=limit {
             self.events
                 .emit(AgentEvent::IterationStarted { iteration, limit });
-            self.trim_history(session);
+            self.fit_history(session).await;
 
             let request = self.build_request(session, &system_prompt, &tools, iteration);
             let started = Instant::now();
@@ -243,7 +259,29 @@ impl AgentLoop {
         }
     }
 
-    fn trim_history(&self, session: &mut Session) {
+    /// Brings the history back inside its budget before the next request.
+    ///
+    /// Two stages, and the order is the point. Compaction is the one that
+    /// preserves meaning, so it goes first and gets the whole history to work
+    /// with. Trimming runs afterwards regardless, because it is the only stage
+    /// that *guarantees* the budget: a summary that failed to arrive, or one
+    /// that landed on top of a tail already filling the budget, still has to be
+    /// dealt with. In that second case trimming will drop the summary itself -
+    /// the budget is a hard limit and something has to go.
+    async fn fit_history(&self, session: &mut Session) {
+        if session.conversation.approx_bytes() > self.config.max_history_bytes
+            && let Some(report) = self
+                .compactor
+                .compact(&session.id, &mut session.conversation)
+                .await
+        {
+            self.events.emit(AgentEvent::HistoryCompacted {
+                folded_messages: report.folded_messages,
+                before_bytes: report.before_bytes,
+                after_bytes: report.after_bytes,
+            });
+        }
+
         let dropped = session.conversation.trim_to_budget(
             self.config.max_history_bytes,
             self.config.keep_recent_messages,

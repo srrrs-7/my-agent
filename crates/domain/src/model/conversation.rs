@@ -1,12 +1,22 @@
 //! The conversation aggregate.
 //!
 //! Owns one rule that is easy to get wrong and expensive when it breaks:
-//! trimming history must never orphan a `tool_result` from the assistant turn
-//! that requested it, or providers reject the next request outright.
+//! shortening the history must never orphan a `tool_result` from the assistant
+//! turn that requested it, or providers reject the next request outright.
+//!
+//! There are two ways to shorten it, and the rule is the same for both.
+//! [`Conversation::trim_to_budget`] drops the oldest turns outright;
+//! [`Conversation::replace_prefix`] folds them into a single message that
+//! someone else has summarised. Only the boundary logic lives here - deciding
+//! *what* the summary says is a use case, not a domain rule.
 
 use serde::{Deserialize, Serialize};
 
 use super::message::{Message, Role};
+
+/// Below this, folding a prefix into a summary is not worth a model
+/// round-trip: one message replaced by one message saves nothing.
+const MIN_FOLDED_MESSAGES: usize = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
@@ -85,6 +95,67 @@ impl Conversation {
         self.messages.drain(..drop_count);
         drop_count
     }
+
+    /// Where a compaction may cut, keeping `keep_recent` messages verbatim, or
+    /// `None` when folding what is left would not be worth a model round-trip.
+    ///
+    /// The caller summarises `messages()[..split]` and hands the result to
+    /// [`Self::replace_prefix`]. Nothing here mutates, so a summarisation that
+    /// fails leaves the history exactly as it was and the caller can fall back
+    /// to [`Self::trim_to_budget`].
+    pub fn compaction_split(&self, keep_recent: usize) -> Option<usize> {
+        let split = self.fold_boundary(self.messages.len().saturating_sub(keep_recent));
+        (split >= MIN_FOLDED_MESSAGES).then_some(split)
+    }
+
+    /// Replaces everything before `split` with `summary`, returning how many
+    /// messages were folded away.
+    ///
+    /// `split` is moved if it would leave the history malformed, by the same
+    /// rules [`Self::compaction_split`] applies - so a split that came from
+    /// there is used as given, and one that did not is still safe.
+    pub fn replace_prefix(&mut self, split: usize, summary: Message) -> usize {
+        let split = self.fold_boundary(split);
+        if split == 0 {
+            return 0;
+        }
+        self.messages.splice(..split, std::iter::once(summary));
+        split
+    }
+
+    /// Nearest index to `requested` that cuts the history cleanly.
+    ///
+    /// Two rules, and they cannot be satisfied by moving the cut in one
+    /// direction only:
+    ///
+    /// * The tail must not *begin* with a tool result, whose matching call
+    ///   would be on the other side of the cut. Move forward until it does not.
+    /// * The prefix must not *end* with a request for tools whose results
+    ///   stayed behind. That would orphan them, and it would also make the
+    ///   prefix invalid as a request in its own right - which matters because
+    ///   the caller sends it to a model to be summarised. Move back until it
+    ///   does not.
+    ///
+    /// Moving back cannot re-break the first rule: the message it lands on
+    /// carries tool calls, so it is an assistant turn, not a tool result.
+    ///
+    /// In a well-formed history the two rules often *could* both resolve the
+    /// same cut, since a tool result is always preceded by the call that asked
+    /// for it. Forward runs first because it is the one that makes progress:
+    /// a history ending in a tool result would otherwise retreat all the way to
+    /// zero and fold nothing at all.
+    fn fold_boundary(&self, requested: usize) -> usize {
+        let mut split = requested.min(self.messages.len());
+
+        while split < self.messages.len() && self.messages[split].role == Role::Tool {
+            split += 1;
+        }
+        while split > 0 && self.messages[split - 1].has_tool_calls() {
+            split -= 1;
+        }
+
+        split
+    }
 }
 
 #[cfg(test)]
@@ -134,5 +205,106 @@ mod tests {
         let mut conversation = Conversation::from_messages(vec![Message::user("hi")]);
         assert_eq!(conversation.trim_to_budget(10_000, 1), 0);
         assert_eq!(conversation.len(), 1);
+    }
+
+    /// `[user, assistant(call), tool, assistant, user, assistant]`
+    fn with_a_tool_turn() -> Conversation {
+        let call = call();
+        Conversation::from_messages(vec![
+            Message::user("first"),
+            Message::assistant(vec![ContentBlock::ToolCall(call.clone())]),
+            Message::tool_results(vec![ToolResult::ok(&call, "contents")]),
+            Message::assistant_text("read it"),
+            Message::user("second"),
+            Message::assistant_text("done"),
+        ])
+    }
+
+    #[test]
+    fn a_compaction_folds_everything_except_the_recent_tail() {
+        let mut conversation = with_a_tool_turn();
+        let split = conversation
+            .compaction_split(2)
+            .expect("there is history to fold");
+
+        assert_eq!(split, 4, "the tail keeps the last two messages");
+        assert_eq!(
+            conversation.replace_prefix(split, Message::user("SUMMARY")),
+            4
+        );
+        assert_eq!(conversation.len(), 3);
+        assert_eq!(conversation.messages()[0].text(), "SUMMARY");
+        assert_eq!(conversation.messages()[1].text(), "second");
+    }
+
+    /// The cut lands between an assistant's tool call and its result, which is
+    /// the case that orphans a result if it is taken literally.
+    #[test]
+    fn a_cut_between_a_call_and_its_result_moves_past_the_result() {
+        let mut conversation = with_a_tool_turn();
+        // keep_recent = 4 asks to cut at index 2 - exactly the tool result.
+        let split = conversation
+            .compaction_split(4)
+            .expect("there is history to fold");
+
+        assert_eq!(
+            split, 3,
+            "the result is folded with the call that asked for it"
+        );
+        conversation.replace_prefix(split, Message::user("SUMMARY"));
+        assert_ne!(
+            conversation.messages()[1].role,
+            Role::Tool,
+            "history must not resume with an orphaned tool result"
+        );
+    }
+
+    /// Reachable whenever a caller compacts after the model has asked for tools
+    /// but before the results exist. Folding that assistant turn away would
+    /// leave its results with nothing to attach to - and would also make the
+    /// prefix invalid as a summarisation request on its own.
+    #[test]
+    fn a_trailing_tool_call_is_left_for_the_tail() {
+        let call = call();
+        let conversation = Conversation::from_messages(vec![
+            Message::user("go"),
+            Message::assistant_text("thinking"),
+            Message::assistant(vec![ContentBlock::ToolCall(call)]),
+        ]);
+
+        assert_eq!(
+            conversation.compaction_split(0),
+            Some(2),
+            "the unanswered call stays out of the fold"
+        );
+    }
+
+    #[test]
+    fn folding_a_single_message_is_not_worth_a_round_trip() {
+        let conversation =
+            Conversation::from_messages(vec![Message::user("a"), Message::assistant_text("b")]);
+        assert_eq!(conversation.compaction_split(1), None);
+        assert_eq!(conversation.compaction_split(9), None, "nothing to fold");
+    }
+
+    #[test]
+    fn replacing_a_prefix_that_would_orphan_a_result_moves_the_cut() {
+        // A split nobody planned: straight into the middle of a tool turn.
+        let mut conversation = with_a_tool_turn();
+        let folded = conversation.replace_prefix(2, Message::user("SUMMARY"));
+
+        assert_eq!(folded, 3, "the cut moved past the tool result");
+        assert_ne!(conversation.messages()[1].role, Role::Tool);
+    }
+
+    #[test]
+    fn a_compacted_history_opens_with_the_summary() {
+        // Providers expect a conversation to start with a user message, and
+        // after a compaction the summary is that message.
+        let mut conversation = with_a_tool_turn();
+        let split = conversation.compaction_split(2).unwrap();
+        conversation.replace_prefix(split, Message::user("SUMMARY"));
+
+        assert_eq!(conversation.messages()[0].role, Role::User);
     }
 }
