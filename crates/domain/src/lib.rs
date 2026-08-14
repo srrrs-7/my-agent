@@ -20,7 +20,7 @@ pub mod model;
 pub mod ports;
 pub mod text;
 
-pub use error::{ApprovalError, DomainError, FsError, LlmError, ToolError};
+pub use error::{ApprovalError, DomainError, FetchError, FsError, LlmError, ToolError};
 pub use model::{
     context::ContextSnapshot,
     conversation::Conversation,
@@ -41,4 +41,5 @@ pub use ports::{
     prompt::PromptBuilder,
     search::{FileSearcher, SearchHit, SearchQuery},
     tool::Tool,
+    web::{FetchedContent, WebFetcher},
 };

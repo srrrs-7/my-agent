@@ -54,6 +54,7 @@
 | `ContextProvider` | `WorkspaceContextProvider` | 環境情報とプロジェクト指示の収集 |
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`, `AppendingPromptBuilder` | システムプロンプトの組み立て方針（既定・差し替え・追記） |
 | `ApprovalGate` | `CliApprovalGate` | human-in-the-loop |
+| `WebFetcher` | `GuardedWebFetcher` | 外向き HTTP（SSRF ガード・許可リスト・サイズ上限） |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` | 進捗の可観測性 |
 
 すべて `dyn` 互換なので、合成ルートで実装を差し替えられます。
@@ -178,4 +179,4 @@ pub struct RequestMetadata {
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 156 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 188 本）。

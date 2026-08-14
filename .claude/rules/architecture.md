@@ -39,6 +39,7 @@
 | `ContextProvider` | `WorkspaceContextProvider` |
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`（差し替え）, `AppendingPromptBuilder`（追記・装飾） |
 | `ApprovalGate` | `CliApprovalGate` |
+| `WebFetcher` | `GuardedWebFetcher`（SSRF ガード付き・既定無効） |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` |
 
 `LlmProvider` が合成パターンになっている点が重要です。ルータもリトライもそれ自体が `LlmProvider` なので、

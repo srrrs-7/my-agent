@@ -115,6 +115,32 @@ impl From<DomainError> for FsError {
     }
 }
 
+/// Failures produced by [`crate::ports::web::WebFetcher`] implementations.
+///
+/// `InvalidUrl` and `Blocked` mean the *model's* URL was unacceptable - tools
+/// map them to invalid-input so the model picks another URL. The rest are
+/// execution failures of an acceptable request.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    #[error("`{url}` is not a fetchable URL: {reason}")]
+    InvalidUrl { url: String, reason: String },
+
+    #[error("fetching `{url}` is not allowed: {reason}")]
+    Blocked { url: String, reason: String },
+
+    #[error("transport error fetching `{url}`: {message}")]
+    Transport { url: String, message: String },
+
+    #[error("fetching `{url}` timed out after {seconds}s")]
+    Timeout { url: String, seconds: u64 },
+
+    #[error("`{url}` answered with HTTP {status}")]
+    HttpStatus { url: String, status: u16 },
+
+    #[error("`{url}` returned {content_type}, which is not text and cannot be shown")]
+    UnsupportedContent { url: String, content_type: String },
+}
+
 /// Failures produced while running a tool.
 #[derive(Debug, Error, Clone)]
 pub enum ToolError {

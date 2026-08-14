@@ -91,6 +91,11 @@ pub enum ToolSafety {
     ReadOnly,
     /// Changes workspace state in a recoverable way (create / edit a file).
     Mutating,
+    /// Sends data outside the process (a URL is an outbound message: its path
+    /// and query carry whatever the model put there). Not read-only even when
+    /// nothing local changes, so the default policy always confirms it and the
+    /// human sees the full destination before anything leaves.
+    Network,
     /// Irreversible or reaches outside the workspace. Always confirmed.
     Destructive,
 }
@@ -104,6 +109,7 @@ impl ToolSafety {
         match self {
             Self::ReadOnly => "read-only",
             Self::Mutating => "mutating",
+            Self::Network => "network",
             Self::Destructive => "destructive",
         }
     }

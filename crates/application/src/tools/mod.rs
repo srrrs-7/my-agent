@@ -8,5 +8,6 @@
 pub mod file;
 pub mod registry;
 pub mod util;
+pub mod web;
 
 pub use registry::ToolRegistry;

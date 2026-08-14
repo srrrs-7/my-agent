@@ -47,6 +47,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive", "env"] }
 regex = "1"
+url = "2"
 ignore = "0.4"
 dotenvy = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -12,5 +12,6 @@ pub mod fs;
 pub mod llm;
 pub mod telemetry;
 pub mod tools;
+pub mod web;
 
 pub use config::{ConfigError, Settings};

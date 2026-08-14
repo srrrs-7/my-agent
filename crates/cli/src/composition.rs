@@ -16,6 +16,7 @@ use agent_application::tools::ToolRegistry;
 use agent_application::tools::file::{
     EditFileTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
 };
+use agent_application::tools::web::WebFetchTool;
 use agent_domain::model::llm::{GenerationParams, ModelId};
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::ApprovalGate;
@@ -27,6 +28,7 @@ use agent_infrastructure::config::{ApprovalPolicy, PromptSettings, Settings};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
 use agent_infrastructure::tools::TimeoutTool;
+use agent_infrastructure::web::{GuardedWebFetcher, WebFetchConfig};
 use anyhow::{Context, Result};
 
 use crate::approval::CliApprovalGate;
@@ -67,12 +69,31 @@ pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         Arc::new(CliApprovalGate::new(settings.approval, interactive));
     let events: Arc<dyn EventSink> = Arc::new(TerminalRenderer::new(cli.verbose, cli.no_color));
 
-    let tools = build_tools(
+    let mut tools = build_tools(
         file_system,
         searcher,
         workspace.clone(),
         settings.agent_loop.tool_timeout,
     );
+
+    // web_fetch is opt-in: registering it at all is the operator's decision
+    // (AGENT_WEB_FETCH=true), because a URL is an outbound message.
+    if settings.web_fetch.enabled {
+        let fetcher = GuardedWebFetcher::new(WebFetchConfig {
+            allowed_domains: settings.web_fetch.allowed_domains.clone(),
+            allow_private: settings.web_fetch.allow_private,
+            max_bytes: settings.web_fetch.max_bytes,
+            timeout: settings.web_fetch.timeout,
+        })
+        .context("cannot build the web fetcher")?;
+
+        let mut registry = (*tools).clone();
+        registry.register(TimeoutTool::wrap(
+            Arc::new(WebFetchTool::new(Arc::new(fetcher))),
+            settings.agent_loop.tool_timeout,
+        ));
+        tools = Arc::new(registry);
+    }
 
     // --- the loop ------------------------------------------------------------
     let prompt = build_prompt_builder(&settings.prompt)?;

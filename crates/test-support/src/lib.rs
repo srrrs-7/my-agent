@@ -18,6 +18,7 @@ pub struct Response {
     status_line: String,
     content_type: &'static str,
     body: String,
+    location: Option<String>,
 }
 
 impl Response {
@@ -32,6 +33,32 @@ impl Response {
             status_line: status_line.into(),
             content_type: "application/json",
             body: body.into(),
+            location: None,
+        }
+    }
+
+    /// An HTTP redirect to `location`.
+    pub fn redirect(status_line: impl Into<String>, location: impl Into<String>) -> Self {
+        Self {
+            status_line: status_line.into(),
+            content_type: "text/plain",
+            body: String::new(),
+            location: Some(location.into()),
+        }
+    }
+
+    /// Full control over the content type - for servers that are not LLM
+    /// endpoints (the web-fetch tests serve HTML and redirects with this).
+    pub fn with_content_type(
+        status_line: impl Into<String>,
+        content_type: &'static str,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            status_line: status_line.into(),
+            content_type,
+            body: body.into(),
+            location: None,
         }
     }
 
@@ -51,6 +78,7 @@ impl Response {
             status_line: "200 OK".into(),
             content_type: "text/event-stream",
             body,
+            location: None,
         }
     }
 
@@ -174,13 +202,15 @@ impl Response {
         let mut response = String::new();
         let _ = write!(
             response,
-            "HTTP/1.1 {}\r\ncontent-type: {}\r\n\
-             content-length: {}\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n",
             self.status_line,
             self.content_type,
             self.body.len(),
-            self.body
         );
+        if let Some(location) = &self.location {
+            let _ = write!(response, "location: {location}\r\n");
+        }
+        let _ = write!(response, "connection: close\r\n\r\n{}", self.body);
         response
     }
 }

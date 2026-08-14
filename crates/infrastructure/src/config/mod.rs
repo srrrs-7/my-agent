@@ -121,6 +121,36 @@ pub struct PromptSettings {
     pub append: Option<String>,
 }
 
+/// Outbound web access for the `web_fetch` tool.
+///
+/// Off by default: giving the model a network egress is an explicit operator
+/// decision (a URL can carry anything the model puts in it). Even when
+/// enabled, private and internal addresses stay blocked unless
+/// `allow_private` is also set, and the tool's `Network` safety class means
+/// the default approval policy confirms every call.
+#[derive(Debug, Clone)]
+pub struct WebFetchSettings {
+    pub enabled: bool,
+    /// Domain suffixes the operator allows. Empty = any public host.
+    pub allowed_domains: Vec<String>,
+    /// Lifts the private/internal-address blocking (intranet docs, tests).
+    pub allow_private: bool,
+    pub max_bytes: usize,
+    pub timeout: Duration,
+}
+
+impl Default for WebFetchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: Vec::new(),
+            allow_private: false,
+            max_bytes: 1024 * 1024,
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub workspace: PathBuf,
@@ -128,6 +158,7 @@ pub struct Settings {
     pub llm: LlmSettings,
     pub agent_loop: LoopSettings,
     pub prompt: PromptSettings,
+    pub web_fetch: WebFetchSettings,
     /// Largest file the read tool will load.
     pub max_file_bytes: u64,
 }
@@ -156,6 +187,22 @@ impl Settings {
             prompt: PromptSettings {
                 replace_file: reader.string("AGENT_SYSTEM_PROMPT_FILE").map(PathBuf::from),
                 append: reader.string("AGENT_APPEND_SYSTEM_PROMPT"),
+            },
+            web_fetch: WebFetchSettings {
+                enabled: reader.parsed("AGENT_WEB_FETCH", false)?,
+                allowed_domains: reader
+                    .string("AGENT_WEB_FETCH_ALLOW")
+                    .map(|raw| {
+                        raw.split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                allow_private: reader.parsed("AGENT_WEB_FETCH_ALLOW_PRIVATE", false)?,
+                max_bytes: reader.parsed("AGENT_WEB_FETCH_MAX_BYTES", 1024 * 1024)?,
+                timeout: Duration::from_secs(reader.parsed("AGENT_WEB_FETCH_TIMEOUT_SECS", 30)?),
             },
             max_file_bytes: reader.parsed("AGENT_MAX_FILE_BYTES", 2 * 1024 * 1024)?,
         })
@@ -254,6 +301,26 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
     let mut description = BTreeMap::new();
     description.insert("workspace".into(), settings.workspace.display().to_string());
     description.insert("approval".into(), settings.approval.as_str().into());
+    description.insert(
+        "web fetch".into(),
+        if !settings.web_fetch.enabled {
+            "disabled".to_string()
+        } else {
+            let scope = if settings.web_fetch.allowed_domains.is_empty() {
+                "any public host".to_string()
+            } else {
+                format!(
+                    "allowlist: {}",
+                    settings.web_fetch.allowed_domains.join(", ")
+                )
+            };
+            if settings.web_fetch.allow_private {
+                format!("enabled ({scope}; private addresses ALLOWED)")
+            } else {
+                format!("enabled ({scope})")
+            }
+        },
+    );
     description.insert(
         "system prompt".into(),
         match (&settings.prompt.replace_file, &settings.prompt.append) {

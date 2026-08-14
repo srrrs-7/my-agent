@@ -131,9 +131,21 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 | `search_files` | read-only | 正規表現検索（`.gitignore` 準拠・バイナリ除外） |
 | `write_file` | mutating | 全文書き込み（親ディレクトリ自動作成） |
 | `edit_file` | mutating | 完全一致の部分置換。一致 0 件／複数件はエラー |
+| `web_fetch` | network | URL の内容をテキスト取得（**既定で無効**。`AGENT_WEB_FETCH=true` で有効化） |
 
 `edit_file` を曖昧一致にしないのは意図的です。モデルが `read_file` で見た文字列と
 一致しない限り編集は成立せず、意図しない箇所への適用が構造的に起こりません。
+
+`web_fetch` は**既定で無効**です。URL はモデルが組み立てる外向きのメッセージであり、
+クエリにワークスペースの内容を載せて送信できてしまうため、有効化は操作者の明示的な
+判断（`AGENT_WEB_FETCH=true`）としています。有効化しても:
+
+- プライベート帯・ループバック・リンクローカル（クラウドメタデータ 169.254.169.254 を含む）、
+  `localhost`・ドットなしホスト名（`ollama` 等）・`host.docker.internal`・`.internal`/`.local`
+  への接続は常に拒否されます（DNS 解決後の全アドレスも検査。リダイレクトも 1 ホップごとに再検査）
+- 安全分類は `network` で、既定の承認ポリシーでは**毎回確認**が入り、承認プロンプトに
+  URL 全体が表示されます（`AGENT_APPROVAL=auto` では確認が入らない点に注意）
+- 取得内容は指示ではなくデータとしてツール結果でのみモデルに渡ります
 
 ### context
 
@@ -255,7 +267,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 156 本、外部ネットワークもモデルも不要です。
+テストは 188 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -302,6 +314,11 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_MAX_HISTORY_BYTES` | `262144` | 履歴の予算。超過分は古い順に破棄 |
 | `AGENT_TOOL_TIMEOUT_SECS` | `60` | ツール 1 回あたりの上限時間 |
 | `AGENT_MAX_FILE_BYTES` | `2097152` | `read_file` が読む最大サイズ |
+| `AGENT_WEB_FETCH` | `false` | `web_fetch` ツールの有効化（§4 参照） |
+| `AGENT_WEB_FETCH_ALLOW` | —（公開ホスト全般） | 許可ドメインのカンマ区切り（`docs.rs` は `*.docs.rs` も許可） |
+| `AGENT_WEB_FETCH_ALLOW_PRIVATE` | `false` | プライベート帯拒否の解除（イントラネット用。通常は触らない） |
+| `AGENT_WEB_FETCH_MAX_BYTES` | `1048576` | 取得サイズ上限 |
+| `AGENT_WEB_FETCH_TIMEOUT_SECS` | `30` | 取得の上限時間 |
 | `AGENT_PARALLEL_READ_TOOLS` | `true` | 読み取り系ツールの並列実行 |
 
 ### 生成とログ

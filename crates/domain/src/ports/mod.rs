@@ -13,6 +13,7 @@ pub mod llm;
 pub mod prompt;
 pub mod search;
 pub mod tool;
+pub mod web;
 
 pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 pub use context::ContextProvider;
@@ -22,3 +23,4 @@ pub use llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent};
 pub use prompt::PromptBuilder;
 pub use search::{FileSearcher, SearchHit, SearchQuery};
 pub use tool::Tool;
+pub use web::{FetchedContent, WebFetcher};
