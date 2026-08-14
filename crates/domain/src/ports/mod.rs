@@ -18,7 +18,7 @@ pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 pub use context::ContextProvider;
 pub use events::{AgentEvent, EventSink, FinishReason};
 pub use file_system::{DirEntry, EntryKind, FileSystem};
-pub use llm::{LlmProvider, LlmRouter, RouteDecision};
+pub use llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent};
 pub use prompt::PromptBuilder;
 pub use search::{FileSearcher, SearchHit, SearchQuery};
 pub use tool::Tool;

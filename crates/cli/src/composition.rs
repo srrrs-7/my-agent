@@ -95,6 +95,7 @@ pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             max_history_bytes: settings.agent_loop.max_history_bytes,
             keep_recent_messages: 6,
             parallel_read_only_tools: settings.agent_loop.parallel_read_only_tools,
+            stream: settings.agent_loop.stream,
         },
     );
 

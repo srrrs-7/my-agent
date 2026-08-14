@@ -9,6 +9,7 @@ description = "Enterprise/domain layer: entities, value objects and ports. Depen
 
 [dependencies]
 async-trait = { workspace = true }
+futures-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

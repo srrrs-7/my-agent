@@ -7,9 +7,9 @@
 
 | crate | 責務 | 許可される依存 |
 |---|---|---|
-| `agent-domain` | エンティティ、値オブジェクト、ポート(trait)、エラー語彙、共有カーネル(`text`) | std, serde, serde_json, thiserror, async-trait |
+| `agent-domain` | エンティティ、値オブジェクト、ポート(trait)、エラー語彙、共有カーネル(`text`) | std, serde, serde_json, thiserror, async-trait, futures-core(Stream trait のみ) |
 | `agent-application` | ユースケース: ループ、ディスパッチャ、プロンプト組み立て、ツール実装 | domain, async-trait, futures, serde, tracing |
-| `agent-infrastructure` | アダプタ: LLM の HTTP クライアント、FS、検索、設定、テレメトリ | domain, reqwest, tokio, ignore, regex, chrono |
+| `agent-infrastructure` | アダプタ: LLM の HTTP クライアント、FS、検索、設定、テレメトリ | domain, reqwest, tokio, futures, bytes, ignore, regex, chrono |
 | `agent-cli` | 引数解析、描画、承認 UI、合成ルート | 全て |
 | `agent-test-support` | テストダブル | tokio, serde_json |
 

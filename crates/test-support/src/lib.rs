@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone)]
 pub struct Response {
     status_line: String,
+    content_type: &'static str,
     body: String,
 }
 
@@ -29,8 +30,103 @@ impl Response {
     pub fn status(status_line: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
             status_line: status_line.into(),
+            content_type: "application/json",
             body: body.into(),
         }
+    }
+
+    /// A `text/event-stream` reply: each payload becomes one `data:` event,
+    /// followed by `data: [DONE]`. Pass raw JSON strings (or use
+    /// [`Self::sse_text_stream`] / [`Self::sse_tool_call_stream`] for the
+    /// common shapes).
+    pub fn sse(payloads: impl IntoIterator<Item = String>) -> Self {
+        let mut body = String::new();
+        for payload in payloads {
+            body.push_str("data: ");
+            body.push_str(&payload);
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        Self {
+            status_line: "200 OK".into(),
+            content_type: "text/event-stream",
+            body,
+        }
+    }
+
+    /// An OpenAI-shaped streamed text answer: one content-delta chunk per
+    /// string, then a `finish_reason: "stop"` chunk and a usage chunk.
+    pub fn sse_text_stream(deltas: &[&str]) -> Self {
+        let mut payloads: Vec<String> = deltas
+            .iter()
+            .map(|delta| {
+                json!({
+                    "model": "mock",
+                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
+                })
+                .to_string()
+            })
+            .collect();
+        payloads.push(
+            json!({
+                "model": "mock",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            })
+            .to_string(),
+        );
+        payloads.push(
+            json!({
+                "model": "mock",
+                "choices": [],
+                "usage": {"prompt_tokens": 150, "completion_tokens": 30}
+            })
+            .to_string(),
+        );
+        Self::sse(payloads)
+    }
+
+    /// An OpenAI-shaped streamed tool call whose arguments arrive split into
+    /// the given fragments - the case that forces consumers to aggregate
+    /// before executing.
+    pub fn sse_tool_call_stream(id: &str, name: &str, argument_fragments: &[&str]) -> Self {
+        let mut payloads = vec![
+            json!({
+                "model": "mock",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": id, "type": "function",
+                    "function": {"name": name, "arguments": ""}
+                }]}, "finish_reason": null}]
+            })
+            .to_string(),
+        ];
+        for fragment in argument_fragments {
+            payloads.push(
+                json!({
+                    "model": "mock",
+                    "choices": [{"index": 0, "delta": {"tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": fragment}
+                    }]}, "finish_reason": null}]
+                })
+                .to_string(),
+            );
+        }
+        payloads.push(
+            json!({
+                "model": "mock",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            })
+            .to_string(),
+        );
+        payloads.push(
+            json!({
+                "model": "mock",
+                "choices": [],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 20}
+            })
+            .to_string(),
+        );
+        Self::sse(payloads)
     }
 
     /// An OpenAI-shaped final answer.
@@ -78,9 +174,10 @@ impl Response {
         let mut response = String::new();
         let _ = write!(
             response,
-            "HTTP/1.1 {}\r\ncontent-type: application/json\r\n\
+            "HTTP/1.1 {}\r\ncontent-type: {}\r\n\
              content-length: {}\r\nconnection: close\r\n\r\n{}",
             self.status_line,
+            self.content_type,
             self.body.len(),
             self.body
         );

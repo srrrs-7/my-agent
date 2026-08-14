@@ -537,3 +537,202 @@ async fn the_session_history_survives_multiple_turns() {
         "the earlier turn is still in context"
     );
 }
+
+// --- streaming ---------------------------------------------------------------
+
+use agent_domain::ports::llm::{ChatStream, StreamEvent};
+
+/// Scripts `chat_stream` per call; `chat` panics so a test that means to
+/// stream can never silently take the non-streaming path.
+struct ScriptedStreamProvider {
+    script: Mutex<Vec<Vec<Result<StreamEvent, LlmError>>>>,
+}
+
+impl ScriptedStreamProvider {
+    fn new(script: Vec<Vec<Result<StreamEvent, LlmError>>>) -> Arc<Self> {
+        Arc::new(Self {
+            script: Mutex::new(script),
+        })
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ScriptedStreamProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("scripted-stream")
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            supports_streaming: true,
+            ..ProviderCapabilities::default()
+        }
+    }
+
+    async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse, LlmError> {
+        panic!("a streaming test must not fall back to the non-streaming call");
+    }
+
+    async fn chat_stream(&self, _request: ChatRequest) -> Result<ChatStream, LlmError> {
+        let mut script = self.script.lock().unwrap();
+        let events = if script.is_empty() {
+            vec![Ok(StreamEvent::Completed(assistant("(script exhausted)")))]
+        } else {
+            script.remove(0)
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+fn delta(text: &str) -> Result<StreamEvent, LlmError> {
+    Ok(StreamEvent::TextDelta(text.to_string()))
+}
+
+fn completed(response: ChatResponse) -> Result<StreamEvent, LlmError> {
+    Ok(StreamEvent::Completed(response))
+}
+
+#[tokio::test]
+async fn streamed_deltas_are_forwarded_and_the_completed_response_drives_the_loop() {
+    let file_system = MemoryFileSystem::with(&[("a.rs", "AAA")]);
+    let provider = ScriptedStreamProvider::new(vec![
+        vec![
+            delta("Let me "),
+            delta("look."),
+            completed(tool_use("c1", "read_file", json!({"path": "a.rs"}))),
+        ],
+        vec![delta("It says AAA."), completed(assistant("It says AAA."))],
+    ]);
+
+    let events = Arc::new(RecordingSink::default());
+    let agent = loop_with(
+        provider,
+        registry(file_system),
+        Arc::new(AlwaysApprove),
+        events.clone(),
+        10,
+    );
+
+    let mut session = Session::new("stream-1");
+    let outcome = agent.run(&mut session, "read a.rs").await.unwrap();
+
+    assert_eq!(outcome.final_text, "It says AAA.");
+    assert_eq!(outcome.reason, FinishReason::Completed);
+
+    let recorded = events.events.lock().unwrap();
+    let deltas: Vec<String> = recorded
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::AssistantDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec!["Let me ", "look.", "It says AAA."]);
+
+    // The full message still arrives for sinks that want it whole.
+    assert!(recorded.iter().any(
+        |event| matches!(event, AgentEvent::AssistantMessage { text } if text == "It says AAA.")
+    ));
+}
+
+#[tokio::test]
+async fn whitespace_only_deltas_are_held_back() {
+    // Some models emit "\n\n" before a tool call; the non-streaming path never
+    // prints a whitespace-only answer, so streaming must not either.
+    let provider = ScriptedStreamProvider::new(vec![
+        vec![
+            delta("\n"),
+            delta("\n"),
+            completed(tool_use("c1", "read_file", json!({"path": "a.rs"}))),
+        ],
+        vec![completed(assistant("done"))],
+    ]);
+
+    let events = Arc::new(RecordingSink::default());
+    let agent = loop_with(
+        provider,
+        registry(MemoryFileSystem::with(&[("a.rs", "AAA")])),
+        Arc::new(AlwaysApprove),
+        events.clone(),
+        10,
+    );
+
+    let mut session = Session::new("stream-2");
+    agent.run(&mut session, "read a.rs").await.unwrap();
+
+    let recorded = events.events.lock().unwrap();
+    assert!(
+        !recorded
+            .iter()
+            .any(|event| matches!(event, AgentEvent::AssistantDelta { .. })),
+        "whitespace-only prose must not surface as deltas"
+    );
+}
+
+#[tokio::test]
+async fn a_mid_stream_error_aborts_the_turn() {
+    let provider = ScriptedStreamProvider::new(vec![vec![
+        delta("partial ans"),
+        Err(LlmError::Transport("connection reset mid-stream".into())),
+    ]]);
+
+    let agent = loop_with(
+        provider,
+        registry(MemoryFileSystem::with(&[])),
+        Arc::new(AlwaysApprove),
+        Arc::new(NullEventSink),
+        10,
+    );
+
+    let mut session = Session::new("stream-3");
+    let error = agent.run(&mut session, "hi").await.unwrap_err();
+    assert!(error.to_string().contains("connection reset"), "{error}");
+}
+
+#[tokio::test]
+async fn a_stream_that_never_completes_is_an_error() {
+    let provider = ScriptedStreamProvider::new(vec![vec![delta("never finished")]]);
+
+    let agent = loop_with(
+        provider,
+        registry(MemoryFileSystem::with(&[])),
+        Arc::new(AlwaysApprove),
+        Arc::new(NullEventSink),
+        10,
+    );
+
+    let mut session = Session::new("stream-4");
+    let error = agent.run(&mut session, "hi").await.unwrap_err();
+    assert!(
+        error.to_string().contains("without a completed response"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn stream_false_uses_the_plain_chat_call() {
+    // ScriptedProvider has no chat_stream override; with stream disabled the
+    // loop must call `chat` directly (and does throughout the suite above,
+    // which runs with the default `stream: true` through the trait fallback -
+    // this test pins the explicit opt-out).
+    let provider = ScriptedProvider::new(vec![assistant("plain")]);
+    let config = AgentLoopConfig {
+        stream: false,
+        ..AgentLoopConfig::default()
+    };
+    let agent = AgentLoop::new(
+        AgentDependencies {
+            llm: provider,
+            tools: registry(MemoryFileSystem::with(&[])),
+            approval: Arc::new(AlwaysApprove),
+            events: Arc::new(NullEventSink),
+            context: Arc::new(FakeContext),
+            prompt: Arc::new(DefaultPromptBuilder),
+        },
+        config,
+    );
+
+    let mut session = Session::new("stream-5");
+    let outcome = agent.run(&mut session, "hi").await.unwrap();
+    assert_eq!(outcome.final_text, "plain");
+}

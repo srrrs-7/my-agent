@@ -18,7 +18,7 @@ use agent_domain::error::LlmError;
 use agent_domain::model::llm::{
     ChatRequest, ChatResponse, ModelId, ProviderCapabilities, ProviderId,
 };
-use agent_domain::ports::llm::{LlmProvider, LlmRouter, RouteDecision};
+use agent_domain::ports::llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision};
 use async_trait::async_trait;
 use tracing::debug;
 
@@ -41,25 +41,14 @@ impl RoutingProvider {
     pub fn provider_ids(&self) -> Vec<ProviderId> {
         self.providers.keys().cloned().collect()
     }
-}
 
-#[async_trait]
-impl LlmProvider for RoutingProvider {
-    fn id(&self) -> ProviderId {
-        ProviderId::new("router")
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        // Only promise what every candidate can deliver: the caller cannot know
-        // which one will serve the next request.
-        self.providers
-            .values()
-            .map(|provider| provider.capabilities())
-            .reduce(ProviderCapabilities::intersect)
-            .unwrap_or_default()
-    }
-
-    async fn chat(&self, mut request: ChatRequest) -> Result<ChatResponse, LlmError> {
+    /// Runs the router and resolves its decision to a concrete provider,
+    /// rewriting the request's model when the decision says so. Shared by
+    /// every entry point so they cannot drift apart.
+    async fn resolve(
+        &self,
+        mut request: ChatRequest,
+    ) -> Result<(&Arc<dyn LlmProvider>, ChatRequest), LlmError> {
         let decision = self.router.route(&request).await?;
 
         let provider = self.providers.get(&decision.provider).ok_or_else(|| {
@@ -86,7 +75,36 @@ impl LlmProvider for RoutingProvider {
             "routed request"
         );
 
+        Ok((provider, request))
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RoutingProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("router")
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        // Only promise what every candidate can deliver: the caller cannot know
+        // which one will serve the next request.
+        self.providers
+            .values()
+            .map(|provider| provider.capabilities())
+            .reduce(ProviderCapabilities::intersect)
+            .unwrap_or_default()
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
+        let (provider, request) = self.resolve(request).await?;
         provider.chat(request).await
+    }
+
+    /// Routes exactly like [`Self::chat`]; the chosen provider decides whether
+    /// it truly streams or serves the default single-`Completed` fallback.
+    async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream, LlmError> {
+        let (provider, request) = self.resolve(request).await?;
+        provider.chat_stream(request).await
     }
 }
 

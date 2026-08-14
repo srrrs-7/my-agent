@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use agent_domain::error::LlmError;
 use agent_domain::model::llm::{ChatRequest, ChatResponse, ProviderCapabilities, ProviderId};
-use agent_domain::ports::llm::LlmProvider;
+use agent_domain::ports::llm::{ChatStream, LlmProvider};
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -47,24 +47,22 @@ impl RetryingProvider {
         let exponent = attempt.saturating_sub(1).min(6);
         (self.base_delay * 2_u32.pow(exponent)).min(self.max_delay)
     }
-}
 
-#[async_trait]
-impl LlmProvider for RetryingProvider {
-    fn id(&self) -> ProviderId {
-        self.inner.id()
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
-        self.inner.capabilities()
-    }
-
-    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
+    /// The retry loop both entry points share. `call` is invoked once per
+    /// attempt with a fresh clone of the request.
+    async fn run_with_retry<T, Fut>(
+        &self,
+        request: ChatRequest,
+        call: impl Fn(ChatRequest) -> Fut,
+    ) -> Result<T, LlmError>
+    where
+        Fut: std::future::Future<Output = Result<T, LlmError>>,
+    {
         let mut last_error = None;
 
         for attempt in 1..=self.max_attempts {
-            match self.inner.chat(request.clone()).await {
-                Ok(response) => return Ok(response),
+            match call(request.clone()).await {
+                Ok(value) => return Ok(value),
                 Err(error) if error.is_retryable() && attempt < self.max_attempts => {
                     let delay = self.delay_for(attempt, &error);
                     warn!(
@@ -83,6 +81,31 @@ impl LlmProvider for RetryingProvider {
 
         Err(last_error
             .unwrap_or_else(|| LlmError::Transport("the provider was never called".to_string())))
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RetryingProvider {
+    fn id(&self) -> ProviderId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.run_with_retry(request, |request| self.inner.chat(request))
+            .await
+    }
+
+    /// Retries only the *opening* of a stream. Once `chat_stream` has returned
+    /// `Ok`, events flow through untouched: an error inside the stream aborts
+    /// it, because silently replaying a half-delivered answer would duplicate
+    /// whatever the consumer already rendered.
+    async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream, LlmError> {
+        self.run_with_retry(request, |request| self.inner.chat_stream(request))
+            .await
     }
 }
 

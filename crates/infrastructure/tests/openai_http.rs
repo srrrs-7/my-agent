@@ -165,3 +165,76 @@ async fn a_non_json_body_is_reported_as_an_invalid_response() {
         "the body helps diagnose: {error}"
     );
 }
+
+// --- streaming ---------------------------------------------------------------
+
+use agent_domain::ports::llm::StreamEvent;
+use futures::StreamExt as _;
+
+#[tokio::test]
+async fn chat_stream_yields_deltas_then_the_completed_response() {
+    let server =
+        MockLlmServer::start(vec![Response::sse_text_stream(&["Hello, ", "world."])]).await;
+
+    let mut stream = provider(server.base_url())
+        .chat_stream(ChatRequest::new(vec![Message::user("hi")]))
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert_eq!(
+        events[..2],
+        [
+            StreamEvent::TextDelta("Hello, ".into()),
+            StreamEvent::TextDelta("world.".into()),
+        ]
+    );
+    let StreamEvent::Completed(response) = &events[2] else {
+        panic!("the final event must be Completed, got {events:?}");
+    };
+    assert_eq!(response.message.text(), "Hello, world.");
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+    assert_eq!(
+        response.usage.total(),
+        180,
+        "usage arrives via the include_usage chunk"
+    );
+
+    // What went on the wire: the streaming flags were set.
+    let sent = server.json_requests().await.remove(0);
+    assert_eq!(sent["stream"], json!(true));
+    assert_eq!(sent["stream_options"]["include_usage"], json!(true));
+}
+
+#[tokio::test]
+async fn a_stream_that_ends_without_completing_is_an_error() {
+    // One content chunk, then the connection closes: no finish_reason, no
+    // [DONE]. Resuming is out of scope, so this must surface as an error, not
+    // as a silently truncated answer.
+    let server = MockLlmServer::start(vec![Response::status(
+        "200 OK",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half an ans\"}}]}\n\n",
+    )])
+    .await;
+
+    let mut stream = provider(server.base_url())
+        .chat_stream(ChatRequest::new(vec![Message::user("hi")]))
+        .await
+        .unwrap();
+
+    let mut last = None;
+    while let Some(event) = stream.next().await {
+        last = Some(event);
+    }
+
+    let error = last.expect("the stream produced events").unwrap_err();
+    assert!(
+        matches!(error, LlmError::InvalidResponse(_)),
+        "got {error:?}"
+    );
+    assert!(error.to_string().contains("before the response completed"));
+}

@@ -19,7 +19,8 @@
 │   agent/prompt.rs            │ │   llm/routing.rs            │
 │   agent/session.rs           │ │   llm/retry.rs              │
 │   tools/file/*.rs            │ │   llm/http.rs（共有配管）   │
-│   tools/registry.rs          │ │   fs/local.rs               │
+│   tools/registry.rs          │ │   llm/sse.rs（SSE 枠組）    │
+│                              │ │   fs/local.rs               │
 │                              │ │   fs/search.rs              │
 │                              │ │   fs/context.rs             │
 │  ※ tokio に依存しない        │ │   config/{kinds,env}.rs     │
@@ -33,7 +34,7 @@
         │   error.rs ドメインのエラー語彙          │
         │                                          │
         │   依存: std, serde, thiserror,           │
-        │         async-trait のみ                 │
+        │         async-trait, futures-core のみ   │
         └──────────────────────────────────────────┘
 ```
 
@@ -177,4 +178,4 @@ pub struct RequestMetadata {
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 129 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 144 本）。

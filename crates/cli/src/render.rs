@@ -22,8 +22,17 @@ pub struct TerminalRenderer {
     verbose: bool,
     color: bool,
     /// Serialises writes so concurrent read-only tool calls cannot interleave
-    /// their lines.
-    lock: Mutex<()>,
+    /// their lines, and remembers whether the current answer has already been
+    /// streamed to stdout as deltas.
+    state: Mutex<RenderState>,
+}
+
+#[derive(Default)]
+struct RenderState {
+    /// True once an `AssistantDelta` was printed for the answer in progress.
+    /// The full `AssistantMessage` then only terminates the line - printing it
+    /// again would duplicate everything the deltas already showed.
+    streaming: bool,
 }
 
 impl TerminalRenderer {
@@ -33,7 +42,7 @@ impl TerminalRenderer {
         Self {
             verbose,
             color,
-            lock: Mutex::new(()),
+            state: Mutex::new(RenderState::default()),
         }
     }
 
@@ -46,16 +55,31 @@ impl TerminalRenderer {
     }
 
     fn status(&self, line: impl AsRef<str>) {
-        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let mut stderr = std::io::stderr();
         let _ = writeln!(stderr, "{}", line.as_ref());
         let _ = stderr.flush();
     }
 
-    fn answer(&self, text: &str) {
-        let _guard = self.lock.lock().unwrap_or_else(|error| error.into_inner());
+    /// Prints one streamed fragment, without a newline, flushed immediately.
+    fn answer_delta(&self, text: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.streaming = true;
         let mut stdout = std::io::stdout();
-        let _ = writeln!(stdout, "{text}");
+        let _ = write!(stdout, "{text}");
+        let _ = stdout.flush();
+    }
+
+    fn answer(&self, text: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut stdout = std::io::stdout();
+        if state.streaming {
+            // The prose is already on screen; just end the line.
+            state.streaming = false;
+            let _ = writeln!(stdout);
+        } else {
+            let _ = writeln!(stdout, "{text}");
+        }
         let _ = stdout.flush();
     }
 }
@@ -106,6 +130,8 @@ impl EventSink for TerminalRenderer {
                     ));
                 }
             }
+
+            AgentEvent::AssistantDelta { text } => self.answer_delta(&text),
 
             AgentEvent::AssistantMessage { text } => self.answer(&text),
 

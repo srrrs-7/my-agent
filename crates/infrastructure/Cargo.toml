@@ -11,7 +11,9 @@ description = "Adapter layer: HTTP LLM clients, the sandboxed filesystem, config
 agent-domain = { workspace = true }
 
 async-trait = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
 ignore = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }

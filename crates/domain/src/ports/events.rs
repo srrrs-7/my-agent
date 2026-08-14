@@ -39,6 +39,13 @@ pub enum AgentEvent {
         usage: TokenUsage,
         latency: Duration,
     },
+    /// A streamed fragment of the assistant's prose, for incremental display.
+    /// The full text still arrives as [`AgentEvent::AssistantMessage`] once the
+    /// turn completes; sinks that render deltas must treat that message as the
+    /// terminator of the streamed text, not as a second copy.
+    AssistantDelta {
+        text: String,
+    },
     AssistantMessage {
         text: String,
     },

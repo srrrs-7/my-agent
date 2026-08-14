@@ -10,8 +10,10 @@
 //! * It must not know about HTTP, tokio, the filesystem, or any concrete LLM
 //!   vendor. Those live behind the ports in [`ports`].
 //! * The only external dependencies allowed are data-shape helpers
-//!   (`serde`, `serde_json` for JSON-Schema tool definitions), `thiserror`
-//!   and `async-trait` for object-safe async ports.
+//!   (`serde`, `serde_json` for JSON-Schema tool definitions), `thiserror`,
+//!   `async-trait` for object-safe async ports, and `futures-core` for the
+//!   `Stream` trait streamed responses are expressed in. All of them are
+//!   runtime-agnostic; anything that needs an executor stays outside.
 
 pub mod error;
 pub mod model;
@@ -35,7 +37,7 @@ pub use ports::{
     context::ContextProvider,
     events::{AgentEvent, EventSink, FinishReason, NullEventSink},
     file_system::{DirEntry, EntryKind, FileSystem},
-    llm::{LlmProvider, LlmRouter, RouteDecision},
+    llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent},
     prompt::PromptBuilder,
     search::{FileSearcher, SearchHit, SearchQuery},
     tool::Tool,

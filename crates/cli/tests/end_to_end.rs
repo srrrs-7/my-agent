@@ -46,7 +46,18 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Non-streaming agent: the canned replies here are plain JSON bodies, so
+    /// the loop must not ask the provider to stream. The streaming path gets
+    /// its own fixture below with SSE replies.
     async fn new(responses: Vec<Response>) -> Self {
+        Self::with_streaming(responses, false).await
+    }
+
+    async fn new_streaming(responses: Vec<Response>) -> Self {
+        Self::with_streaming(responses, true).await
+    }
+
+    async fn with_streaming(responses: Vec<Response>, stream: bool) -> Self {
         let workspace = tempfile::tempdir().unwrap();
         let server = MockLlmServer::start(responses).await;
         let root = Arc::new(WorkspaceRoot::new(workspace.path().to_path_buf()).unwrap());
@@ -87,6 +98,7 @@ impl Fixture {
             },
             AgentLoopConfig {
                 max_iterations: 5,
+                stream,
                 ..AgentLoopConfig::default()
             },
         );
@@ -251,4 +263,71 @@ async fn a_malformed_tool_argument_is_reported_back_to_the_model() {
         content.contains("content"),
         "the missing field is named: {content}"
     );
+}
+
+#[tokio::test]
+async fn a_streamed_conversation_reads_a_file_and_answers() {
+    // Turn 1: the model streams a tool call whose JSON arguments arrive split
+    // across chunks. Turn 2: it streams the prose answer in fragments.
+    let fixture = Fixture::new_streaming(vec![
+        Response::sse_tool_call_stream(
+            "call_1",
+            "read_file",
+            &[r#"{"pa"#, r#"th":"he"#, r#"llo.txt"}"#],
+        ),
+        Response::sse_text_stream(&["The file greets ", "you in Japanese."]),
+    ])
+    .await;
+
+    fixture.write("hello.txt", "konnichiwa\n");
+
+    let mut session = Session::new("e2e-stream-1");
+    let outcome = fixture
+        .agent
+        .run(&mut session, "what is in hello.txt?")
+        .await
+        .unwrap();
+
+    // The fragmented arguments were aggregated before the tool ran: the file
+    // was actually read and its contents fed back to the model.
+    assert_eq!(outcome.final_text, "The file greets you in Japanese.");
+    assert_eq!(outcome.reason, FinishReason::Completed);
+    assert_eq!(
+        outcome.usage.total(),
+        300,
+        "usage still arrives via the stream's usage chunks"
+    );
+
+    let requests = fixture.server.json_requests().await;
+    assert_eq!(requests[0]["stream"], serde_json::json!(true));
+    assert_eq!(
+        requests[0]["stream_options"]["include_usage"],
+        serde_json::json!(true)
+    );
+    assert!(
+        tool_result(&requests[1], "call_1").contains("konnichiwa"),
+        "the aggregated call executed against the real filesystem"
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_turn_can_still_be_denied_by_the_sandbox() {
+    let fixture = Fixture::new_streaming(vec![
+        Response::sse_tool_call_stream("call_1", "read_file", &[r#"{"path":"/etc/passwd"}"#]),
+        Response::sse_text_stream(&["I cannot read files outside the workspace."]),
+    ])
+    .await;
+
+    let mut session = Session::new("e2e-stream-2");
+    let outcome = fixture
+        .agent
+        .run(&mut session, "read /etc/passwd")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.reason, FinishReason::Completed);
+    let requests = fixture.server.json_requests().await;
+    let content = tool_result(&requests[1], "call_1");
+    assert!(content.contains("escapes the workspace"), "got: {content}");
+    assert!(!content.contains("root:"));
 }

@@ -13,7 +13,7 @@
 //! * newer OpenAI models require `max_completion_tokens` instead of
 //!   `max_tokens`; the field name is configurable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use agent_domain::error::LlmError;
@@ -22,14 +22,16 @@ use agent_domain::model::llm::{
 };
 use agent_domain::model::message::{ContentBlock, Message, Role};
 use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName};
-use agent_domain::ports::llm::LlmProvider;
+use agent_domain::ports::llm::{ChatStream, LlmProvider, StreamEvent};
 use agent_domain::text::clip;
 use async_trait::async_trait;
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
 use super::http;
+use super::sse::SseFraming;
 
 pub struct OpenAiCompatibleProvider {
     id: ProviderId,
@@ -75,7 +77,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             supports_tools: true,
-            supports_streaming: false,
+            supports_streaming: true,
             supports_system_prompt: true,
             max_context_tokens: None,
         }
@@ -86,6 +88,40 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .model
             .clone()
             .unwrap_or_else(|| self.default_model.clone());
+        let builder = self.request_builder(&request, &model, false);
+
+        let text = http::send(builder, &self.base_url, self.timeout).await?;
+
+        let parsed: WireResponse = serde_json::from_str(&text).map_err(|error| {
+            LlmError::InvalidResponse(format!("{error} (body: {})", clip(&text, 300)))
+        })?;
+
+        self.decode(parsed, model)
+    }
+
+    async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream, LlmError> {
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.default_model.clone());
+        let builder = self.request_builder(&request, &model, true);
+
+        // A failure here (bad status, unreachable host) happens before any
+        // event was produced, so the retry decorator may safely retry it.
+        let bytes = http::send_streaming(builder, &self.base_url, self.timeout).await?;
+
+        Ok(stream_events(bytes, self.id.clone(), model))
+    }
+}
+
+impl OpenAiCompatibleProvider {
+    /// Builds the request both entry points share; only `stream` differs.
+    fn request_builder(
+        &self,
+        request: &ChatRequest,
+        model: &ModelId,
+        stream: bool,
+    ) -> reqwest::RequestBuilder {
         let url = format!("{}/chat/completions", self.base_url);
 
         let mut messages = Vec::with_capacity(request.messages.len() + 1);
@@ -113,30 +149,39 @@ impl LlmProvider for OpenAiCompatibleProvider {
             top_p: request.params.top_p,
             stop: request.params.stop_sequences.clone(),
             max_tokens,
-            stream: false,
+            stream,
+            // Without this the final usage chunk is omitted by most servers.
+            // Tolerated by the ones that predate it via the AGENT_STREAM=false
+            // escape hatch.
+            stream_options: stream.then_some(WireStreamOptions {
+                include_usage: true,
+            }),
         };
 
         let mut builder = self.client.post(&url).json(&body);
         if let Some(key) = &self.api_key {
             builder = builder.bearer_auth(key);
         }
-
-        let text = http::send(builder, &self.base_url, self.timeout).await?;
-
-        let parsed: WireResponse = serde_json::from_str(&text).map_err(|error| {
-            LlmError::InvalidResponse(format!("{error} (body: {})", clip(&text, 300)))
-        })?;
-
-        self.decode(parsed, model)
+        builder
     }
-}
 
-impl OpenAiCompatibleProvider {
     fn decode(
         &self,
         response: WireResponse,
         requested_model: ModelId,
     ) -> Result<ChatResponse, LlmError> {
+        decode_response(&self.id, response, requested_model)
+    }
+}
+
+/// Decodes a complete (or stream-assembled) response. Free-standing so the
+/// `'static` event stream can decode without borrowing the provider.
+fn decode_response(
+    provider: &ProviderId,
+    response: WireResponse,
+    requested_model: ModelId,
+) -> Result<ChatResponse, LlmError> {
+    {
         let choice = response.choices.into_iter().next().ok_or_else(|| {
             LlmError::InvalidResponse("the response contained no choices".to_string())
         })?;
@@ -191,15 +236,230 @@ impl OpenAiCompatibleProvider {
             })
             .unwrap_or_default();
 
-        debug!(provider = %self.id, tool_calls = has_tool_calls, "chat completion decoded");
+        debug!(provider = %provider, tool_calls = has_tool_calls, "chat completion decoded");
 
         Ok(ChatResponse {
             message: Message::assistant(content),
             stop_reason,
             usage,
             model: response.model.map(ModelId::new).unwrap_or(requested_model),
-            provider: self.id.clone(),
+            provider: provider.clone(),
         })
+    }
+}
+
+// --- streaming ---------------------------------------------------------------
+
+/// Turns the SSE byte stream into the domain's [`StreamEvent`] protocol.
+///
+/// Chunks are absorbed into a [`StreamAccumulator`]; prose surfaces
+/// immediately as [`StreamEvent::TextDelta`], tool-call fragments only
+/// accumulate. When the server signals completion (`[DONE]`, or EOF after a
+/// `finish_reason`), the accumulated state is decoded through the same
+/// [`decode_response`] path the non-streaming call uses - so a streamed turn
+/// and a plain turn obey identical invariants, tool-call aggregation included.
+fn stream_events(
+    bytes: http::ByteStream,
+    provider: ProviderId,
+    requested_model: ModelId,
+) -> ChatStream {
+    struct State {
+        bytes: http::ByteStream,
+        framing: SseFraming,
+        /// `None` once the final response has been assembled.
+        accumulator: Option<StreamAccumulator>,
+        pending: VecDeque<Result<StreamEvent, LlmError>>,
+        saw_done: bool,
+        finished: bool,
+        provider: ProviderId,
+        requested_model: Option<ModelId>,
+    }
+
+    impl State {
+        /// Assembles the final [`StreamEvent::Completed`] (or the error that
+        /// explains why there is none) and queues it.
+        fn finalize(&mut self) {
+            let Some(accumulator) = self.accumulator.take() else {
+                return;
+            };
+            let event = if self.saw_done || accumulator.is_complete() {
+                let model = self
+                    .requested_model
+                    .take()
+                    .expect("requested_model is taken exactly once, with the accumulator");
+                decode_response(&self.provider, accumulator.into_response(), model)
+                    .map(StreamEvent::Completed)
+            } else {
+                // EOF without a completion marker: the connection broke.
+                // Resuming a half-delivered stream is explicitly out of scope.
+                Err(LlmError::InvalidResponse(
+                    "the stream ended before the response completed".to_string(),
+                ))
+            };
+            self.pending.push_back(event);
+        }
+    }
+
+    let state = State {
+        bytes,
+        framing: SseFraming::new(),
+        accumulator: Some(StreamAccumulator::default()),
+        pending: VecDeque::new(),
+        saw_done: false,
+        finished: false,
+        provider,
+        requested_model: Some(requested_model),
+    };
+
+    Box::pin(futures::stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                // `Completed` and errors are terminal: nothing may follow them.
+                if matches!(event, Err(_) | Ok(StreamEvent::Completed(_))) {
+                    state.finished = true;
+                }
+                return Some((event, state));
+            }
+            if state.finished {
+                return None;
+            }
+
+            match state.bytes.next().await {
+                Some(Ok(chunk)) => {
+                    for payload in state.framing.feed(&chunk) {
+                        if state.accumulator.is_none() {
+                            // Trailing data after completion; ignore.
+                            continue;
+                        }
+                        if payload == "[DONE]" {
+                            state.saw_done = true;
+                            state.finalize();
+                            continue;
+                        }
+                        match serde_json::from_str::<WireStreamChunk>(&payload) {
+                            Ok(parsed) => {
+                                let delta = state
+                                    .accumulator
+                                    .as_mut()
+                                    .expect("checked above")
+                                    .absorb(parsed);
+                                if let Some(delta) = delta {
+                                    state.pending.push_back(Ok(StreamEvent::TextDelta(delta)));
+                                }
+                            }
+                            Err(error) => {
+                                state
+                                    .pending
+                                    .push_back(Err(LlmError::InvalidResponse(format!(
+                                        "undecodable stream chunk: {error} (payload: {})",
+                                        clip(&payload, 200)
+                                    ))));
+                            }
+                        }
+                    }
+                }
+                Some(Err(error)) => {
+                    state.pending.push_back(Err(error));
+                }
+                None => {
+                    state.finalize();
+                    if state.pending.is_empty() {
+                        // Finalize was a no-op (already completed earlier).
+                        return None;
+                    }
+                }
+            }
+        }
+    }))
+}
+
+/// Reassembles a chat completion from stream chunks.
+///
+/// Tool-call fragments are keyed by the wire `index` and their `arguments`
+/// strings concatenated; nothing is surfaced until [`Self::into_response`], so
+/// a partially-received call can never leak out.
+#[derive(Debug, Default)]
+struct StreamAccumulator {
+    model: Option<String>,
+    text: String,
+    calls: BTreeMap<u32, PartialToolCall>,
+    finish_reason: Option<String>,
+    usage: Option<WireUsage>,
+}
+
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+impl StreamAccumulator {
+    /// Absorbs one chunk and returns any prose to surface as a delta.
+    fn absorb(&mut self, chunk: WireStreamChunk) -> Option<String> {
+        if self.model.is_none() {
+            self.model = chunk.model;
+        }
+        if chunk.usage.is_some() {
+            self.usage = chunk.usage;
+        }
+
+        let mut delta_text: Option<String> = None;
+        for choice in chunk.choices {
+            if choice.finish_reason.is_some() {
+                self.finish_reason = choice.finish_reason;
+            }
+            if let Some(content) = choice.delta.content.as_ref().and_then(Value::as_str) {
+                if !content.is_empty() {
+                    self.text.push_str(content);
+                    delta_text.get_or_insert_default().push_str(content);
+                }
+            }
+            for call in choice.delta.tool_calls {
+                let entry = self.calls.entry(call.index.unwrap_or(0)).or_default();
+                if entry.id.is_none() {
+                    entry.id = call.id.filter(|id| !id.is_empty());
+                }
+                if let Some(name) = call.function.name {
+                    entry.name.push_str(&name);
+                }
+                if let Some(arguments) = call.function.arguments {
+                    entry.arguments.push_str(&arguments);
+                }
+            }
+        }
+        delta_text
+    }
+
+    /// Whether the server marked the turn as finished.
+    fn is_complete(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
+    /// Synthesizes the non-streaming wire shape so [`decode_response`] applies
+    /// unchanged - id fallbacks, argument parsing, stop-reason policy and all.
+    fn into_response(self) -> WireResponse {
+        WireResponse {
+            model: self.model,
+            choices: vec![WireChoice {
+                message: WireResponseMessage {
+                    content: Some(Value::String(self.text)),
+                    tool_calls: self
+                        .calls
+                        .into_values()
+                        .map(|call| WireResponseToolCall {
+                            id: call.id,
+                            function: WireResponseFunction {
+                                name: call.name,
+                                arguments: Value::String(call.arguments),
+                            },
+                        })
+                        .collect(),
+                },
+                finish_reason: self.finish_reason,
+            }],
+            usage: self.usage,
+        }
     }
 }
 
@@ -299,6 +559,59 @@ struct WireRequest<'a> {
     #[serde(flatten)]
     max_tokens: BTreeMap<String, u32>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<WireStreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct WireStreamOptions {
+    include_usage: bool,
+}
+
+// --- streaming wire types ----------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct WireStreamChunk {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<WireStreamChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireStreamChoice {
+    #[serde(default)]
+    delta: WireStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireStreamDelta {
+    #[serde(default)]
+    content: Option<Value>,
+    #[serde(default)]
+    tool_calls: Vec<WireStreamToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireStreamToolCall {
+    #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: WireStreamFunction,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WireStreamFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -497,6 +810,7 @@ mod tests {
             stop: vec![],
             max_tokens: BTreeMap::from([("max_completion_tokens".to_string(), 128)]),
             stream: false,
+            stream_options: None,
         };
         let serialised = serde_json::to_value(&body).unwrap();
         assert_eq!(serialised["max_completion_tokens"], json!(128));

@@ -95,6 +95,9 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 
 `chat` 内のコマンド: `/reset` `/usage` `/tools` `/help` `/exit`
 
+応答は既定でストリーミング表示されます（生成と同時に流れる）。`AGENT_STREAM=false` で
+従来の一括表示に戻せます。どちらでも stdout に出る内容は同一です。
+
 出力のチャネル分離:
 
 - **stdout** … モデルの回答のみ（`agent run "..." > answer.md` がそのまま使えます）
@@ -246,7 +249,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 129 本、外部ネットワークもモデルも不要です。
+テストは 144 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -299,6 +302,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 
 | 変数 | 既定値 | 意味 |
 |---|---|---|
+| `AGENT_STREAM` | `true` | 応答の逐次表示（SSE）。サーバが `stream` を拒否する場合や一括表示に戻したい場合は `false` |
 | `AGENT_MAX_TOKENS` | `4096` | 生成トークン上限 |
 | `AGENT_TEMPERATURE` | `0.2` | |
 | `AGENT_REQUEST_TIMEOUT_SECS` | `180` | HTTP リクエストの上限時間 |

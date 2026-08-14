@@ -26,6 +26,13 @@ pub struct AgentLoopConfig {
     /// Run read-only tool calls of the same turn concurrently. Mutating calls
     /// always run sequentially, in the order the model asked for them.
     pub parallel_read_only_tools: bool,
+
+    /// Ask the provider to stream and surface prose incrementally. Providers
+    /// without streaming fall back transparently, so this stays `true` unless
+    /// a server misbehaves on `stream: true` (the `AGENT_STREAM=false` escape
+    /// hatch). `false` also restores the retry semantics of a whole-response
+    /// call: a mid-stream failure cannot be retried, a whole request can.
+    pub stream: bool,
 }
 
 impl Default for AgentLoopConfig {
@@ -43,6 +50,7 @@ impl Default for AgentLoopConfig {
             max_history_bytes: 256 * 1024,
             keep_recent_messages: 6,
             parallel_read_only_tools: true,
+            stream: true,
         }
     }
 }

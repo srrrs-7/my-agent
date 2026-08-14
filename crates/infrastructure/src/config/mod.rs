@@ -101,6 +101,7 @@ pub struct LoopSettings {
     pub max_history_bytes: usize,
     pub tool_timeout: Duration,
     pub parallel_read_only_tools: bool,
+    pub stream: bool,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
 }
@@ -158,6 +159,7 @@ impl LoopSettings {
             max_history_bytes: reader.parsed("AGENT_MAX_HISTORY_BYTES", 256 * 1024)?,
             tool_timeout: Duration::from_secs(reader.parsed("AGENT_TOOL_TIMEOUT_SECS", 60)?),
             parallel_read_only_tools: reader.parsed("AGENT_PARALLEL_READ_TOOLS", true)?,
+            stream: reader.parsed("AGENT_STREAM", true)?,
             temperature: Some(reader.optional("AGENT_TEMPERATURE")?.unwrap_or(0.2)),
             max_tokens: Some(reader.optional("AGENT_MAX_TOKENS")?.unwrap_or(4096)),
         })
@@ -336,6 +338,7 @@ mod tests {
             ("AGENT_MAX_ITERATIONS", "3"),
             ("AGENT_TOOL_TIMEOUT_SECS", "7"),
             ("AGENT_PARALLEL_READ_TOOLS", "false"),
+            ("AGENT_STREAM", "false"),
             ("AGENT_TEMPERATURE", "0.9"),
         ])
         .unwrap();
@@ -343,6 +346,7 @@ mod tests {
         assert_eq!(settings.agent_loop.max_iterations, 3);
         assert_eq!(settings.agent_loop.tool_timeout, Duration::from_secs(7));
         assert!(!settings.agent_loop.parallel_read_only_tools);
+        assert!(!settings.agent_loop.stream);
         assert_eq!(settings.agent_loop.temperature, Some(0.9));
     }
 

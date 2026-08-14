@@ -49,7 +49,7 @@ color: cyan
 
 ## 見落としやすい点
 
-- 「便利だから」で `domain` に外部依存を足していないか（許可は std, serde, thiserror, async-trait のみ）
+- 「便利だから」で `domain` に外部依存を足していないか（許可は std, serde, serde_json, thiserror, async-trait, futures-core のみ）
 - 共有カーネル `domain/src/text.rs` に、本当は共有でないものを入れていないか
 - ポートを足す前に、既存のポートの合成（装飾子）で足りないか
 - `RequestMetadata` に既にある情報を、プロンプト解析で取り直そうとしていないか

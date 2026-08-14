@@ -59,6 +59,54 @@ pub(crate) async fn send(
     Ok(text)
 }
 
+/// Byte stream of a successful streaming response, errors already mapped into
+/// domain vocabulary.
+pub(crate) type ByteStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, LlmError>> + Send>>;
+
+/// Streaming counterpart of [`send`]: checks the status (reading the error
+/// body if the request failed, so status failures stay *pre-stream* and
+/// therefore retryable) and hands back the raw byte stream on success.
+///
+/// The client-level timeout covers the whole exchange, stream included - a
+/// generation slower than `AGENT_REQUEST_TIMEOUT_SECS` in total is cut off.
+pub(crate) async fn send_streaming(
+    request: reqwest::RequestBuilder,
+    base_url: &str,
+    timeout: Duration,
+) -> Result<ByteStream, LlmError> {
+    use futures::StreamExt as _;
+
+    let base_url = base_url.to_string();
+    let transport = move |error: reqwest::Error| {
+        if error.is_timeout() {
+            LlmError::Timeout {
+                seconds: timeout.as_secs(),
+            }
+        } else {
+            LlmError::Transport(format!("{error} ({base_url})"))
+        }
+    };
+
+    let response = request.send().await.map_err(&transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let text = response.text().await.map_err(&transport)?;
+        return Err(map_http_failure(status.as_u16(), retry_after, &text));
+    }
+
+    Ok(Box::pin(
+        response
+            .bytes_stream()
+            .map(move |item| item.map_err(&transport)),
+    ))
+}
+
 /// Shared HTTP status mapping so every client reports failures the same way.
 pub(crate) fn map_http_failure(status: u16, retry_after_secs: Option<u64>, body: &str) -> LlmError {
     let message = extract_error_message(body);

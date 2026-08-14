@@ -22,14 +22,17 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent_domain::model::llm::{ChatRequest, RequestMetadata, StopReason, TaskKind, TokenUsage};
+use agent_domain::model::llm::{
+    ChatRequest, ChatResponse, RequestMetadata, StopReason, TaskKind, TokenUsage,
+};
 use agent_domain::model::message::Message;
 use agent_domain::model::tool::{ToolCall, ToolDefinition};
 use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::context::ContextProvider;
 use agent_domain::ports::events::{AgentEvent, EventSink, FinishReason};
-use agent_domain::ports::llm::LlmProvider;
+use agent_domain::ports::llm::{LlmProvider, StreamEvent};
 use agent_domain::ports::prompt::PromptBuilder;
+use futures::StreamExt as _;
 use tracing::{debug, warn};
 
 use super::config::AgentLoopConfig;
@@ -136,7 +139,11 @@ impl AgentLoop {
 
             let request = self.build_request(session, &system_prompt, &tools, iteration);
             let started = Instant::now();
-            let response = self.llm.chat(request).await?;
+            let response = if self.config.stream {
+                self.chat_streaming(request).await?
+            } else {
+                self.llm.chat(request).await?
+            };
 
             session.usage.accumulate(response.usage);
             self.events.emit(AgentEvent::ModelResponded {
@@ -179,6 +186,50 @@ impl AgentLoop {
             partial,
             limit,
             FinishReason::MaxIterations { limit },
+        ))
+    }
+
+    /// One model round-trip over the streaming interface.
+    ///
+    /// Prose fragments surface immediately as [`AgentEvent::AssistantDelta`];
+    /// the turn is still driven solely by the final completed response, which
+    /// carries any tool calls with fully-aggregated arguments. Providers that
+    /// cannot stream yield only the completed response (no deltas), which is
+    /// exactly the non-streamed rendering path - so this method behaves
+    /// identically to [`LlmProvider::chat`] for them.
+    async fn chat_streaming(&self, request: ChatRequest) -> Result<ChatResponse, AppError> {
+        let mut stream = self.llm.chat_stream(request).await?;
+
+        // Leading whitespace is held back: the non-streaming path never prints
+        // a whitespace-only answer (some models emit "\n\n" before a tool
+        // call), and the streamed output must be byte-identical to it.
+        let mut held_whitespace = String::new();
+        let mut live = false;
+
+        while let Some(event) = stream.next().await {
+            match event.map_err(AppError::from)? {
+                StreamEvent::TextDelta(delta) => {
+                    if live {
+                        self.events.emit(AgentEvent::AssistantDelta { text: delta });
+                    } else {
+                        held_whitespace.push_str(&delta);
+                        if !held_whitespace.trim().is_empty() {
+                            live = true;
+                            self.events.emit(AgentEvent::AssistantDelta {
+                                text: std::mem::take(&mut held_whitespace),
+                            });
+                        }
+                    }
+                }
+                // The protocol makes `Completed` the final event.
+                StreamEvent::Completed(response) => return Ok(response),
+            }
+        }
+
+        Err(AppError::Llm(
+            agent_domain::error::LlmError::InvalidResponse(
+                "the stream ended without a completed response".to_string(),
+            ),
         ))
     }
 

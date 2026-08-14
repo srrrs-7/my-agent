@@ -19,6 +19,7 @@ pub(crate) mod http;
 pub mod openai;
 pub mod retry;
 pub mod routing;
+pub(crate) mod sse;
 
 pub use anthropic::AnthropicProvider;
 pub use factory::build_provider;
