@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use agent_domain::text;
 
-use crate::tools::util::parse_arguments;
+use crate::tools::util::{ToolErrorContext, parse_arguments};
 
 const DEFAULT_MAX_RESULTS: usize = 100;
 const HARD_MAX_RESULTS: usize = 500;
@@ -102,7 +102,7 @@ impl Tool for SearchFilesTool {
         let root = self
             .root
             .resolve(input.path.as_deref().unwrap_or(""))
-            .map_err(|error| ToolError::invalid_input(&name, error.to_string()))?;
+            .for_tool(&name)?;
 
         let max_results = input
             .max_results
@@ -119,7 +119,7 @@ impl Tool for SearchFilesTool {
                 max_results,
             })
             .await
-            .map_err(|error| ToolError::execution(&name, error.to_string()))?;
+            .for_tool(&name)?;
 
         if hits.is_empty() {
             return Ok(ToolOutcome::new(format!(

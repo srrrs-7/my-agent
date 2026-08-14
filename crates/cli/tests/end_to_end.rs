@@ -10,7 +10,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_application::agent::{AgentLoop, AgentLoopConfig, Session};
+use agent_application::agent::{
+    AgentDependencies, AgentLoop, AgentLoopConfig, DefaultPromptBuilder, Session,
+};
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::file::{ReadFileTool, WriteFileTool};
 use agent_domain::error::ApprovalError;
@@ -75,11 +77,14 @@ impl Fixture {
         );
 
         let agent = AgentLoop::new(
-            build_provider(&settings).unwrap(),
-            tools,
-            Arc::new(ApproveAll),
-            Arc::new(NullEventSink),
-            Arc::new(WorkspaceContextProvider::new(root)),
+            AgentDependencies {
+                llm: build_provider(&settings).unwrap(),
+                tools,
+                approval: Arc::new(ApproveAll),
+                events: Arc::new(NullEventSink),
+                context: Arc::new(WorkspaceContextProvider::new(root)),
+                prompt: Arc::new(DefaultPromptBuilder),
+            },
             AgentLoopConfig {
                 max_iterations: 5,
                 ..AgentLoopConfig::default()

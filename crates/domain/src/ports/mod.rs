@@ -10,6 +10,7 @@ pub mod context;
 pub mod events;
 pub mod file_system;
 pub mod llm;
+pub mod prompt;
 pub mod search;
 pub mod tool;
 
@@ -18,5 +19,6 @@ pub use context::ContextProvider;
 pub use events::{AgentEvent, EventSink, FinishReason};
 pub use file_system::{DirEntry, EntryKind, FileSystem};
 pub use llm::{LlmProvider, LlmRouter, RouteDecision};
+pub use prompt::PromptBuilder;
 pub use search::{FileSearcher, SearchHit, SearchQuery};
 pub use tool::Tool;

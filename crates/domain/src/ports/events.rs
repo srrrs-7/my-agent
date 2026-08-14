@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use crate::model::llm::{ModelId, ProviderId, StopReason, TokenUsage};
-use crate::model::tool::{ToolCall, ToolName, ToolSafety};
+use crate::model::tool::{ToolCall, ToolCallId, ToolName, ToolSafety};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
@@ -48,7 +48,7 @@ pub enum AgentEvent {
     },
     ToolCallFinished {
         name: ToolName,
-        call_id: String,
+        call_id: ToolCallId,
         is_error: bool,
         summary: String,
         duration: Duration,

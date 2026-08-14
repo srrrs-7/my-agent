@@ -36,6 +36,7 @@ pub use ports::{
     events::{AgentEvent, EventSink, FinishReason, NullEventSink},
     file_system::{DirEntry, EntryKind, FileSystem},
     llm::{LlmProvider, LlmRouter, RouteDecision},
+    prompt::PromptBuilder,
     search::{FileSearcher, SearchHit, SearchQuery},
     tool::Tool,
 };

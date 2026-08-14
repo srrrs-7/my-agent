@@ -9,7 +9,7 @@ use crate::config::{LlmSettings, ProviderKind, ProviderSettings, RouterKind};
 
 use super::{
     AnthropicProvider, ModelPrefixRouter, OpenAiCompatibleProvider, RetryingProvider,
-    RoutingLlmProvider, StaticRouter,
+    RoutingProvider, StaticRouter,
 };
 
 /// Assembles `Retry(Route(clients...))`.
@@ -41,7 +41,7 @@ pub fn build_provider(settings: &LlmSettings) -> Result<Arc<dyn LlmProvider>, Ll
         )),
     };
 
-    let routing = Arc::new(RoutingLlmProvider::new(clients, router));
+    let routing = Arc::new(RoutingProvider::new(clients, router));
     Ok(Arc::new(RetryingProvider::new(
         routing,
         settings.max_retries,

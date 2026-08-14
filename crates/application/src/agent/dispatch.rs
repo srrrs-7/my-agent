@@ -203,7 +203,7 @@ impl ToolDispatcher {
 
         self.events.emit(AgentEvent::ToolCallFinished {
             name: call.name.clone(),
-            call_id: call.id.to_string(),
+            call_id: call.id.clone(),
             is_error: result.is_error,
             summary,
             duration,

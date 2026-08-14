@@ -3,10 +3,36 @@
 //! Text clipping lives in [`agent_domain::text`]; this module only deals with
 //! turning what a *model* sent into what a tool expects.
 
-use agent_domain::error::ToolError;
+use agent_domain::error::{DomainError, FsError, ToolError};
 use agent_domain::model::tool::ToolName;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+
+/// Attaches the owning tool to a low-level failure, encoding one policy in one
+/// place instead of at every call site:
+///
+/// * a [`DomainError`] (bad path, invalid value) means the *model's arguments*
+///   were wrong → [`ToolError::InvalidInput`];
+/// * an [`FsError`] means the arguments were fine but the operation failed →
+///   [`ToolError::Execution`].
+///
+/// Both render messages the model can act on, which is the contract every tool
+/// error must meet (see `.claude/rules/invariants.md` §3).
+pub trait ToolErrorContext<T> {
+    fn for_tool(self, tool: &ToolName) -> Result<T, ToolError>;
+}
+
+impl<T> ToolErrorContext<T> for Result<T, DomainError> {
+    fn for_tool(self, tool: &ToolName) -> Result<T, ToolError> {
+        self.map_err(|error| ToolError::invalid_input(tool, error.to_string()))
+    }
+}
+
+impl<T> ToolErrorContext<T> for Result<T, FsError> {
+    fn for_tool(self, tool: &ToolName) -> Result<T, ToolError> {
+        self.map_err(|error| ToolError::execution(tool, error.to_string()))
+    }
+}
 
 /// Deserialises model-supplied arguments, turning a schema mismatch into a
 /// message the model can act on rather than an opaque serde error.
@@ -78,5 +104,24 @@ mod tests {
         let parsed: Input =
             parse_arguments(&tool(), json!({"path": "a.rs", "unexpected": true})).unwrap();
         assert_eq!(parsed.path, "a.rs");
+    }
+
+    #[test]
+    fn domain_errors_become_invalid_input_and_fs_errors_become_execution() {
+        let bad_path: Result<(), _> = Err(DomainError::PathEscape {
+            path: "../etc".into(),
+        });
+        assert!(matches!(
+            bad_path.for_tool(&tool()).unwrap_err(),
+            ToolError::InvalidInput { .. }
+        ));
+
+        let missing: Result<(), _> = Err(FsError::NotFound {
+            path: "a.rs".into(),
+        });
+        assert!(matches!(
+            missing.for_tool(&tool()).unwrap_err(),
+            ToolError::Execution { .. }
+        ));
     }
 }

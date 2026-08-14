@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use agent_domain::text;
 
-use crate::tools::util::parse_arguments;
+use crate::tools::util::{ToolErrorContext, parse_arguments};
 
 /// Lines returned when the model does not ask for a window.
 const DEFAULT_LIMIT: usize = 1_500;
@@ -86,16 +86,13 @@ impl Tool for ReadFileTool {
         let name = Self::name();
         let input: Input = parse_arguments(&name, arguments)?;
 
-        let path = self
-            .root
-            .resolve(&input.path)
-            .map_err(|error| ToolError::invalid_input(&name, error.to_string()))?;
+        let path = self.root.resolve(&input.path).for_tool(&name)?;
 
         let content = self
             .file_system
             .read_to_string(&path)
             .await
-            .map_err(|error| ToolError::execution(&name, error.to_string()))?;
+            .for_tool(&name)?;
 
         if content.is_empty() {
             return Ok(ToolOutcome::new(format!("`{path}` exists but is empty."))

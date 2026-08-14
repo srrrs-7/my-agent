@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tools::file::human_bytes;
-use crate::tools::util::parse_arguments;
+use crate::tools::util::{ToolErrorContext, parse_arguments};
 
 /// Lists one directory (non-recursive).
 pub struct ListDirectoryTool {
@@ -64,13 +64,9 @@ impl Tool for ListDirectoryTool {
         let path = self
             .root
             .resolve(input.path.as_deref().unwrap_or(""))
-            .map_err(|error| ToolError::invalid_input(&name, error.to_string()))?;
+            .for_tool(&name)?;
 
-        let entries = self
-            .file_system
-            .list_dir(&path)
-            .await
-            .map_err(|error| ToolError::execution(&name, error.to_string()))?;
+        let entries = self.file_system.list_dir(&path).await.for_tool(&name)?;
 
         if entries.is_empty() {
             return Ok(ToolOutcome::new(format!("`{path}` is empty."))

@@ -199,8 +199,8 @@ crates/
 
 ```
 Arc<dyn LlmProvider>
-  = RetryingProvider(            ← 指数バックオフ（Retry-After 尊重）
-      RoutingLlmProvider(        ← リクエストごとに委譲先を選択
+  = RetryingProvider(         ← 指数バックオフ（Retry-After 尊重）
+      RoutingProvider(        ← リクエストごとに委譲先を選択
         { "local": OpenAiCompatibleProvider,
           "cloud": AnthropicProvider }))
 ```
@@ -246,7 +246,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 128 本、外部ネットワークもモデルも不要です。
+テストは 129 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）

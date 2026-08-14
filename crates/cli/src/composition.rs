@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use agent_application::agent::{AgentLoop, AgentLoopConfig};
+use agent_application::agent::{
+    AgentDependencies, AgentLoop, AgentLoopConfig, DefaultPromptBuilder,
+};
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::file::{
     EditFileTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
@@ -18,6 +20,7 @@ use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::events::EventSink;
 use agent_domain::ports::llm::LlmProvider;
+use agent_domain::ports::tool::Tool;
 use agent_infrastructure::config::{ApprovalPolicy, Settings};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
@@ -62,44 +65,23 @@ pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         Arc::new(CliApprovalGate::new(settings.approval, interactive));
     let events: Arc<dyn EventSink> = Arc::new(TerminalRenderer::new(cli.verbose, cli.no_color));
 
-    // --- tools ---------------------------------------------------------------
-    // Every tool is wrapped in a timeout so that one pathological call cannot
-    // stall the loop.
-    let timeout = settings.agent_loop.tool_timeout;
-    let tools = Arc::new(
-        ToolRegistry::new()
-            .with(TimeoutTool::wrap(
-                Arc::new(ReadFileTool::new(file_system.clone(), workspace.clone())),
-                timeout,
-            ))
-            .with(TimeoutTool::wrap(
-                Arc::new(WriteFileTool::new(file_system.clone(), workspace.clone())),
-                timeout,
-            ))
-            .with(TimeoutTool::wrap(
-                Arc::new(EditFileTool::new(file_system.clone(), workspace.clone())),
-                timeout,
-            ))
-            .with(TimeoutTool::wrap(
-                Arc::new(ListDirectoryTool::new(
-                    file_system.clone(),
-                    workspace.clone(),
-                )),
-                timeout,
-            ))
-            .with(TimeoutTool::wrap(
-                Arc::new(SearchFilesTool::new(searcher, workspace.clone())),
-                timeout,
-            )),
+    let tools = build_tools(
+        file_system,
+        searcher,
+        workspace.clone(),
+        settings.agent_loop.tool_timeout,
     );
 
     // --- the loop ------------------------------------------------------------
     let agent = AgentLoop::new(
-        provider.clone(),
-        tools.clone(),
-        approval,
-        events,
-        context,
+        AgentDependencies {
+            llm: provider.clone(),
+            tools: tools.clone(),
+            approval,
+            events,
+            context,
+            prompt: Arc::new(DefaultPromptBuilder),
+        },
         AgentLoopConfig {
             model: cli.model.as_deref().map(ModelId::new),
             params: GenerationParams {
@@ -123,6 +105,37 @@ pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         provider,
         agent,
     })
+}
+
+/// The default toolset, every tool wrapped in a timeout so that one
+/// pathological call cannot stall the loop.
+fn build_tools(
+    file_system: Arc<LocalFileSystem>,
+    searcher: Arc<IgnoreAwareSearcher>,
+    workspace: Arc<WorkspaceRoot>,
+    timeout: std::time::Duration,
+) -> Arc<ToolRegistry> {
+    let timed = |tool: Arc<dyn Tool>| TimeoutTool::wrap(tool, timeout);
+    Arc::new(
+        ToolRegistry::new()
+            .with(timed(Arc::new(ReadFileTool::new(
+                file_system.clone(),
+                workspace.clone(),
+            ))))
+            .with(timed(Arc::new(WriteFileTool::new(
+                file_system.clone(),
+                workspace.clone(),
+            ))))
+            .with(timed(Arc::new(EditFileTool::new(
+                file_system.clone(),
+                workspace.clone(),
+            ))))
+            .with(timed(Arc::new(ListDirectoryTool::new(
+                file_system,
+                workspace.clone(),
+            ))))
+            .with(timed(Arc::new(SearchFilesTool::new(searcher, workspace)))),
+    )
 }
 
 /// Environment first, command-line flags on top.

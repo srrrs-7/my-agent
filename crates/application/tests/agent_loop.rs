@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use agent_application::agent::{AgentLoop, AgentLoopConfig, Session};
+use agent_application::agent::{
+    AgentDependencies, AgentLoop, AgentLoopConfig, DefaultPromptBuilder, Session,
+};
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::file::{ReadFileTool, WriteFileTool};
 use agent_domain::error::{ApprovalError, FsError, LlmError};
@@ -224,11 +226,14 @@ fn loop_with(
     max_iterations: u32,
 ) -> AgentLoop {
     AgentLoop::new(
-        provider,
-        tools,
-        approval,
-        events,
-        Arc::new(FakeContext),
+        AgentDependencies {
+            llm: provider,
+            tools,
+            approval,
+            events,
+            context: Arc::new(FakeContext),
+            prompt: Arc::new(DefaultPromptBuilder),
+        },
         AgentLoopConfig {
             max_iterations,
             ..AgentLoopConfig::default()

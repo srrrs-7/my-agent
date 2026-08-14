@@ -1,6 +1,6 @@
 //! Provider routing.
 //!
-//! [`RoutingLlmProvider`] is a composite: it *is* an
+//! [`RoutingProvider`] is a composite: it *is* an
 //! [`LlmProvider`] and it *contains* several, delegating each request to the
 //! one a [`LlmRouter`] picks. Callers never learn that routing happened, which
 //! is what makes this safe to add later - or to remove.
@@ -22,12 +22,12 @@ use agent_domain::ports::llm::{LlmProvider, LlmRouter, RouteDecision};
 use async_trait::async_trait;
 use tracing::debug;
 
-pub struct RoutingLlmProvider {
+pub struct RoutingProvider {
     providers: BTreeMap<ProviderId, Arc<dyn LlmProvider>>,
     router: Arc<dyn LlmRouter>,
 }
 
-impl RoutingLlmProvider {
+impl RoutingProvider {
     pub fn new(providers: Vec<Arc<dyn LlmProvider>>, router: Arc<dyn LlmRouter>) -> Self {
         Self {
             providers: providers
@@ -44,7 +44,7 @@ impl RoutingLlmProvider {
 }
 
 #[async_trait]
-impl LlmProvider for RoutingLlmProvider {
+impl LlmProvider for RoutingProvider {
     fn id(&self) -> ProviderId {
         ProviderId::new("router")
     }
@@ -193,8 +193,8 @@ mod tests {
         }
     }
 
-    fn routing(router: Arc<dyn LlmRouter>) -> RoutingLlmProvider {
-        RoutingLlmProvider::new(
+    fn routing(router: Arc<dyn LlmRouter>) -> RoutingProvider {
+        RoutingProvider::new(
             vec![
                 Arc::new(StubProvider(ProviderId::new("local"))),
                 Arc::new(StubProvider(ProviderId::new("cloud"))),

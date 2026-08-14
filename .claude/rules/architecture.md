@@ -31,12 +31,13 @@
 
 | ポート | 実装 |
 |---|---|
-| `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingLlmProvider`, `RetryingProvider` |
+| `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider` |
 | `LlmRouter` | `StaticRouter`, `ModelPrefixRouter` |
 | `Tool` | `application/src/tools/file/*`（実装）, `TimeoutTool`（装飾） |
 | `FileSystem` | `LocalFileSystem` |
 | `FileSearcher` | `IgnoreAwareSearcher` |
 | `ContextProvider` | `WorkspaceContextProvider` |
+| `PromptBuilder` | `DefaultPromptBuilder`（外部注入のプロンプトは実装追加で対応） |
 | `ApprovalGate` | `CliApprovalGate` |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` |
 
@@ -45,7 +46,7 @@
 
 ```
 Arc<dyn LlmProvider>
-  = RetryingProvider(RoutingLlmProvider({ "local": OpenAi…, "cloud": Anthropic… }))
+  = RetryingProvider(RoutingProvider({ "local": OpenAi…, "cloud": Anthropic… }))
 ```
 
 将来のルーティング（コスト・レイテンシ・能力ベース、フェイルオーバー、A/B）は

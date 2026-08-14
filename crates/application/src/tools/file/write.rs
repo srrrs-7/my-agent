@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tools::file::human_bytes;
-use crate::tools::util::parse_arguments;
+use crate::tools::util::{ToolErrorContext, parse_arguments};
 
 /// Creates a file or replaces its entire contents.
 pub struct WriteFileTool {
@@ -66,10 +66,7 @@ impl Tool for WriteFileTool {
         let name = Self::name();
         let input: Input = parse_arguments(&name, arguments)?;
 
-        let path = self
-            .root
-            .resolve(&input.path)
-            .map_err(|error| ToolError::invalid_input(&name, error.to_string()))?;
+        let path = self.root.resolve(&input.path).for_tool(&name)?;
 
         if path.is_root() {
             return Err(ToolError::invalid_input(
@@ -78,16 +75,12 @@ impl Tool for WriteFileTool {
             ));
         }
 
-        let existed = self
-            .file_system
-            .exists(&path)
-            .await
-            .map_err(|error| ToolError::execution(&name, error.to_string()))?;
+        let existed = self.file_system.exists(&path).await.for_tool(&name)?;
 
         self.file_system
             .write(&path, &input.content)
             .await
-            .map_err(|error| ToolError::execution(&name, error.to_string()))?;
+            .for_tool(&name)?;
 
         let action = if existed { "Updated" } else { "Created" };
         let size = human_bytes(input.content.len() as u64);

@@ -25,7 +25,7 @@ scope: [domain, application, infrastructure, cli, docs]
 - **クレート**: `domain`（`LlmProvider` に `chat_stream` を追加。既定実装は
   非ストリーミングへのフォールバック。`ProviderCapabilities.supports_streaming` は定義済み）、
   `infrastructure`（OpenAI / Anthropic の SSE パース、`RetryingProvider` /
-  `RoutingLlmProvider` の対応）、`application`（ループがストリームを消費し、
+  `RoutingProvider` の対応）、`application`（ループがストリームを消費し、
   差分イベントを発行）、`cli`（`TerminalRenderer` の逐次描画）
 - **不変条件**: §1 — `application` は tokio 非依存のまま。ストリームは
   `futures::Stream` で表現する。§4 — ストリーミング中の `tool_call` は断片で届くため、

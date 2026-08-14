@@ -8,11 +8,27 @@ use std::fmt::Write as _;
 
 use agent_domain::model::context::ContextSnapshot;
 use agent_domain::model::tool::ToolDefinition;
+use agent_domain::ports::prompt::PromptBuilder;
 use agent_domain::text;
 
 /// Cap on the project instruction file so a huge `AGENTS.md` cannot crowd out
 /// the conversation.
 const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+
+/// The built-in prompt policy: environment, workspace overview, tool list,
+/// working rules, project instructions.
+///
+/// This is the [`PromptBuilder`] the composition root wires by default;
+/// operator-supplied prompts (see the backlog) become sibling implementations
+/// or decorators rather than edits to this one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPromptBuilder;
+
+impl PromptBuilder for DefaultPromptBuilder {
+    fn build(&self, context: &ContextSnapshot, tools: &[ToolDefinition]) -> String {
+        build_system_prompt(context, tools)
+    }
+}
 
 pub fn build_system_prompt(context: &ContextSnapshot, tools: &[ToolDefinition]) -> String {
     let mut prompt = String::with_capacity(2048);

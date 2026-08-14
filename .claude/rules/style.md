@@ -44,7 +44,7 @@ if tail.as_os_str().is_empty() { return Ok(canonical); }
 ## 命名
 
 - ポートの実装は「何であるか」で命名する（`LocalFileSystem`, `IgnoreAwareSearcher`）
-- 装飾子は `-ing` / 役割名（`RetryingProvider`, `TimeoutTool`, `RoutingLlmProvider`）
+- 装飾子は `-ing` / 役割名（`RetryingProvider`, `TimeoutTool`, `RoutingProvider`）
 - `&self` を取るメソッドに `into_*` を使わない（clippy が落とす）。`decode` などにする
 
 ## 避けること

@@ -29,11 +29,11 @@ use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::context::ContextProvider;
 use agent_domain::ports::events::{AgentEvent, EventSink, FinishReason};
 use agent_domain::ports::llm::LlmProvider;
+use agent_domain::ports::prompt::PromptBuilder;
 use tracing::{debug, warn};
 
 use super::config::AgentLoopConfig;
 use super::dispatch::{DispatchConfig, ToolDispatcher};
-use super::prompt::build_system_prompt;
 use super::session::Session;
 use crate::error::AppError;
 use crate::tools::registry::ToolRegistry;
@@ -55,23 +55,40 @@ impl AgentOutcome {
     }
 }
 
+/// Everything the loop collaborates with, named so call sites read as wiring
+/// rather than as a positional argument list.
+///
+/// Every field is a port: swap an implementation here and the loop is none the
+/// wiser. New collaborators are added as fields, which keeps the churn at the
+/// construction sites instead of in every signature between them.
+pub struct AgentDependencies {
+    pub llm: Arc<dyn LlmProvider>,
+    pub tools: Arc<ToolRegistry>,
+    pub approval: Arc<dyn ApprovalGate>,
+    pub events: Arc<dyn EventSink>,
+    pub context: Arc<dyn ContextProvider>,
+    pub prompt: Arc<dyn PromptBuilder>,
+}
+
 pub struct AgentLoop {
     llm: Arc<dyn LlmProvider>,
     dispatcher: ToolDispatcher,
     events: Arc<dyn EventSink>,
     context: Arc<dyn ContextProvider>,
+    prompt: Arc<dyn PromptBuilder>,
     config: AgentLoopConfig,
 }
 
 impl AgentLoop {
-    pub fn new(
-        llm: Arc<dyn LlmProvider>,
-        tools: Arc<ToolRegistry>,
-        approval: Arc<dyn ApprovalGate>,
-        events: Arc<dyn EventSink>,
-        context: Arc<dyn ContextProvider>,
-        config: AgentLoopConfig,
-    ) -> Self {
+    pub fn new(deps: AgentDependencies, config: AgentLoopConfig) -> Self {
+        let AgentDependencies {
+            llm,
+            tools,
+            approval,
+            events,
+            context,
+            prompt,
+        } = deps;
         let dispatcher = ToolDispatcher::new(
             tools,
             approval,
@@ -86,12 +103,9 @@ impl AgentLoop {
             dispatcher,
             events,
             context,
+            prompt,
             config,
         }
-    }
-
-    pub fn config(&self) -> &AgentLoopConfig {
-        &self.config
     }
 
     /// Runs one user turn to completion, mutating `session` in place so a REPL
@@ -102,7 +116,8 @@ impl AgentLoop {
         user_input: impl Into<String>,
     ) -> Result<AgentOutcome, AppError> {
         let tools = self.advertised_tools();
-        let system_prompt = build_system_prompt(&self.context.snapshot().await?, &tools);
+        let snapshot = self.context.snapshot().await?;
+        let system_prompt = self.prompt.build(&snapshot, &tools);
         // A zero budget would silently answer nothing; one round-trip is the
         // smallest thing that can be called a run.
         let limit = self.config.max_iterations.max(1);

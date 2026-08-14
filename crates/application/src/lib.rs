@@ -13,6 +13,9 @@ pub mod agent;
 pub mod error;
 pub mod tools;
 
-pub use agent::{AgentLoop, AgentLoopConfig, AgentOutcome, Session, prompt::build_system_prompt};
+pub use agent::{
+    AgentDependencies, AgentLoop, AgentLoopConfig, AgentOutcome, DefaultPromptBuilder, Session,
+    prompt::build_system_prompt,
+};
 pub use error::AppError;
 pub use tools::registry::ToolRegistry;

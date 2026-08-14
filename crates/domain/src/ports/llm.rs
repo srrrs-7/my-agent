@@ -12,7 +12,7 @@
 //!                |
 //!     +----------+-----------+
 //!     |                      |
-//! OpenAiCompatible   RoutingLlmProvider ---- dyn LlmRouter
+//! OpenAiCompatible     RoutingProvider ---- dyn LlmRouter
 //!                            |
 //!                    +-------+-------+
 //!                    |               |

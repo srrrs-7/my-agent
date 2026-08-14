@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
-use super::map_http_failure;
+use super::http;
 
 pub struct OpenAiCompatibleProvider {
     id: ProviderId,
@@ -50,15 +50,9 @@ impl OpenAiCompatibleProvider {
         max_tokens_field: impl Into<String>,
         timeout: Duration,
     ) -> Result<Self, LlmError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(concat!("my-agent/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| LlmError::Configuration(error.to_string()))?;
-
         Ok(Self {
             id,
-            client,
+            client: http::build_client(timeout)?,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
             default_model,
@@ -127,24 +121,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             builder = builder.bearer_auth(key);
         }
 
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| self.transport_error(error))?;
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
-        let text = response
-            .text()
-            .await
-            .map_err(|error| self.transport_error(error))?;
-
-        if !status.is_success() {
-            return Err(map_http_failure(status.as_u16(), retry_after, &text));
-        }
+        let text = http::send(builder, &self.base_url, self.timeout).await?;
 
         let parsed: WireResponse = serde_json::from_str(&text).map_err(|error| {
             LlmError::InvalidResponse(format!("{error} (body: {})", clip(&text, 300)))
@@ -155,16 +132,6 @@ impl LlmProvider for OpenAiCompatibleProvider {
 }
 
 impl OpenAiCompatibleProvider {
-    fn transport_error(&self, error: reqwest::Error) -> LlmError {
-        if error.is_timeout() {
-            LlmError::Timeout {
-                seconds: self.timeout.as_secs(),
-            }
-        } else {
-            LlmError::Transport(format!("{} ({})", error, self.base_url))
-        }
-    }
-
     fn decode(
         &self,
         response: WireResponse,

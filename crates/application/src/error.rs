@@ -1,11 +1,14 @@
-use agent_domain::error::{ApprovalError, DomainError, FsError, LlmError, ToolError};
+use agent_domain::error::{FsError, LlmError};
 use thiserror::Error;
 
 /// Failures that abort a whole run.
 ///
-/// Note what is *not* here: a failing tool call. Those are turned into an
-/// error-flagged `tool_result` and handed back to the model, because the model
-/// recovering from its own mistake is the normal case, not an exception.
+/// Deliberately narrow: only a broken provider or an unreadable workspace can
+/// abort. A failing tool call, a denied approval or an invalid model argument
+/// all become error-flagged `tool_result`s and go back to the model, because
+/// the model recovering from its own mistake is the normal case, not an
+/// exception. If a new variant is about to be added here, first ask whether
+/// the failure should instead be fed back into the loop.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error(transparent)]
@@ -13,16 +16,4 @@ pub enum AppError {
 
     #[error(transparent)]
     FileSystem(#[from] FsError),
-
-    #[error(transparent)]
-    Tool(#[from] ToolError),
-
-    #[error(transparent)]
-    Approval(#[from] ApprovalError),
-
-    #[error(transparent)]
-    Domain(#[from] DomainError),
-
-    #[error("configuration error: {0}")]
-    Configuration(String),
 }

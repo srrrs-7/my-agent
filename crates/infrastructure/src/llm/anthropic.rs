@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::map_http_failure;
+use super::http;
 
 const API_VERSION: &str = "2023-06-01";
 /// `max_tokens` is required by the API, so a request without one still needs a
@@ -44,15 +44,9 @@ impl AnthropicProvider {
         default_model: ModelId,
         timeout: Duration,
     ) -> Result<Self, LlmError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(concat!("my-agent/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| LlmError::Configuration(error.to_string()))?;
-
         Ok(Self {
             id,
-            client,
+            client: http::build_client(timeout)?,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
             default_model,
@@ -108,30 +102,14 @@ impl LlmProvider for AnthropicProvider {
             stop_sequences: request.params.stop_sequences.clone(),
         };
 
-        let response = self
+        let builder = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| self.transport_error(error))?;
+            .json(&body);
 
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
-        let text = response
-            .text()
-            .await
-            .map_err(|error| self.transport_error(error))?;
-
-        if !status.is_success() {
-            return Err(map_http_failure(status.as_u16(), retry_after, &text));
-        }
+        let text = http::send(builder, &self.base_url, self.timeout).await?;
 
         let parsed: WireResponse = serde_json::from_str(&text)
             .map_err(|error| LlmError::InvalidResponse(format!("{error}")))?;
@@ -141,16 +119,6 @@ impl LlmProvider for AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    fn transport_error(&self, error: reqwest::Error) -> LlmError {
-        if error.is_timeout() {
-            LlmError::Timeout {
-                seconds: self.timeout.as_secs(),
-            }
-        } else {
-            LlmError::Transport(format!("{} ({})", error, self.base_url))
-        }
-    }
-
     fn decode(
         &self,
         response: WireResponse,

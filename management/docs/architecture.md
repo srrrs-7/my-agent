@@ -18,8 +18,9 @@
 │   agent/dispatch.rs          │ │   llm/anthropic.rs          │
 │   agent/prompt.rs            │ │   llm/routing.rs            │
 │   agent/session.rs           │ │   llm/retry.rs              │
-│   tools/file/*.rs            │ │   fs/local.rs               │
-│   tools/registry.rs          │ │   fs/search.rs              │
+│   tools/file/*.rs            │ │   llm/http.rs（共有配管）   │
+│   tools/registry.rs          │ │   fs/local.rs               │
+│                              │ │   fs/search.rs              │
 │                              │ │   fs/context.rs             │
 │  ※ tokio に依存しない        │ │   config/{kinds,env}.rs     │
 └───────────────┬──────────────┘ └─────────┬───────────────────┘
@@ -44,12 +45,13 @@
 
 | ポート | 実装 | 役割 |
 |---|---|---|
-| `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingLlmProvider`, `RetryingProvider` | チャット補完 |
+| `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider` | チャット補完 |
 | `LlmRouter` | `StaticRouter`, `ModelPrefixRouter` | 委譲先の選択 |
 | `Tool` | `ReadFileTool` ほか（application）, `TimeoutTool`（装飾） | モデルに公開する能力 |
 | `FileSystem` | `LocalFileSystem` | サンドボックス化された I/O |
 | `FileSearcher` | `IgnoreAwareSearcher` | `.gitignore` 準拠の内容検索 |
 | `ContextProvider` | `WorkspaceContextProvider` | 環境情報とプロジェクト指示の収集 |
+| `PromptBuilder` | `DefaultPromptBuilder` | システムプロンプトの組み立て方針 |
 | `ApprovalGate` | `CliApprovalGate` | human-in-the-loop |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` | 進捗の可観測性 |
 
@@ -99,7 +101,7 @@ OpenAI 形式（`tool_calls` + `role:"tool"`）への写像は情報を落とし
 
 ### 3.5 ルータを最初から挟んでおく
 
-プロバイダが 1 つでも `RoutingLlmProvider` を経由します。コストは
+プロバイダが 1 つでも `RoutingProvider` を経由します。コストは
 1 リクエストあたり map 参照 1 回で、代わりに「2 つ目のモデルを足す」が
 **コード変更ではなく設定変更**になります。
 
@@ -175,4 +177,4 @@ pub struct RequestMetadata {
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 128 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 129 本）。

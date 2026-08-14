@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::tools::util::parse_arguments;
+use crate::tools::util::{ToolErrorContext, parse_arguments};
 
 /// Replaces an exact excerpt inside an existing file.
 ///
@@ -96,16 +96,13 @@ impl Tool for EditFileTool {
             ));
         }
 
-        let path = self
-            .root
-            .resolve(&input.path)
-            .map_err(|error| ToolError::invalid_input(&name, error.to_string()))?;
+        let path = self.root.resolve(&input.path).for_tool(&name)?;
 
         let content = self
             .file_system
             .read_to_string(&path)
             .await
-            .map_err(|error| ToolError::execution(&name, error.to_string()))?;
+            .for_tool(&name)?;
 
         let occurrences = content.matches(&input.old_string).count();
         match occurrences {
@@ -139,7 +136,7 @@ impl Tool for EditFileTool {
         self.file_system
             .write(&path, &updated)
             .await
-            .map_err(|error| ToolError::execution(&name, error.to_string()))?;
+            .for_tool(&name)?;
 
         let replaced = if input.replace_all { occurrences } else { 1 };
         let line = line_of(&content, &input.old_string);
