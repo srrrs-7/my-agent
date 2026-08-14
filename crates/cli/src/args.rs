@@ -30,6 +30,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "N")]
     pub max_iterations: Option<u32>,
 
+    /// Replace the built-in system prompt with this file's contents
+    /// (overrides AGENT_SYSTEM_PROMPT_FILE).
+    #[arg(long, global = true, value_name = "FILE")]
+    pub system_prompt_file: Option<PathBuf>,
+
+    /// Append extra instructions to the end of the system prompt
+    /// (overrides AGENT_APPEND_SYSTEM_PROMPT).
+    #[arg(long, global = true, value_name = "TEXT")]
+    pub append_system_prompt: Option<String>,
+
     /// Show model, token usage and latency for every round-trip.
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
@@ -110,5 +120,26 @@ mod tests {
         let cli = Cli::parse_from(["agent", "--yes", "-m", "cloud/claude-sonnet-5", "chat"]);
         assert!(cli.yes);
         assert_eq!(cli.model.as_deref(), Some("cloud/claude-sonnet-5"));
+    }
+
+    #[test]
+    fn prompt_injection_flags_are_parsed() {
+        let cli = Cli::parse_from([
+            "agent",
+            "--system-prompt-file",
+            "prompts/agent.md",
+            "--append-system-prompt",
+            "Reply in Japanese.",
+            "run",
+            "hi",
+        ]);
+        assert_eq!(
+            cli.system_prompt_file,
+            Some(PathBuf::from("prompts/agent.md"))
+        );
+        assert_eq!(
+            cli.append_system_prompt.as_deref(),
+            Some("Reply in Japanese.")
+        );
     }
 }

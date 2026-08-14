@@ -37,7 +37,7 @@
 | `FileSystem` | `LocalFileSystem` |
 | `FileSearcher` | `IgnoreAwareSearcher` |
 | `ContextProvider` | `WorkspaceContextProvider` |
-| `PromptBuilder` | `DefaultPromptBuilder`（外部注入のプロンプトは実装追加で対応） |
+| `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`（差し替え）, `AppendingPromptBuilder`（追記・装飾） |
 | `ApprovalGate` | `CliApprovalGate` |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` |
 

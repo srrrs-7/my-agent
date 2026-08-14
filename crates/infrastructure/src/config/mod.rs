@@ -106,12 +106,28 @@ pub struct LoopSettings {
     pub max_tokens: Option<u32>,
 }
 
+/// Operator control over the system prompt.
+///
+/// The file is read once at startup by the *operator's* process, not through
+/// the model's tools, so it may legitimately live outside the workspace
+/// sandbox. Replacing the prompt does not weaken the sandbox either - path
+/// confinement is enforced in code, never by prompt text.
+#[derive(Debug, Clone, Default)]
+pub struct PromptSettings {
+    /// Replace the built-in system prompt with this file's contents.
+    pub replace_file: Option<PathBuf>,
+    /// Append these instructions to the end of the prompt (after the project
+    /// instruction file; combined with `replace_file`, appends to that text).
+    pub append: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub workspace: PathBuf,
     pub approval: ApprovalPolicy,
     pub llm: LlmSettings,
     pub agent_loop: LoopSettings,
+    pub prompt: PromptSettings,
     /// Largest file the read tool will load.
     pub max_file_bytes: u64,
 }
@@ -137,6 +153,10 @@ impl Settings {
             approval: reader.parsed("AGENT_APPROVAL", ApprovalPolicy::ReadOnlyAuto)?,
             llm: LlmSettings::read(&reader)?,
             agent_loop: LoopSettings::read(&reader)?,
+            prompt: PromptSettings {
+                replace_file: reader.string("AGENT_SYSTEM_PROMPT_FILE").map(PathBuf::from),
+                append: reader.string("AGENT_APPEND_SYSTEM_PROMPT"),
+            },
             max_file_bytes: reader.parsed("AGENT_MAX_FILE_BYTES", 2 * 1024 * 1024)?,
         })
     }
@@ -234,6 +254,17 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
     let mut description = BTreeMap::new();
     description.insert("workspace".into(), settings.workspace.display().to_string());
     description.insert("approval".into(), settings.approval.as_str().into());
+    description.insert(
+        "system prompt".into(),
+        match (&settings.prompt.replace_file, &settings.prompt.append) {
+            (None, None) => "built-in".to_string(),
+            (Some(path), None) => format!("replaced from {}", path.display()),
+            (None, Some(_)) => "built-in + appended instructions".to_string(),
+            (Some(path), Some(_)) => {
+                format!("replaced from {} + appended instructions", path.display())
+            }
+        },
+    );
     description.insert("router".into(), settings.llm.router.as_str().into());
     description.insert(
         "default provider".into(),
@@ -348,6 +379,39 @@ mod tests {
         assert!(!settings.agent_loop.parallel_read_only_tools);
         assert!(!settings.agent_loop.stream);
         assert_eq!(settings.agent_loop.temperature, Some(0.9));
+    }
+
+    #[test]
+    fn prompt_injection_is_read_from_the_environment() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SYSTEM_PROMPT_FILE", "/prompts/agent.md"),
+            ("AGENT_APPEND_SYSTEM_PROMPT", "Reply in Japanese."),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            settings.prompt.replace_file,
+            Some(PathBuf::from("/prompts/agent.md"))
+        );
+        assert_eq!(
+            settings.prompt.append.as_deref(),
+            Some("Reply in Japanese.")
+        );
+
+        let rendered = describe(&settings);
+        assert!(
+            rendered["system prompt"].contains("/prompts/agent.md"),
+            "doctor shows where the prompt comes from: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn the_prompt_is_built_in_when_nothing_is_injected() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert_eq!(settings.prompt.replace_file, None);
+        assert_eq!(settings.prompt.append, None);
+        assert_eq!(describe(&settings)["system prompt"], "built-in");
     }
 
     #[test]

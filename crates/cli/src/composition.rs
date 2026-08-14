@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use agent_application::agent::{
-    AgentDependencies, AgentLoop, AgentLoopConfig, DefaultPromptBuilder,
+    AgentDependencies, AgentLoop, AgentLoopConfig, AppendingPromptBuilder, DefaultPromptBuilder,
+    FixedPromptBuilder,
 };
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::file::{
@@ -20,8 +21,9 @@ use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::events::EventSink;
 use agent_domain::ports::llm::LlmProvider;
+use agent_domain::ports::prompt::PromptBuilder;
 use agent_domain::ports::tool::Tool;
-use agent_infrastructure::config::{ApprovalPolicy, Settings};
+use agent_infrastructure::config::{ApprovalPolicy, PromptSettings, Settings};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
 use agent_infrastructure::tools::TimeoutTool;
@@ -73,6 +75,7 @@ pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
     );
 
     // --- the loop ------------------------------------------------------------
+    let prompt = build_prompt_builder(&settings.prompt)?;
     let agent = AgentLoop::new(
         AgentDependencies {
             llm: provider.clone(),
@@ -80,7 +83,7 @@ pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             approval,
             events,
             context,
-            prompt: Arc::new(DefaultPromptBuilder),
+            prompt,
         },
         AgentLoopConfig {
             model: cli.model.as_deref().map(ModelId::new),
@@ -139,11 +142,50 @@ fn build_tools(
     )
 }
 
+/// Resolves the operator's prompt configuration into the builder the loop
+/// receives.
+///
+/// The replacement file is read here, once, by the operator's own process -
+/// not through the model's tools - so a path outside the workspace is
+/// legitimate and the workspace sandbox does not apply. A path that cannot be
+/// read (or an effectively empty file) aborts startup: silently falling back
+/// to the built-in prompt would hide exactly the misconfiguration the
+/// operator most needs to see.
+fn build_prompt_builder(prompt: &PromptSettings) -> Result<Arc<dyn PromptBuilder>> {
+    let base: Arc<dyn PromptBuilder> = match &prompt.replace_file {
+        Some(path) => {
+            let contents = std::fs::read_to_string(path).with_context(|| {
+                format!("cannot read the system prompt file `{}`", path.display())
+            })?;
+            if contents.trim().is_empty() {
+                anyhow::bail!(
+                    "the system prompt file `{}` is empty - remove \
+                     AGENT_SYSTEM_PROMPT_FILE / --system-prompt-file to use the built-in prompt",
+                    path.display()
+                );
+            }
+            Arc::new(FixedPromptBuilder::new(contents))
+        }
+        None => Arc::new(DefaultPromptBuilder),
+    };
+
+    Ok(match &prompt.append {
+        Some(extra) => Arc::new(AppendingPromptBuilder::new(base, extra.clone())),
+        None => base,
+    })
+}
+
 /// Environment first, command-line flags on top.
 fn resolve_settings(cli: &Cli) -> Result<Settings> {
     let mut settings = Settings::from_env()
         .context("invalid configuration - copy .env.example to .env (make env) and fill it in")?;
+    apply_cli_overrides(&mut settings, cli);
+    Ok(settings)
+}
 
+/// Command-line flags win over the environment. Split out so the precedence
+/// is testable without touching the process environment.
+fn apply_cli_overrides(settings: &mut Settings, cli: &Cli) {
     if let Some(workspace) = &cli.workspace {
         settings.workspace = workspace.clone();
     }
@@ -153,6 +195,116 @@ fn resolve_settings(cli: &Cli) -> Result<Settings> {
     if cli.yes {
         settings.approval = ApprovalPolicy::Auto;
     }
+    if let Some(file) = &cli.system_prompt_file {
+        settings.prompt.replace_file = Some(file.clone());
+    }
+    if let Some(text) = &cli.append_system_prompt {
+        settings.prompt.append = Some(text.clone());
+    }
+}
 
-    Ok(settings)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_application::build_system_prompt;
+    use agent_domain::model::context::ContextSnapshot;
+    use clap::Parser as _;
+
+    fn snapshot() -> ContextSnapshot {
+        ContextSnapshot {
+            workspace_root: "/workspace".into(),
+            os: "linux".into(),
+            today: "2026-08-14".into(),
+            is_git_repository: true,
+            project_instructions: Some("Project rules here.".into()),
+            directory_overview: vec!["crates/".into()],
+        }
+    }
+
+    #[test]
+    fn the_default_wiring_is_byte_identical_to_the_builtin_prompt() {
+        let builder = build_prompt_builder(&PromptSettings::default()).unwrap();
+        assert_eq!(
+            builder.build(&snapshot(), &[]),
+            build_system_prompt(&snapshot(), &[]),
+            "with nothing injected, the sent prompt must not change by a byte"
+        );
+    }
+
+    #[test]
+    fn a_missing_prompt_file_aborts_startup_with_the_path_in_the_error() {
+        let error = build_prompt_builder(&PromptSettings {
+            replace_file: Some("/nonexistent/prompt.md".into()),
+            append: None,
+        })
+        .err()
+        .expect("startup must fail");
+        assert!(
+            format!("{error:#}").contains("/nonexistent/prompt.md"),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn an_empty_prompt_file_is_rejected_rather_than_silently_ignored() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "  \n\n").unwrap();
+
+        let error = build_prompt_builder(&PromptSettings {
+            replace_file: Some(file.path().to_path_buf()),
+            append: None,
+        })
+        .err()
+        .expect("startup must fail");
+        assert!(format!("{error:#}").contains("empty"), "got: {error:#}");
+    }
+
+    #[test]
+    fn replacement_and_append_compose() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "You are a terse bot.\n").unwrap();
+
+        let builder = build_prompt_builder(&PromptSettings {
+            replace_file: Some(file.path().to_path_buf()),
+            append: Some("Reply in Japanese.".into()),
+        })
+        .unwrap();
+
+        let prompt = builder.build(&snapshot(), &[]);
+        assert_eq!(prompt, "You are a terse bot.\n\nReply in Japanese.\n");
+        assert!(
+            !prompt.contains("Project rules here."),
+            "a replaced prompt carries none of the default sections"
+        );
+    }
+
+    #[test]
+    fn cli_flags_override_the_environment() {
+        use agent_infrastructure::config::MapEnv;
+
+        let env = MapEnv::new(&[
+            ("AGENT_WORKSPACE", "/workspace"),
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SYSTEM_PROMPT_FILE", "/from-env.md"),
+            ("AGENT_APPEND_SYSTEM_PROMPT", "from env"),
+        ]);
+        let mut settings = Settings::from_source(&env).unwrap();
+
+        let cli = Cli::parse_from([
+            "agent",
+            "--system-prompt-file",
+            "/from-cli.md",
+            "--append-system-prompt",
+            "from cli",
+            "run",
+            "hi",
+        ]);
+        apply_cli_overrides(&mut settings, &cli);
+
+        assert_eq!(
+            settings.prompt.replace_file,
+            Some(std::path::PathBuf::from("/from-cli.md"))
+        );
+        assert_eq!(settings.prompt.append.as_deref(), Some("from cli"));
+    }
 }

@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_application::agent::{
-    AgentDependencies, AgentLoop, AgentLoopConfig, DefaultPromptBuilder, Session,
+    AgentDependencies, AgentLoop, AgentLoopConfig, DefaultPromptBuilder, FixedPromptBuilder,
+    Session,
 };
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::file::{ReadFileTool, WriteFileTool};
@@ -20,6 +21,7 @@ use agent_domain::model::llm::{ModelId, ProviderId};
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 use agent_domain::ports::events::{FinishReason, NullEventSink};
+use agent_domain::ports::prompt::PromptBuilder;
 use agent_infrastructure::config::{LlmSettings, ProviderKind, ProviderSettings, RouterKind};
 use agent_infrastructure::fs::{LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
@@ -50,14 +52,18 @@ impl Fixture {
     /// the loop must not ask the provider to stream. The streaming path gets
     /// its own fixture below with SSE replies.
     async fn new(responses: Vec<Response>) -> Self {
-        Self::with_streaming(responses, false).await
+        Self::build(responses, false, Arc::new(DefaultPromptBuilder)).await
     }
 
     async fn new_streaming(responses: Vec<Response>) -> Self {
-        Self::with_streaming(responses, true).await
+        Self::build(responses, true, Arc::new(DefaultPromptBuilder)).await
     }
 
-    async fn with_streaming(responses: Vec<Response>, stream: bool) -> Self {
+    async fn with_prompt_builder(responses: Vec<Response>, prompt: Arc<dyn PromptBuilder>) -> Self {
+        Self::build(responses, false, prompt).await
+    }
+
+    async fn build(responses: Vec<Response>, stream: bool, prompt: Arc<dyn PromptBuilder>) -> Self {
         let workspace = tempfile::tempdir().unwrap();
         let server = MockLlmServer::start(responses).await;
         let root = Arc::new(WorkspaceRoot::new(workspace.path().to_path_buf()).unwrap());
@@ -94,7 +100,7 @@ impl Fixture {
                 approval: Arc::new(ApproveAll),
                 events: Arc::new(NullEventSink),
                 context: Arc::new(WorkspaceContextProvider::new(root)),
-                prompt: Arc::new(DefaultPromptBuilder),
+                prompt,
             },
             AgentLoopConfig {
                 max_iterations: 5,
@@ -330,4 +336,60 @@ async fn a_streamed_turn_can_still_be_denied_by_the_sandbox() {
     let content = tool_result(&requests[1], "call_1");
     assert!(content.contains("escapes the workspace"), "got: {content}");
     assert!(!content.contains("root:"));
+}
+
+#[tokio::test]
+async fn a_replaced_system_prompt_is_sent_verbatim_and_tools_still_work() {
+    const OPERATOR_PROMPT: &str = "You are a terse file bot. Use your tools when asked.";
+
+    let fixture = Fixture::with_prompt_builder(
+        vec![
+            Response::tool_call("call_1", "read_file", r#"{"path":"hello.txt"}"#),
+            Response::assistant_text("It says: secret."),
+        ],
+        Arc::new(FixedPromptBuilder::new(OPERATOR_PROMPT)),
+    )
+    .await;
+
+    fixture.write("hello.txt", "secret");
+    // Would be folded into the *default* prompt; a replaced prompt must not
+    // carry it.
+    fixture.write("AGENTS.md", "MUST-NOT-APPEAR");
+
+    let mut session = Session::new("e2e-prompt-1");
+    let outcome = fixture
+        .agent
+        .run(&mut session, "what is in hello.txt?")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.final_text, "It says: secret.");
+
+    let requests = fixture.server.json_requests().await;
+
+    // The operator's prompt went out verbatim - no default sections, no
+    // project instruction file.
+    assert_eq!(
+        requests[0]["messages"][0]["role"],
+        serde_json::json!("system")
+    );
+    assert_eq!(
+        requests[0]["messages"][0]["content"],
+        serde_json::json!(OPERATOR_PROMPT)
+    );
+    assert!(
+        !requests[0].to_string().contains("MUST-NOT-APPEAR"),
+        "the project instruction file belongs to the default prompt only"
+    );
+
+    // Tool definitions travel independently of the prompt, so replacing the
+    // prompt must not break tool calling.
+    assert_eq!(
+        requests[0]["tools"][0]["function"]["name"],
+        serde_json::json!("read_file")
+    );
+    assert!(
+        tool_result(&requests[1], "call_1").contains("secret"),
+        "the tool actually executed against the real filesystem"
+    );
 }

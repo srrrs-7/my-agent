@@ -10,5 +10,5 @@ pub mod session;
 pub use config::AgentLoopConfig;
 pub use dispatch::{DispatchConfig, ToolDispatcher};
 pub use loop_runner::{AgentDependencies, AgentLoop, AgentOutcome};
-pub use prompt::DefaultPromptBuilder;
+pub use prompt::{AppendingPromptBuilder, DefaultPromptBuilder, FixedPromptBuilder};
 pub use session::Session;

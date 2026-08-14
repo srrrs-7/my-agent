@@ -3,8 +3,19 @@
 //! Context engineering happens here: the model is told where it is, what it may
 //! touch, what the workspace looks like, and how to behave - once, up front -
 //! so that individual turns can stay short.
+//!
+//! Three [`PromptBuilder`]s live here:
+//!
+//! * [`DefaultPromptBuilder`] - the built-in policy below.
+//! * [`FixedPromptBuilder`] - an operator-supplied prompt used verbatim.
+//! * [`AppendingPromptBuilder`] - a decorator adding operator instructions to
+//!   whatever the wrapped builder produced.
+//!
+//! Replacing the prompt does not loosen the sandbox: path confinement is
+//! enforced by `WorkspaceRoot` / `LocalFileSystem`, never by prompt text.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use agent_domain::model::context::ContextSnapshot;
 use agent_domain::model::tool::ToolDefinition;
@@ -27,6 +38,62 @@ pub struct DefaultPromptBuilder;
 impl PromptBuilder for DefaultPromptBuilder {
     fn build(&self, context: &ContextSnapshot, tools: &[ToolDefinition]) -> String {
         build_system_prompt(context, tools)
+    }
+}
+
+/// An operator-supplied system prompt, used verbatim.
+///
+/// Context and tool list are deliberately ignored: whoever replaces the prompt
+/// owns all of its content. Tool *calling* still works, because tool
+/// definitions travel in the request separately from the prompt.
+#[derive(Debug, Clone)]
+pub struct FixedPromptBuilder {
+    prompt: String,
+}
+
+impl FixedPromptBuilder {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+        }
+    }
+}
+
+impl PromptBuilder for FixedPromptBuilder {
+    fn build(&self, _context: &ContextSnapshot, _tools: &[ToolDefinition]) -> String {
+        self.prompt.clone()
+    }
+}
+
+/// Appends operator instructions to whatever the wrapped builder produced.
+///
+/// The extra text lands at the very end - after the project instruction file -
+/// because later text is what a model treats as most binding when
+/// instructions conflict, and an explicit operator override should win.
+pub struct AppendingPromptBuilder {
+    inner: Arc<dyn PromptBuilder>,
+    extra: String,
+}
+
+impl AppendingPromptBuilder {
+    pub fn new(inner: Arc<dyn PromptBuilder>, extra: impl Into<String>) -> Self {
+        Self {
+            inner,
+            extra: extra.into(),
+        }
+    }
+}
+
+impl PromptBuilder for AppendingPromptBuilder {
+    fn build(&self, context: &ContextSnapshot, tools: &[ToolDefinition]) -> String {
+        let mut prompt = self.inner.build(context, tools);
+        if !prompt.is_empty() && !prompt.ends_with('\n') {
+            prompt.push('\n');
+        }
+        prompt.push('\n');
+        prompt.push_str(&self.extra);
+        prompt.push('\n');
+        prompt
     }
 }
 
@@ -170,5 +237,44 @@ mod tests {
         let prompt = build_system_prompt(&context, &[]);
         assert!(prompt.contains("# Project instructions"));
         assert!(prompt.len() < MAX_PROJECT_INSTRUCTIONS_BYTES * 3);
+    }
+
+    #[test]
+    fn a_fixed_prompt_is_verbatim_and_ignores_context_and_tools() {
+        let tools = vec![ToolDefinition {
+            name: agent_domain::model::tool::ToolName::new("read_file").unwrap(),
+            description: "Read a file.".into(),
+            input_schema: serde_json::json!({}),
+            safety: agent_domain::model::tool::ToolSafety::ReadOnly,
+        }];
+        let prompt = FixedPromptBuilder::new("You are a terse bot.").build(&snapshot(), &tools);
+        assert_eq!(prompt, "You are a terse bot.");
+    }
+
+    #[test]
+    fn appended_instructions_land_after_the_project_instructions() {
+        let builder =
+            AppendingPromptBuilder::new(Arc::new(DefaultPromptBuilder), "Reply in Japanese.");
+        let prompt = builder.build(&snapshot(), &[]);
+
+        assert!(
+            prompt.ends_with("Reply in Japanese.\n"),
+            "appended text is last"
+        );
+        let instructions = prompt
+            .find("make check")
+            .expect("project instructions present");
+        let appended = prompt.rfind("Reply in Japanese.").unwrap();
+        assert!(
+            appended > instructions,
+            "operator instructions come after the project instruction file"
+        );
+    }
+
+    #[test]
+    fn appending_separates_with_a_blank_line() {
+        let builder =
+            AppendingPromptBuilder::new(Arc::new(FixedPromptBuilder::new("base")), "extra");
+        assert_eq!(builder.build(&snapshot(), &[]), "base\n\nextra\n");
     }
 }
