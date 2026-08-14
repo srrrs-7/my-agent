@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::session::store::RetentionPolicy;
+
 use agent_domain::model::llm::{ModelId, ProviderId};
 use thiserror::Error;
 
@@ -103,8 +105,12 @@ pub struct LoopSettings {
     pub max_history_bytes: usize,
     /// Fold the oldest turns into a summary before resorting to dropping them.
     pub compact: bool,
-    /// Messages left verbatim after a compaction.
+    /// Most messages left verbatim after a compaction.
     pub compact_keep_recent: usize,
+    /// Most bytes left verbatim after a compaction. The cap that usually
+    /// binds, since a message count says nothing about how big the messages
+    /// are.
+    pub compact_keep_recent_bytes: usize,
     pub tool_timeout: Duration,
     pub parallel_read_only_tools: bool,
     pub stream: bool,
@@ -181,12 +187,28 @@ pub struct ShellSettings {
     pub extra_writable: Vec<PathBuf>,
 }
 
+/// What a session leaves on disk.
+///
+/// Off is a real option and not a formality: the log holds the conversation
+/// verbatim, including the contents of every file the model read, so enabling
+/// it is a decision about where that material is allowed to sit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    pub log: bool,
+    /// Relative paths resolve against the workspace root.
+    pub dir: PathBuf,
+    /// How long the records are kept. Nothing removes them otherwise: the log
+    /// only ever appends, so without this the directory is a ratchet.
+    pub retention: RetentionPolicy,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub workspace: PathBuf,
     pub approval: ApprovalPolicy,
     pub llm: LlmSettings,
     pub agent_loop: LoopSettings,
+    pub session: SessionSettings,
     pub prompt: PromptSettings,
     pub web_fetch: WebFetchSettings,
     pub shell: ShellSettings,
@@ -215,6 +237,20 @@ impl Settings {
             approval: reader.parsed("AGENT_APPROVAL", ApprovalPolicy::ReadOnlyAuto)?,
             llm: LlmSettings::read(&reader)?,
             agent_loop: LoopSettings::read(&reader)?,
+            session: SessionSettings {
+                log: reader.parsed("AGENT_SESSION_LOG", true)?,
+                dir: reader
+                    .string("AGENT_SESSION_DIR")
+                    .map_or_else(|| PathBuf::from(".agent/sessions"), PathBuf::from),
+                retention: RetentionPolicy {
+                    // Zero is the off switch for each half independently, so
+                    // "keep everything for 30 days" and "keep the last 50
+                    // forever" are both sayable.
+                    keep: positive(reader.parsed("AGENT_SESSION_KEEP", 50)?),
+                    max_age: positive(reader.parsed("AGENT_SESSION_MAX_AGE_DAYS", 30)?)
+                        .map(|days| Duration::from_secs(days as u64 * 24 * 60 * 60)),
+                },
+            },
             prompt: PromptSettings {
                 replace_file: reader.string("AGENT_SYSTEM_PROMPT_FILE").map(PathBuf::from),
                 append: reader.string("AGENT_APPEND_SYSTEM_PROMPT"),
@@ -240,6 +276,19 @@ impl Settings {
         })
     }
 
+    /// Absolute location of the session directory.
+    ///
+    /// A relative setting is read against the workspace rather than against
+    /// the current directory, so `agent` started from a subdirectory writes to
+    /// the same place as one started from the root.
+    pub fn session_dir(&self) -> PathBuf {
+        if self.session.dir.is_absolute() {
+            self.session.dir.clone()
+        } else {
+            self.workspace.join(&self.session.dir)
+        }
+    }
+
     /// The provider a request reaches when nothing steers it elsewhere.
     pub fn default_provider_settings(&self) -> &ProviderSettings {
         self.llm
@@ -258,6 +307,8 @@ impl LoopSettings {
             max_history_bytes: reader.parsed("AGENT_MAX_HISTORY_BYTES", 256 * 1024)?,
             compact: reader.parsed("AGENT_COMPACT", true)?,
             compact_keep_recent: reader.parsed("AGENT_COMPACT_KEEP_RECENT", 12)?,
+            compact_keep_recent_bytes: reader
+                .parsed("AGENT_COMPACT_KEEP_RECENT_BYTES", 64 * 1024)?,
             tool_timeout: Duration::from_secs(reader.parsed("AGENT_TOOL_TIMEOUT_SECS", 60)?),
             parallel_read_only_tools: reader.parsed("AGENT_PARALLEL_READ_TOOLS", true)?,
             stream: reader.parsed("AGENT_STREAM", true)?,
@@ -322,6 +373,32 @@ impl LlmSettings {
     }
 }
 
+/// Says what will be deleted, in the words of the settings that decide it.
+///
+/// `doctor` is where someone checks this before trusting the machine with a
+/// long session, so "kept forever" has to be as plain as the limits are.
+fn describe_retention(policy: &RetentionPolicy) -> String {
+    let count = policy
+        .keep
+        .map(|keep| format!("newest {keep}"))
+        .unwrap_or_else(|| "any number".to_string());
+    let age = policy
+        .max_age
+        .map(|max_age| format!("{} days", max_age.as_secs() / (24 * 60 * 60)))
+        .unwrap_or_else(|| "forever".to_string());
+
+    format!("{count}, kept {age}")
+}
+
+/// `0` reads as "no limit" for every retention setting.
+///
+/// A limit of zero would otherwise mean "delete everything immediately", which
+/// nobody types on purpose and which destroys exactly the thing the setting is
+/// about.
+fn positive(value: usize) -> Option<usize> {
+    (value > 0).then_some(value)
+}
+
 fn names(providers: &[ProviderSettings]) -> String {
     providers
         .iter()
@@ -367,6 +444,21 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
             };
             format!("enabled (sandbox: {}; {egress})", settings.shell.sandbox)
         },
+    );
+    description.insert(
+        "session log".into(),
+        if settings.session.log {
+            format!(
+                "{} (holds the conversation verbatim)",
+                settings.session_dir().display()
+            )
+        } else {
+            "disabled".to_string()
+        },
+    );
+    description.insert(
+        "session retention".into(),
+        describe_retention(&settings.session.retention),
     );
     description.insert(
         "system prompt".into(),
@@ -450,6 +542,74 @@ mod tests {
         .unwrap();
         assert!(!settings.agent_loop.compact);
         assert_eq!(settings.agent_loop.compact_keep_recent, 4);
+    }
+
+    #[test]
+    fn the_session_log_is_on_and_lands_inside_the_workspace() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+
+        assert!(settings.session.log);
+        assert_eq!(
+            settings.session_dir(),
+            PathBuf::from("/workspace/.agent/sessions"),
+            "a relative setting resolves against the workspace, not the cwd"
+        );
+    }
+
+    #[test]
+    fn sessions_are_kept_by_count_and_by_age() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert_eq!(settings.session.retention.keep, Some(50));
+        assert_eq!(
+            settings.session.retention.max_age,
+            Some(Duration::from_secs(30 * 24 * 60 * 60))
+        );
+    }
+
+    #[test]
+    fn zero_means_no_limit_rather_than_delete_everything() {
+        // The dangerous reading of `0`. Someone typing it means "stop deleting
+        // my sessions", never "delete them all now".
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SESSION_KEEP", "0"),
+            ("AGENT_SESSION_MAX_AGE_DAYS", "0"),
+        ])
+        .unwrap();
+
+        assert_eq!(settings.session.retention.keep, None);
+        assert_eq!(settings.session.retention.max_age, None);
+        assert!(settings.session.retention.keeps_everything());
+    }
+
+    #[test]
+    fn each_retention_limit_can_be_lifted_on_its_own() {
+        let settings =
+            settings(&[("AGENT_MODEL", "m"), ("AGENT_SESSION_MAX_AGE_DAYS", "0")]).unwrap();
+
+        assert_eq!(settings.session.retention.keep, Some(50));
+        assert_eq!(settings.session.retention.max_age, None);
+        assert!(!settings.session.retention.keeps_everything());
+    }
+
+    #[test]
+    fn the_session_log_can_be_turned_off_or_pointed_elsewhere() {
+        // Off matters: the log holds the conversation verbatim, including the
+        // contents of every file the model read.
+        let off = settings(&[("AGENT_MODEL", "m"), ("AGENT_SESSION_LOG", "false")]).unwrap();
+        assert!(!off.session.log);
+
+        let elsewhere = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SESSION_DIR", "/var/lib/agent"),
+        ])
+        .unwrap();
+        assert_eq!(
+            elsewhere.session_dir(),
+            PathBuf::from("/var/lib/agent"),
+            "an absolute setting is taken as given, so the log can be kept \
+             outside the workspace the model can read"
+        );
     }
 
     #[test]

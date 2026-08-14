@@ -45,11 +45,29 @@ impl ContentBlock {
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
+
+    /// Where this message fell in the session, counted in messages.
+    ///
+    /// Assigned by [`Conversation`](crate::model::conversation::Conversation)
+    /// as the message is appended, never reused, and never restarted when a
+    /// compaction shortens the vector. It is what the retention policy weighs
+    /// a message by - see
+    /// [`Conversation::distance_from_newest`](crate::model::conversation::Conversation::distance_from_newest).
+    ///
+    /// `Option` because a message exists before it joins a conversation, and
+    /// because a history persisted before this field existed has none. Absent
+    /// means "ask the vector instead", never "discard".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 impl Message {
     pub fn new(role: Role, content: Vec<ContentBlock>) -> Self {
-        Self { role, content }
+        Self {
+            role,
+            content,
+            seq: None,
+        }
     }
 
     pub fn user(text: impl Into<String>) -> Self {
@@ -69,6 +87,17 @@ impl Message {
             Role::Tool,
             results.into_iter().map(ContentBlock::ToolResult).collect(),
         )
+    }
+
+    /// Stamps the message with its position in the session.
+    ///
+    /// Only [`Conversation`](crate::model::conversation::Conversation) should
+    /// call this: it owns the counter, and a number handed out by anyone else
+    /// would not be comparable with the rest.
+    #[must_use]
+    pub fn with_seq(mut self, seq: u64) -> Self {
+        self.seq = Some(seq);
+        self
     }
 
     /// All text blocks concatenated - what a human would read.
@@ -123,5 +152,24 @@ mod tests {
         ]);
         assert_eq!(message.text(), "hello\nworld");
         assert!(message.has_tool_calls());
+    }
+
+    /// A history written before sequence numbers existed must still load, and
+    /// an unstamped message must not serialise a null field into one that was
+    /// written after.
+    #[test]
+    fn the_sequence_number_is_optional_in_both_directions() {
+        let without: Message =
+            serde_json::from_str(r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#)
+                .expect("a history without sequence numbers must still load");
+        assert_eq!(without.seq, None);
+        assert_eq!(without.text(), "hi");
+
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("seq"), "{json}");
+
+        let with = without.with_seq(7);
+        assert_eq!(with.seq, Some(7));
+        assert!(serde_json::to_string(&with).unwrap().contains(r#""seq":7"#));
     }
 }

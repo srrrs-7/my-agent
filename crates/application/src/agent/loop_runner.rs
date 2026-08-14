@@ -31,6 +31,7 @@ use agent_domain::model::message::Message;
 use agent_domain::model::tool::{ToolCall, ToolDefinition};
 use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::context::ContextProvider;
+use agent_domain::ports::conversation_log::ConversationLog;
 use agent_domain::ports::events::{AgentEvent, EventSink, FinishReason};
 use agent_domain::ports::llm::{LlmProvider, StreamEvent};
 use agent_domain::ports::prompt::PromptBuilder;
@@ -74,6 +75,10 @@ pub struct AgentDependencies {
     pub events: Arc<dyn EventSink>,
     pub context: Arc<dyn ContextProvider>,
     pub prompt: Arc<dyn PromptBuilder>,
+    /// Where the conversation is written down before the loop is allowed to
+    /// shorten it. [`NullConversationLog`](agent_domain::ports::conversation_log::NullConversationLog)
+    /// writes nothing, which is both the off switch and what the tests use.
+    pub log: Arc<dyn ConversationLog>,
 }
 
 pub struct AgentLoop {
@@ -83,6 +88,7 @@ pub struct AgentLoop {
     events: Arc<dyn EventSink>,
     context: Arc<dyn ContextProvider>,
     prompt: Arc<dyn PromptBuilder>,
+    log: Arc<dyn ConversationLog>,
     config: AgentLoopConfig,
 }
 
@@ -95,6 +101,7 @@ impl AgentLoop {
             events,
             context,
             prompt,
+            log,
         } = deps;
         let dispatcher = ToolDispatcher::new(
             tools,
@@ -113,6 +120,7 @@ impl AgentLoop {
             CompactionConfig {
                 enabled: config.compact,
                 keep_recent_messages: config.compact_keep_recent,
+                keep_recent_bytes: config.compact_keep_recent_bytes,
                 model: config.model.clone(),
             },
         );
@@ -123,6 +131,7 @@ impl AgentLoop {
             events,
             context,
             prompt,
+            log,
             config,
         }
     }
@@ -142,6 +151,7 @@ impl AgentLoop {
         let limit = self.config.max_iterations.max(1);
 
         session.conversation.push(Message::user(user_input));
+        self.record(session, 1).await;
         self.events.emit(AgentEvent::RunStarted {
             session_id: session.id.clone(),
             provider: self.llm.id(),
@@ -179,6 +189,7 @@ impl AgentLoop {
             let calls: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
             let stop_reason = response.stop_reason.clone();
             session.conversation.push(response.message);
+            self.record(session, 1).await;
 
             if calls.is_empty() {
                 return Ok(self.finish(session, text, iteration, finish_reason_for(&stop_reason)));
@@ -187,6 +198,7 @@ impl AgentLoop {
             debug!(iteration, calls = calls.len(), "dispatching tool calls");
             let results = self.dispatcher.dispatch(&calls).await;
             session.conversation.push(Message::tool_results(results));
+            self.record(session, 1).await;
         }
 
         // The model kept asking for tools until the budget ran out. Report what
@@ -256,6 +268,30 @@ impl AgentLoop {
         } else {
             warn!(provider = %self.llm.id(), "provider reports no tool support; running tool-less");
             Vec::new()
+        }
+    }
+
+    /// Writes the `appended` newest messages to the durable record.
+    ///
+    /// Called immediately after every push, and the timing is the whole point.
+    /// [`Self::fit_history`] runs at the top of the *next* iteration, and both
+    /// of the things it does are irreversible: compaction replaces old turns
+    /// with a summary, trimming deletes them outright. Whatever has not been
+    /// written by the time it runs is what the record will be missing, so this
+    /// happens while the message is still whole.
+    ///
+    /// The messages are taken back out of the conversation rather than logged
+    /// on the way in, because that is where they have their sequence numbers.
+    ///
+    /// A failure is warned about and dropped. Logging is a service to whoever
+    /// reads the session afterwards; a turn that dies because it could not be
+    /// written down helps nobody, least of all them.
+    async fn record(&self, session: &Session, appended: usize) {
+        let messages = session.conversation.messages();
+        let from = messages.len().saturating_sub(appended);
+
+        if let Err(error) = self.log.append(&session.id, &messages[from..]).await {
+            warn!(%error, session = %session.id, "cannot write the conversation log");
         }
     }
 

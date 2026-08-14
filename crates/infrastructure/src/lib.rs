@@ -12,6 +12,7 @@ pub mod exec;
 pub mod fs;
 pub mod llm;
 pub(crate) mod net;
+pub mod session;
 pub mod telemetry;
 pub mod tools;
 pub mod web;

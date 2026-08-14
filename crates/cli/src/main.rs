@@ -49,10 +49,20 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
     let interactive = std::io::stdin().is_terminal();
     let app = composition::build(&cli, interactive).await?;
 
-    Ok(match cli.resolve_command() {
+    let command = cli.resolve_command();
+    let resume = command.resume();
+
+    Ok(match command {
         Command::Run { prompt } => commands::run::execute(&app, prompt.join(" ")).await?,
-        Command::Chat => {
-            commands::chat::execute(&app).await?;
+        Command::Chat { .. } => {
+            commands::chat::execute(&app, resume).await?;
+            ExitCode::SUCCESS
+        }
+        Command::Sessions { delete } => {
+            match delete {
+                Some(id) => commands::sessions::delete(&app, &id).await?,
+                None => commands::sessions::list(&app).await?,
+            }
             ExitCode::SUCCESS
         }
         Command::Tools => {
@@ -66,8 +76,10 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
     })
 }
 
-/// Fresh identifier for a conversation. Sessions are not persisted yet, so this
-/// only has to be unique within a process.
+/// Fresh identifier for a conversation.
+///
+/// It names the session's log file, so it has to stay unique across runs and
+/// not merely within a process - which is what rules out a counter.
 pub(crate) fn session_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }

@@ -8,21 +8,25 @@
 pub mod approval;
 pub mod command;
 pub mod context;
+pub mod conversation_log;
 pub mod events;
 pub mod file_system;
 pub mod llm;
 pub mod prompt;
 pub mod search;
+pub mod session_store;
 pub mod tool;
 pub mod web;
 
 pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 pub use command::{CommandOutput, CommandRequest, CommandRunner, SandboxKind};
 pub use context::ContextProvider;
+pub use conversation_log::{ConversationLog, NullConversationLog};
 pub use events::{AgentEvent, EventSink, FinishReason};
 pub use file_system::{DirEntry, EntryKind, FileSystem};
 pub use llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent};
 pub use prompt::PromptBuilder;
 pub use search::{FileSearcher, SearchHit, SearchQuery};
+pub use session_store::{SessionStore, SessionSummary};
 pub use tool::Tool;
 pub use web::{FetchedContent, WebFetcher};

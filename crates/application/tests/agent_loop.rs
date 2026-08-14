@@ -23,6 +23,7 @@ use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName, ToolResult};
 use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 use agent_domain::ports::context::ContextProvider;
+use agent_domain::ports::conversation_log::{ConversationLog, NullConversationLog};
 use agent_domain::ports::events::{AgentEvent, EventSink, FinishReason, NullEventSink};
 use agent_domain::ports::file_system::{DirEntry, EntryKind, FileSystem};
 use agent_domain::ports::llm::LlmProvider;
@@ -253,6 +254,7 @@ fn loop_with_config(
             events,
             context: Arc::new(FakeContext),
             prompt: Arc::new(DefaultPromptBuilder),
+            log: Arc::new(NullConversationLog),
         },
         config,
     )
@@ -745,6 +747,7 @@ async fn stream_false_uses_the_plain_chat_call() {
             events: Arc::new(NullEventSink),
             context: Arc::new(FakeContext),
             prompt: Arc::new(DefaultPromptBuilder),
+            log: Arc::new(NullConversationLog),
         },
         config,
     );
@@ -752,6 +755,115 @@ async fn stream_false_uses_the_plain_chat_call() {
     let mut session = Session::new("stream-5");
     let outcome = agent.run(&mut session, "hi").await.unwrap();
     assert_eq!(outcome.final_text, "plain");
+}
+
+// --- the conversation log ----------------------------------------------------
+
+#[derive(Default)]
+struct RecordingLog {
+    seen: Mutex<Vec<(String, Message)>>,
+}
+
+#[async_trait]
+impl ConversationLog for RecordingLog {
+    async fn append(&self, session_id: &str, messages: &[Message]) -> Result<(), FsError> {
+        let mut seen = self.seen.lock().unwrap();
+        seen.extend(
+            messages
+                .iter()
+                .map(|message| (session_id.to_string(), message.clone())),
+        );
+        Ok(())
+    }
+}
+
+struct BrokenLog;
+
+#[async_trait]
+impl ConversationLog for BrokenLog {
+    async fn append(&self, _session_id: &str, _messages: &[Message]) -> Result<(), FsError> {
+        Err(FsError::Io {
+            path: "/var/log".into(),
+            message: "no space left on device".into(),
+        })
+    }
+}
+
+fn loop_with_log(
+    provider: Arc<dyn LlmProvider>,
+    tools: Arc<ToolRegistry>,
+    log: Arc<dyn ConversationLog>,
+) -> AgentLoop {
+    AgentLoop::new(
+        AgentDependencies {
+            llm: provider,
+            tools,
+            approval: Arc::new(AlwaysApprove),
+            events: Arc::new(NullEventSink),
+            context: Arc::new(FakeContext),
+            prompt: Arc::new(DefaultPromptBuilder),
+            log,
+        },
+        AgentLoopConfig::default(),
+    )
+}
+
+/// Everything the loop appends is recorded, tool turns included.
+///
+/// The reason to pin the tool turn specifically: it is the part an
+/// `EventSink`-shaped log would lose, because the event for a finished call
+/// carries a one-line summary and not the output.
+#[tokio::test]
+async fn every_message_the_loop_appends_reaches_the_log() {
+    let file_system = MemoryFileSystem::with(&[("src/main.rs", "fn main() {}\n")]);
+    let provider = ScriptedProvider::new(vec![
+        tool_use("c1", "read_file", json!({"path": "src/main.rs"})),
+        assistant("It is an empty main function."),
+    ]);
+    let log = Arc::new(RecordingLog::default());
+
+    let mut session = Session::new("logged-7");
+    loop_with_log(provider, registry(file_system), log.clone())
+        .run(&mut session, "what is in main.rs?")
+        .await
+        .unwrap();
+
+    let seen = log.seen.lock().unwrap();
+    assert!(
+        seen.iter().all(|(id, _)| id == "logged-7"),
+        "every line must say which session it belongs to"
+    );
+
+    let roles: Vec<Role> = seen.iter().map(|(_, message)| message.role).collect();
+    assert_eq!(
+        roles,
+        vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant],
+        "the whole turn must be recorded, in order"
+    );
+    assert!(
+        seen[2].1.text().is_empty() || seen[2].1.content.len() == 1,
+        "the tool turn is recorded as blocks, not as prose"
+    );
+    assert!(
+        seen.iter().all(|(_, message)| message.seq.is_some()),
+        "records are taken from the conversation, so they carry its numbering"
+    );
+}
+
+/// A log that cannot be written must not take the session down with it.
+#[tokio::test]
+async fn a_broken_log_does_not_stop_the_turn() {
+    let provider = ScriptedProvider::new(vec![assistant("answered anyway")]);
+    let outcome = loop_with_log(
+        provider,
+        registry(MemoryFileSystem::with(&[])),
+        Arc::new(BrokenLog),
+    )
+    .run(&mut Session::new("broken-log"), "hi")
+    .await
+    .expect("a failed write must not become a failed turn");
+
+    assert_eq!(outcome.final_text, "answered anyway");
 }
 
 // --- web fetch ---------------------------------------------------------------

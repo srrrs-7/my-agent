@@ -38,11 +38,13 @@ pub use ports::{
     approval::{ApprovalDecision, ApprovalGate, ApprovalRequest},
     command::{CommandOutput, CommandRequest, CommandRunner, SandboxKind},
     context::ContextProvider,
+    conversation_log::{ConversationLog, NullConversationLog},
     events::{AgentEvent, EventSink, FinishReason, NullEventSink},
     file_system::{DirEntry, EntryKind, FileSystem},
     llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent},
     prompt::PromptBuilder,
     search::{FileSearcher, SearchHit, SearchQuery},
+    session_store::{SessionStore, SessionSummary},
     tool::Tool,
     web::{FetchedContent, WebFetcher},
 };

@@ -9,6 +9,23 @@
 //! [`Conversation::replace_prefix`] folds them into a single message that
 //! someone else has summarised. Only the boundary logic lives here - deciding
 //! *what* the summary says is a use case, not a domain rule.
+//!
+//! ## What survives is decided by order and size, never by the clock
+//!
+//! Every message carries the position it took in the session
+//! ([`Message::seq`](super::message::Message::seq)), assigned here as it is
+//! appended. That number is the only notion of "recent" this aggregate has,
+//! and it is enough: what the retention policy needs to know is how many
+//! messages ago something was said and how many bytes it costs to keep saying
+//! it, neither of which a wall clock answers better. It also keeps the
+//! aggregate pure - no clock to inject, and a policy that behaves identically
+//! on a session replayed a year later.
+//!
+//! In a conversation that has only ever been appended to, that number says the
+//! same thing as the vector index. It is kept as a field anyway because it is
+//! the part that survives being written to disk and read back, and because it
+//! keeps counting rather than restarting - so a session that is saved, resumed
+//! and then folded still has one ordering everybody agrees on.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +38,16 @@ const MIN_FOLDED_MESSAGES: usize = 2;
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
     messages: Vec<Message>,
+
+    /// The number the next appended message gets.
+    ///
+    /// Counts messages for the life of the session and is deliberately *not*
+    /// reset by a compaction: folding a prefix away shortens the vector, and
+    /// without this the history would forget how deep it already is the moment
+    /// it was shortened. Nothing outside reads it; what callers ask for is
+    /// [`Self::distance_from_newest`].
+    #[serde(default)]
+    next_seq: u64,
 }
 
 impl Conversation {
@@ -29,11 +56,16 @@ impl Conversation {
     }
 
     pub fn from_messages(messages: Vec<Message>) -> Self {
-        Self { messages }
+        let mut conversation = Self::default();
+        for message in messages {
+            conversation.push(message);
+        }
+        conversation
     }
 
     pub fn push(&mut self, message: Message) {
-        self.messages.push(message);
+        self.messages.push(message.with_seq(self.next_seq));
+        self.next_seq += 1;
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -96,6 +128,30 @@ impl Conversation {
         drop_count
     }
 
+    /// Drops a trailing assistant turn whose tool results never arrived,
+    /// returning how many messages went.
+    ///
+    /// The counterpart of the rule [`Self::trim_to_budget`] enforces at the
+    /// front. A history reconstructed from a record that stops mid-turn - a
+    /// crash between the model asking for a tool and the result being written -
+    /// ends with a `tool_call` nothing will ever answer, and the next request
+    /// carries it to a provider that rejects the pair. Nobody is going to run
+    /// that tool now, so the call goes.
+    ///
+    /// Loops rather than dropping one message because a turn may hold several
+    /// unanswered assistant messages; stops at anything else, so a complete
+    /// turn is never touched.
+    pub fn drop_trailing_unanswered_calls(&mut self) -> usize {
+        let mut end = self.messages.len();
+        while end > 0 && self.messages[end - 1].has_tool_calls() {
+            end -= 1;
+        }
+
+        let dropped = self.messages.len() - end;
+        self.messages.truncate(end);
+        dropped
+    }
+
     /// Where a compaction may cut, keeping `keep_recent` messages verbatim, or
     /// `None` when folding what is left would not be worth a model round-trip.
     ///
@@ -106,6 +162,74 @@ impl Conversation {
     pub fn compaction_split(&self, keep_recent: usize) -> Option<usize> {
         let split = self.fold_boundary(self.messages.len().saturating_sub(keep_recent));
         (split >= MIN_FOLDED_MESSAGES).then_some(split)
+    }
+
+    /// Where a compaction may cut when the tail is bounded by size as well as
+    /// by message count.
+    ///
+    /// [`Self::compaction_split`] keeps a fixed number of recent messages
+    /// whatever they weigh, and that is the wrong measure as soon as one of
+    /// them is a 32 KB tool result: twelve of those are more than the entire
+    /// history budget, so the tail that was supposed to be protected is
+    /// precisely what forces the fresh summary to be deleted again a moment
+    /// later. The number of messages worth keeping is not a constant - it
+    /// depends on how big they turned out to be.
+    ///
+    /// So this walks back from the newest message, taking messages while both
+    /// caps still allow: at most `keep_recent` of them, at most
+    /// `keep_recent_bytes` in total. The newest message is taken whatever it
+    /// weighs, because it is the turn about to be answered and a tail of
+    /// nothing leaves the model with nothing to answer.
+    ///
+    /// It can only ever cut *later* than [`Self::compaction_split`] would,
+    /// never earlier, and it leaves [`Self::trim_to_budget`] alone - so
+    /// nothing here makes outright deletion more likely. A message this moves
+    /// is a message that ends up in the summary instead of in the tail.
+    pub fn compaction_split_within(
+        &self,
+        keep_recent: usize,
+        keep_recent_bytes: usize,
+    ) -> Option<usize> {
+        let split = self.fold_boundary(self.verbatim_tail_start(keep_recent, keep_recent_bytes));
+        (split >= MIN_FOLDED_MESSAGES).then_some(split)
+    }
+
+    /// How far the message at `index` sits behind the newest one, counted in
+    /// messages.
+    ///
+    /// This is the weight the retention policy is built on: not how old a
+    /// message is in seconds, but how many turns of conversation have happened
+    /// since. A caller uses it to decide how much of a message is still worth
+    /// carrying - see `HistoryCompactor` in the application layer.
+    ///
+    /// Read from the sequence numbers rather than from the vector so that the
+    /// answer is the same before and after the history is persisted, and falls
+    /// back to the vector position for a history written before the numbers
+    /// existed.
+    pub fn distance_from_newest(&self, index: usize) -> u64 {
+        let newest = self.messages.len().saturating_sub(1);
+        let seq_at = |at: usize| self.messages.get(at).and_then(|message| message.seq);
+
+        match (seq_at(newest), seq_at(index)) {
+            (Some(newest_seq), Some(seq)) => newest_seq.saturating_sub(seq),
+            _ => newest.saturating_sub(index) as u64,
+        }
+    }
+
+    /// First index of the newest run of messages that fits both caps.
+    fn verbatim_tail_start(&self, keep_recent: usize, keep_recent_bytes: usize) -> usize {
+        let mut used = 0usize;
+        let mut start = self.messages.len();
+
+        for (index, message) in self.messages.iter().enumerate().rev().take(keep_recent) {
+            used += message.approx_bytes();
+            if used > keep_recent_bytes && start < self.messages.len() {
+                break;
+            }
+            start = index;
+        }
+
+        start
     }
 
     /// Replaces everything before `split` with `summary`, returning how many
@@ -119,7 +243,16 @@ impl Conversation {
         if split == 0 {
             return 0;
         }
-        self.messages.splice(..split, std::iter::once(summary));
+        // The summary inherits the number of the last message it swallowed,
+        // which keeps the session counting monotonically across the fold.
+        //
+        // The *last* rather than the first on purpose. A summary is a record
+        // written just now, not the oldest thing in the history, and numbering
+        // it as the oldest would tell every later policy to discard first the
+        // one message that was written to stop things being discarded.
+        let seq = self.messages[split - 1].seq.unwrap_or((split - 1) as u64);
+        self.messages
+            .splice(..split, std::iter::once(summary.with_seq(seq)));
         split
     }
 
@@ -295,6 +428,134 @@ mod tests {
 
         assert_eq!(folded, 3, "the cut moved past the tool result");
         assert_ne!(conversation.messages()[1].role, Role::Tool);
+    }
+
+    /// 116 approximate bytes each, so a budget divides into a whole number of
+    /// them and the arithmetic in these tests stays readable.
+    fn sized(text_bytes: usize) -> Message {
+        Message::assistant_text("x".repeat(text_bytes))
+    }
+
+    fn six_equal_messages() -> Conversation {
+        Conversation::from_messages((0..6).map(|_| sized(100)).collect())
+    }
+
+    #[test]
+    fn the_byte_cap_shortens_the_verbatim_tail() {
+        let conversation = six_equal_messages();
+        assert_eq!(
+            conversation.compaction_split(12),
+            None,
+            "by message count alone all six are protected and nothing is folded"
+        );
+
+        // 250 bytes is room for two of them, so the other four are folded -
+        // which is the whole point: how many messages are worth keeping
+        // depends on how big they turned out to be.
+        assert_eq!(conversation.compaction_split_within(12, 250), Some(4));
+    }
+
+    #[test]
+    fn the_message_cap_still_applies_when_the_bytes_are_generous() {
+        let conversation = six_equal_messages();
+        assert_eq!(
+            conversation.compaction_split_within(2, 1_000_000),
+            conversation.compaction_split(2),
+            "a budget nothing can exhaust must decide exactly what the count did"
+        );
+    }
+
+    #[test]
+    fn the_newest_message_is_kept_whatever_it_weighs() {
+        // A 5 KB tool result lands with 250 bytes of room. Folding it away
+        // would leave the model with nothing to answer.
+        let conversation =
+            Conversation::from_messages(vec![sized(100), sized(100), sized(100), sized(5_000)]);
+
+        assert_eq!(conversation.compaction_split_within(12, 250), Some(3));
+    }
+
+    #[test]
+    fn a_byte_driven_cut_still_never_orphans_a_tool_result() {
+        let mut conversation = with_a_tool_turn();
+        let split = conversation
+            .compaction_split_within(12, 100)
+            .expect("a budget this small must fold something");
+
+        conversation.replace_prefix(split, Message::user("SUMMARY"));
+        assert_eq!(conversation.messages()[0].role, Role::User);
+        assert_ne!(
+            conversation.messages()[1].role,
+            Role::Tool,
+            "history must not resume with a result whose call was folded away"
+        );
+    }
+
+    #[test]
+    fn sequence_numbers_survive_a_fold_and_keep_counting() {
+        let mut conversation = with_a_tool_turn();
+        assert_eq!(conversation.messages()[5].seq, Some(5));
+
+        let split = conversation.compaction_split(2).expect("there is history");
+        conversation.replace_prefix(split, Message::user("SUMMARY"));
+
+        assert_eq!(
+            conversation.messages()[0].seq,
+            Some(3),
+            "the summary takes the number of the last message it swallowed"
+        );
+        assert_eq!(
+            conversation.messages()[2].seq,
+            Some(5),
+            "the tail keeps its own"
+        );
+
+        conversation.push(Message::user("third"));
+        assert_eq!(
+            conversation.messages()[3].seq,
+            Some(6),
+            "the counter must not restart just because the vector shrank"
+        );
+        assert_eq!(conversation.distance_from_newest(0), 3);
+    }
+
+    #[test]
+    fn a_history_that_stops_mid_turn_loses_the_unanswered_call() {
+        // What a record written up to the moment of a crash looks like.
+        let call = call();
+        let mut conversation = Conversation::from_messages(vec![
+            Message::user("go"),
+            Message::assistant_text("looking"),
+            Message::assistant(vec![ContentBlock::ToolCall(call)]),
+        ]);
+
+        assert_eq!(conversation.drop_trailing_unanswered_calls(), 1);
+        assert_eq!(conversation.len(), 2);
+        assert_eq!(conversation.messages()[1].text(), "looking");
+    }
+
+    #[test]
+    fn a_complete_turn_is_left_alone() {
+        let mut conversation = with_a_tool_turn();
+        let before = conversation.clone();
+
+        assert_eq!(conversation.drop_trailing_unanswered_calls(), 0);
+        assert_eq!(conversation, before);
+    }
+
+    #[test]
+    fn a_history_without_sequence_numbers_still_measures_distance() {
+        // What a session persisted before the numbers existed looks like.
+        let conversation: Conversation = serde_json::from_str(
+            r#"{"messages":[
+                 {"role":"user","content":[{"type":"text","text":"a"}]},
+                 {"role":"assistant","content":[{"type":"text","text":"b"}]}
+               ]}"#,
+        )
+        .expect("an older history must still load");
+
+        assert_eq!(conversation.distance_from_newest(0), 1);
+        assert_eq!(conversation.distance_from_newest(1), 0);
     }
 
     #[test]

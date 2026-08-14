@@ -23,9 +23,11 @@ use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
 use agent_domain::ports::events::{FinishReason, NullEventSink};
 use agent_domain::ports::prompt::PromptBuilder;
+use agent_domain::ports::session_store::SessionStore;
 use agent_infrastructure::config::{LlmSettings, ProviderKind, ProviderSettings, RouterKind};
 use agent_infrastructure::fs::{LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
+use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
 use agent_test_support::{MockLlmServer, Response};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -105,6 +107,11 @@ impl Fixture {
             max_retries: 2,
         };
 
+        // Every harness logs, so that any test can ask what the record kept -
+        // which is the only way to check that content the loop threw away
+        // still exists somewhere.
+        let log = Arc::new(FileConversationLog::new(log_dir(workspace.path())));
+
         let file_system = Arc::new(LocalFileSystem::new(root.clone(), 1024 * 1024).unwrap());
         let tools = Arc::new(
             ToolRegistry::new()
@@ -123,6 +130,7 @@ impl Fixture {
                 events: Arc::new(NullEventSink),
                 context: Arc::new(WorkspaceContextProvider::new(root)),
                 prompt,
+                log: log.clone(),
             },
             config,
         );
@@ -143,6 +151,20 @@ impl Fixture {
     fn read(&self, relative: &str) -> Option<String> {
         std::fs::read_to_string(self.workspace.path().join(relative)).ok()
     }
+
+    /// Every line the conversation log holds for `session_id`.
+    fn logged(&self, session_id: &str) -> Vec<Value> {
+        let path = log_dir(self.workspace.path()).join(format!("{session_id}.jsonl"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("no log at {}: {error}", path.display()))
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every line must be valid JSON"))
+            .collect()
+    }
+}
+
+fn log_dir(workspace: &std::path::Path) -> std::path::PathBuf {
+    workspace.join(".agent").join("sessions")
 }
 
 /// The `tool` message the agent sent back for a given call id.
@@ -410,6 +432,166 @@ async fn a_replaced_system_prompt_is_sent_verbatim_and_tools_still_work() {
         tool_result(&requests[1], "call_1").contains("secret"),
         "the tool actually executed against the real filesystem"
     );
+}
+
+/// The record outlives the compaction.
+///
+/// This is the claim the whole log exists for, and it can only be checked from
+/// out here: the loop is what shortens the history, so a test that fakes the
+/// loop proves nothing. Both assertions matter and they pull in opposite
+/// directions - the live history *must* have lost the detail (or the budget
+/// did not work) and the log *must* still have it (or the record did not).
+#[tokio::test]
+async fn the_log_keeps_what_the_compaction_folded_away() {
+    let fixture = Fixture::with_config(
+        vec![
+            Response::assistant_text(&format!("DETAIL {}", "x".repeat(4_000))),
+            Response::assistant_text("RECORD OF THE SESSION"),
+            Response::assistant_text("carrying on"),
+        ],
+        AgentLoopConfig {
+            max_iterations: 3,
+            max_history_bytes: 3 * 1024,
+            compact: true,
+            compact_keep_recent: 1,
+            stream: false,
+            ..AgentLoopConfig::default()
+        },
+    )
+    .await;
+
+    let mut session = Session::new("log-compaction");
+    fixture
+        .agent
+        .run(&mut session, "the original request")
+        .await
+        .unwrap();
+    fixture.agent.run(&mut session, "carry on").await.unwrap();
+
+    let live: String = session
+        .conversation
+        .messages()
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live.contains("the original request"),
+        "the compaction must actually have folded the first turn away, or the \
+         rest of this test proves nothing: {live}"
+    );
+
+    let logged = serde_json::to_string(&fixture.logged("log-compaction")).unwrap();
+    assert!(
+        logged.contains("the original request"),
+        "what the user asked for must survive in the record: {logged}"
+    );
+    assert!(
+        logged.contains("DETAIL"),
+        "and so must the answer it got: {logged}"
+    );
+}
+
+/// A session survives the process that made it.
+///
+/// The restart cannot be acted out in a test, so this does the next thing: it
+/// throws the in-memory session away, rebuilds one from the file alone, and
+/// checks that what reaches the provider on the next turn still carries the
+/// earlier conversation. Everything between the log and the wire participates.
+#[tokio::test]
+async fn a_session_can_be_resumed_from_its_log() {
+    let fixture = Fixture::with_config(
+        vec![
+            Response::assistant_text("noted"),
+            Response::assistant_text("you said it must be dependency-free"),
+        ],
+        AgentLoopConfig {
+            max_iterations: 3,
+            stream: false,
+            ..AgentLoopConfig::default()
+        },
+    )
+    .await;
+
+    let mut before = Session::new("resume-e2e");
+    fixture
+        .agent
+        .run(&mut before, "the parser must stay dependency-free")
+        .await
+        .unwrap();
+    drop(before);
+
+    let restored = FileSessionStore::new(log_dir(fixture.workspace.path()))
+        .load("resume-e2e")
+        .await
+        .expect("the session must be readable from its log alone");
+    assert_eq!(restored.len(), 2, "the request and the answer to it");
+
+    let mut after = Session::new("resume-e2e");
+    after.conversation = restored;
+    let outcome = fixture
+        .agent
+        .run(&mut after, "what did I say about the parser?")
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_text, "you said it must be dependency-free");
+
+    // Read before the server is consumed: the record keeps growing in the same
+    // file rather than forking in two.
+    let logged = fixture.logged("resume-e2e");
+    assert_eq!(logged.len(), 4, "two turns, two messages each: {logged:?}");
+
+    let requests = fixture.server.json_requests().await;
+    assert!(
+        requests
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("dependency-free"),
+        "the resumed turn must carry the earlier conversation: {}",
+        requests.last().unwrap()
+    );
+}
+
+/// The same claim for the other, harsher way the history shrinks.
+///
+/// With compaction off there is no summary to fall back on: trimming deletes,
+/// and the log is the only place the deleted turns still exist.
+#[tokio::test]
+async fn the_log_keeps_what_the_trimming_deleted() {
+    let fixture = Fixture::with_config(
+        vec![
+            Response::assistant_text(&format!("DETAIL {}", "x".repeat(4_000))),
+            Response::assistant_text("carrying on"),
+        ],
+        AgentLoopConfig {
+            max_iterations: 3,
+            max_history_bytes: 3 * 1024,
+            keep_recent_messages: 1,
+            compact: false,
+            stream: false,
+            ..AgentLoopConfig::default()
+        },
+    )
+    .await;
+
+    let mut session = Session::new("log-trimming");
+    fixture
+        .agent
+        .run(&mut session, "the original request")
+        .await
+        .unwrap();
+    fixture.agent.run(&mut session, "carry on").await.unwrap();
+
+    assert_eq!(
+        session.conversation.len(),
+        2,
+        "trimming must have dropped the first turn outright"
+    );
+
+    let logged = serde_json::to_string(&fixture.logged("log-trimming")).unwrap();
+    assert!(logged.contains("the original request"), "{logged}");
+    assert!(logged.contains("DETAIL"), "{logged}");
 }
 
 /// What a compaction actually puts on the wire.

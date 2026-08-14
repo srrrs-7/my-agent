@@ -3,6 +3,7 @@
 use agent_application::agent::Session;
 use anyhow::Result;
 
+use crate::args::Resume;
 use crate::commands::tools;
 use crate::composition::Application;
 use crate::input::prompt_line;
@@ -21,10 +22,10 @@ enum Input {
     Prompt,
 }
 
-pub async fn execute(app: &Application) -> Result<()> {
+pub async fn execute(app: &Application, resume: Resume) -> Result<()> {
     banner(app);
 
-    let mut session = Session::new(session_id());
+    let mut session = start(app, resume).await;
 
     loop {
         let Some(line) = prompt_line("\n› ").await? else {
@@ -52,6 +53,54 @@ pub async fn execute(app: &Application) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The session the REPL opens with.
+///
+/// Every way of failing to resume ends in a fresh session rather than in an
+/// error. A missing record, an unreadable one, a `--resume` on a machine that
+/// has never logged anything - none of those are reasons to refuse to start,
+/// and someone who typed `--resume` out of habit should get a usable agent and
+/// a line explaining why it is empty.
+async fn start(app: &Application, resume: Resume) -> Session {
+    let wanted = match resume {
+        Resume::No => return Session::new(session_id()),
+        Resume::Session(id) => Some(id),
+        Resume::Latest => match app.sessions.latest().await {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => {
+                eprintln!("no session to resume; starting a new one");
+                None
+            }
+            Err(error) => {
+                eprintln!("cannot read the session directory ({error}); starting a new one");
+                None
+            }
+        },
+    };
+
+    let Some(id) = wanted else {
+        return Session::new(session_id());
+    };
+
+    match app.sessions.load(&id).await {
+        Ok(conversation) if conversation.is_empty() => {
+            eprintln!("session {id} has nothing in it; starting a new one");
+            Session::new(session_id())
+        }
+        Ok(conversation) => {
+            eprintln!("resuming {id} ({} messages)", conversation.len());
+            // The same id, so the log carries on in the same file rather than
+            // forking the record in two.
+            let mut session = Session::new(id);
+            session.conversation = conversation;
+            session
+        }
+        Err(error) => {
+            eprintln!("cannot resume {id} ({error}); starting a new one");
+            Session::new(session_id())
+        }
+    }
 }
 
 fn classify(line: &str) -> Input {

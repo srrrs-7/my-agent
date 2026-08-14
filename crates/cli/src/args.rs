@@ -62,13 +62,49 @@ pub enum Command {
     },
 
     /// Interactive session that keeps the conversation history.
-    Chat,
+    Chat {
+        /// Continue a previous session. Without an ID, the most recent one.
+        ///
+        /// Reads the session log, so it needs AGENT_SESSION_LOG to have been
+        /// on when that session ran.
+        #[arg(long, value_name = "ID", num_args = 0..=1, default_missing_value = "")]
+        resume: Option<String>,
+    },
+
+    /// List the saved sessions.
+    Sessions {
+        /// Delete this session's record instead of listing.
+        #[arg(long, value_name = "ID")]
+        delete: Option<String>,
+    },
 
     /// List the tools exposed to the model.
     Tools,
 
     /// Show the resolved configuration and check that the LLM answers.
     Doctor,
+}
+
+/// Which conversation `agent chat` should start from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resume {
+    /// A fresh conversation.
+    No,
+    /// Whichever session was written to last.
+    Latest,
+    Session(String),
+}
+
+impl Resume {
+    /// `--resume` with no value arrives as an empty string, which is clap's
+    /// way of saying "the flag was there but bare".
+    fn parse(flag: Option<&str>) -> Self {
+        match flag {
+            None => Self::No,
+            Some(id) if id.trim().is_empty() => Self::Latest,
+            Some(id) => Self::Session(id.to_string()),
+        }
+    }
 }
 
 impl Cli {
@@ -79,11 +115,26 @@ impl Cli {
             Some(Command::Run { prompt }) => Command::Run {
                 prompt: prompt.clone(),
             },
-            Some(Command::Chat) => Command::Chat,
+            Some(Command::Chat { resume }) => Command::Chat {
+                resume: resume.clone(),
+            },
+            Some(Command::Sessions { delete }) => Command::Sessions {
+                delete: delete.clone(),
+            },
             Some(Command::Tools) => Command::Tools,
             Some(Command::Doctor) => Command::Doctor,
             // Bare `agent` drops into the REPL, like `psql` or `irb`.
-            None => Command::Chat,
+            None => Command::Chat { resume: None },
+        }
+    }
+}
+
+impl Command {
+    /// What `chat` was asked to continue from.
+    pub fn resume(&self) -> Resume {
+        match self {
+            Self::Chat { resume } => Resume::parse(resume.as_deref()),
+            _ => Resume::No,
         }
     }
 }
@@ -109,10 +160,46 @@ mod tests {
 
     #[test]
     fn defaults_to_chat() {
+        let command = Cli::parse_from(["agent"]).resolve_command();
+        assert!(matches!(command, Command::Chat { .. }));
+        assert_eq!(command.resume(), Resume::No);
+    }
+
+    #[test]
+    fn resume_takes_an_optional_session_id() {
+        // The bare flag is the common case - "carry on from where I was" -
+        // and naming a session is the exception, so the id must be optional
+        // rather than a second flag.
+        assert_eq!(
+            Cli::parse_from(["agent", "chat", "--resume"])
+                .resolve_command()
+                .resume(),
+            Resume::Latest
+        );
+        assert_eq!(
+            Cli::parse_from(["agent", "chat", "--resume", "abc-123"])
+                .resolve_command()
+                .resume(),
+            Resume::Session("abc-123".into())
+        );
+        assert_eq!(
+            Cli::parse_from(["agent", "chat"])
+                .resolve_command()
+                .resume(),
+            Resume::No
+        );
+    }
+
+    #[test]
+    fn sessions_lists_or_deletes() {
         assert!(matches!(
-            Cli::parse_from(["agent"]).resolve_command(),
-            Command::Chat
+            Cli::parse_from(["agent", "sessions"]).resolve_command(),
+            Command::Sessions { delete: None }
         ));
+        match Cli::parse_from(["agent", "sessions", "--delete", "abc"]).resolve_command() {
+            Command::Sessions { delete } => assert_eq!(delete.as_deref(), Some("abc")),
+            other => panic!("expected sessions, got {other:?}"),
+        }
     }
 
     #[test]

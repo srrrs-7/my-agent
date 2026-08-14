@@ -7,4 +7,5 @@
 pub mod chat;
 pub mod doctor;
 pub mod run;
+pub mod sessions;
 pub mod tools;

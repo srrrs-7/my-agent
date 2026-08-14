@@ -21,20 +21,25 @@ use agent_application::tools::web::WebFetchTool;
 use agent_domain::model::llm::{GenerationParams, ModelId};
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::ApprovalGate;
+use agent_domain::ports::conversation_log::{ConversationLog, NullConversationLog};
 use agent_domain::ports::events::EventSink;
 use agent_domain::ports::llm::LlmProvider;
 use agent_domain::ports::prompt::PromptBuilder;
+use agent_domain::ports::session_store::SessionStore;
 use agent_domain::ports::tool::Tool;
 use agent_infrastructure::config::{ApprovalPolicy, PromptSettings, Settings, ShellSettings};
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
+use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
 use agent_infrastructure::tools::TimeoutTool;
 use agent_infrastructure::web::{GuardedWebFetcher, WebFetchConfig};
 use anyhow::{Context, Result};
 
+use tracing::warn;
+
 use crate::approval::CliApprovalGate;
-use crate::args::Cli;
+use crate::args::{Cli, Resume};
 use crate::render::TerminalRenderer;
 
 pub struct Application {
@@ -43,6 +48,10 @@ pub struct Application {
     pub tools: Arc<ToolRegistry>,
     pub provider: Arc<dyn LlmProvider>,
     pub agent: AgentLoop,
+    /// Reads back what the log wrote. Present even when logging is off, in
+    /// which case it simply finds nothing - `agent sessions` should say "no
+    /// sessions" rather than fail.
+    pub sessions: Arc<dyn SessionStore>,
     /// Kept alive for the life of the process: it owns the egress proxy's
     /// port, and the commands it confines refer to that port by number.
     /// `doctor` also reads its reported sandbox rather than the configuration.
@@ -127,6 +136,19 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
     };
 
     // --- the loop ------------------------------------------------------------
+    // Disabled means `NullConversationLog`, not a flag the loop checks: there
+    // is no "logging is off" branch anywhere above this line.
+    let log: Arc<dyn ConversationLog> = if settings.session.log {
+        Arc::new(FileConversationLog::new(settings.session_dir()))
+    } else {
+        Arc::new(NullConversationLog)
+    };
+    // The reader is wired unconditionally: turning the log off stops new
+    // sessions being written, it does not make the old ones unreadable.
+    let store = Arc::new(FileSessionStore::new(settings.session_dir()));
+    apply_retention(&settings, &store, cli).await;
+    let sessions: Arc<dyn SessionStore> = store;
+
     let prompt = build_prompt_builder(&settings.prompt)?;
     let agent = AgentLoop::new(
         AgentDependencies {
@@ -136,6 +158,7 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             events,
             context,
             prompt,
+            log,
         },
         AgentLoopConfig {
             model: cli.model.as_deref().map(ModelId::new),
@@ -151,6 +174,7 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             keep_recent_messages: 6,
             compact: settings.agent_loop.compact,
             compact_keep_recent: settings.agent_loop.compact_keep_recent,
+            compact_keep_recent_bytes: settings.agent_loop.compact_keep_recent_bytes,
             parallel_read_only_tools: settings.agent_loop.parallel_read_only_tools,
             stream: settings.agent_loop.stream,
         },
@@ -162,8 +186,46 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         tools,
         provider,
         agent,
+        sessions,
         commands,
     })
+}
+
+/// Deletes the session records the retention policy no longer covers.
+///
+/// Startup is the natural place for it: the log only ever appends, so
+/// something has to be the thing that removes, and there is no other moment
+/// that happens on its own. It costs one directory read and one `stat` per
+/// file - no session is opened - so it does not grow into the startup path.
+///
+/// The session `--resume` names is exempt. Reaching for an old record by id is
+/// the normal reason to have one, and deleting it in the second before opening
+/// it would be the worst possible timing.
+///
+/// A failure here is a warning, never a refusal to start. Housekeeping that
+/// could not run is not a reason to withhold the agent.
+async fn apply_retention(settings: &Settings, store: &FileSessionStore, cli: &Cli) {
+    if settings.session.retention.keeps_everything() {
+        return;
+    }
+
+    let protected: Vec<String> = match cli.resolve_command().resume() {
+        Resume::No => Vec::new(),
+        Resume::Session(id) => vec![id],
+        // `keep` alone would spare the newest, but `max_age` would not: a
+        // session resumed after a long break is old by definition.
+        Resume::Latest => store.latest().await.ok().flatten().into_iter().collect(),
+    };
+    let protected: Vec<&str> = protected.iter().map(String::as_str).collect();
+
+    match store.prune(&settings.session.retention, &protected).await {
+        Ok(removed) if !removed.is_empty() => eprintln!(
+            "removed {} old session record(s); `agent doctor` shows the retention policy",
+            removed.len()
+        ),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "cannot apply the session retention policy"),
+    }
 }
 
 /// Builds the command runner, turning a sandbox shortfall into an error the

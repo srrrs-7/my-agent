@@ -28,11 +28,22 @@ pub struct AgentLoopConfig {
     /// otherwise lose content - see [`super::compaction`].
     pub compact: bool,
 
-    /// Messages left verbatim after a compaction. Larger than
+    /// Most messages left verbatim after a compaction. Larger than
     /// [`Self::keep_recent_messages`] on purpose: that one is a floor trimming
     /// must not cross, this one is how much recent conversation is worth
     /// keeping in its original words once the rest is a summary.
     pub compact_keep_recent: usize,
+
+    /// Most bytes left verbatim after a compaction, whatever that works out to
+    /// in messages.
+    ///
+    /// This is the cap that usually binds, and the reason the other one is not
+    /// enough: twelve messages is a different amount of history depending on
+    /// whether they are one-line answers or 32 KB tool results, and in the
+    /// second case the protected tail is three times
+    /// [`Self::max_history_bytes`] all by itself - so the summary that was just
+    /// written gets trimmed away to make room for it.
+    pub compact_keep_recent_bytes: usize,
 
     /// Run read-only tool calls of the same turn concurrently. Mutating calls
     /// always run sequentially, in the order the model asked for them.
@@ -62,6 +73,7 @@ impl Default for AgentLoopConfig {
             keep_recent_messages: 6,
             compact: true,
             compact_keep_recent: 12,
+            compact_keep_recent_bytes: 64 * 1024,
             parallel_read_only_tools: true,
             stream: true,
         }

@@ -17,6 +17,24 @@
 //! message. Those are the things whose loss shows up as the model re-asking a
 //! settled question or re-running a fix that did not work.
 //!
+//! ## Recency is a weight, not a cliff
+//!
+//! Two things decide what survives, and both are measured in messages and
+//! bytes rather than in seconds.
+//!
+//! The tail kept word for word is bounded by size as well as by count, so how
+//! many recent messages survive depends on how big they turned out to be - a
+//! turn that read a 32 KB file does not get to protect itself twelve times
+//! over. Inside the folded prefix the thinning is gradual: a block's share of
+//! the transcript halves the further back it sits, down to a floor it never
+//! crosses, so the turns just behind the tail reach the summariser in detail
+//! and the ones at the bottom reach it as an outline.
+//!
+//! There is no wall clock anywhere in this. What matters is how much
+//! conversation has happened since something was said, not how much time - an
+//! agent whose session sat idle for three hours has not moved on from
+//! anything, and a clock would tell it that it had.
+//!
 //! ## Failure is not an error
 //!
 //! Compaction is an improvement on trimming, not a precondition for it. If the
@@ -38,14 +56,49 @@ use tracing::{debug, warn};
 /// meant to relieve.
 const SUMMARY_MAX_TOKENS: u32 = 2048;
 
-/// Per-block cap when rendering the prefix for the summariser - with one
-/// exception below.
+/// Per-block cap for the most recent of the folded messages - with one
+/// exception, [`render_transcript`].
 ///
 /// The prefix is being folded precisely because it is too big to keep, so
 /// sending all of it back would defeat the exercise. Tool output is most of the
 /// bulk and the least worth preserving word for word: what the summary needs is
 /// that a file was read and what came of it, not the file.
 const MAX_BLOCK_BYTES: usize = 2_000;
+
+/// Per-block cap for anything far enough back, and a floor that is never
+/// crossed.
+///
+/// A block reduced to nothing is a block the summary cannot mention at all,
+/// and "there was a step here I can no longer describe" is worse than a short
+/// description of it.
+const MIN_BLOCK_BYTES: usize = 250;
+
+/// How many messages of distance halve a block's share of the transcript.
+///
+/// Eight is roughly one exchange plus the tool calls it took: near enough that
+/// the thinning is felt within the span the next request is likely to reach
+/// back into, far enough that it is not felt inside a single turn.
+const HALVING_DISTANCE: u64 = 8;
+
+/// How much of one block survives into the transcript, given how many messages
+/// back it sits.
+///
+/// The retention rule of this whole module in one line: recency is a weight,
+/// not a cliff. Everything in the prefix is being replaced by a summary, but
+/// the turns just behind the surviving tail are the ones the next request is
+/// most likely to reach for, so they reach the summariser in detail while the
+/// ones far behind reach it as an outline.
+///
+/// Distance is counted in *messages*, not in seconds. The question worth
+/// asking is how much conversation has happened since, and an agent that spent
+/// three hours idle has not moved on from anything.
+fn block_budget(distance: u64) -> usize {
+    let halvings = u32::try_from(distance / HALVING_DISTANCE).unwrap_or(u32::MAX);
+    MAX_BLOCK_BYTES
+        .checked_shr(halvings)
+        .unwrap_or(0)
+        .max(MIN_BLOCK_BYTES)
+}
 
 /// What the summariser is asked to produce.
 ///
@@ -91,8 +144,17 @@ round numbers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
     pub enabled: bool,
-    /// Messages at the tail left verbatim. Everything before them is folded.
+    /// Most messages the tail may keep verbatim. Everything before them is
+    /// folded.
     pub keep_recent_messages: usize,
+    /// Most bytes the tail may keep verbatim, whatever that works out to in
+    /// messages.
+    ///
+    /// The cap that actually binds. A count alone protects twelve messages
+    /// whether they are twelve one-line answers or twelve 32 KB tool results,
+    /// and in the second case the tail that was meant to be protected is what
+    /// pushes the fresh summary back out of the budget again.
+    pub keep_recent_bytes: usize,
     /// Passed through so an operator who pinned a model gets it here too. A
     /// router that wants to send summaries somewhere cheaper reads
     /// [`TaskKind::Summarize`] off the request metadata instead.
@@ -104,6 +166,7 @@ impl Default for CompactionConfig {
         Self {
             enabled: true,
             keep_recent_messages: 12,
+            keep_recent_bytes: 64 * 1024,
             model: None,
         }
     }
@@ -140,9 +203,12 @@ impl HistoryCompactor {
             return None;
         }
 
-        let split = conversation.compaction_split(self.config.keep_recent_messages)?;
+        let split = conversation.compaction_split_within(
+            self.config.keep_recent_messages,
+            self.config.keep_recent_bytes,
+        )?;
         let before_bytes = conversation.approx_bytes();
-        let transcript = render_transcript(&conversation.messages()[..split]);
+        let transcript = render_transcript(conversation, split);
 
         let summary = match self.llm.chat(self.request(session_id, transcript)).await {
             Ok(response) => response.message.text(),
@@ -219,16 +285,28 @@ fn summary_message(summary: &str) -> Message {
     ))
 }
 
-/// Flattens messages into a transcript the summariser can read.
+/// Flattens `conversation.messages()[..split]` into a transcript the
+/// summariser can read, spending more of the transcript on the turns nearest
+/// the surviving tail than on the ones at the bottom.
 ///
-/// User messages are never clipped. They are the instructions the whole session
-/// is an answer to, and a summary that has lost half of one is worse than no
-/// compaction at all - which is also why a previous summary, being a user
-/// message, survives intact into the next one.
-fn render_transcript(messages: &[Message]) -> String {
+/// How much each block gets is [`block_budget`] of its distance from the newest
+/// message, which is why this needs the whole conversation and not just the
+/// slice: distance is measured against the session, and the slice does not know
+/// what comes after it.
+///
+/// **User messages are never clipped, at any distance.** They are the
+/// instructions the whole session is an answer to, and a summary that has lost
+/// half of one is worse than no compaction at all. It is also what protects the
+/// *previous* summary, which re-enters as a user message: without the
+/// exemption, the record written by the last compaction would be the oldest
+/// thing in the history and so the first thing this one thinned away - each
+/// compaction quietly undoing the one before it.
+fn render_transcript(conversation: &Conversation, split: usize) -> String {
     let mut out = String::new();
 
-    for message in messages {
+    for (index, message) in conversation.messages()[..split].iter().enumerate() {
+        let budget = block_budget(conversation.distance_from_newest(index));
+
         for block in &message.content {
             match block {
                 ContentBlock::Text { text } if message.role == Role::User => {
@@ -238,14 +316,14 @@ fn render_transcript(messages: &[Message]) -> String {
                 }
                 ContentBlock::Text { text } => {
                     out.push_str("\n## assistant\n");
-                    out.push_str(&text::clip(text, MAX_BLOCK_BYTES));
+                    out.push_str(&text::clip(text, budget));
                     out.push('\n');
                 }
                 ContentBlock::ToolCall(call) => {
                     out.push_str(&format!(
                         "\n### tool call: {}\n{}\n",
                         call.name,
-                        text::clip(&call.arguments.to_string(), MAX_BLOCK_BYTES)
+                        text::clip(&call.arguments.to_string(), budget)
                     ));
                 }
                 ContentBlock::ToolResult(result) => {
@@ -253,7 +331,7 @@ fn render_transcript(messages: &[Message]) -> String {
                         "\n### tool result: {} [{}]\n{}\n",
                         result.tool_name,
                         if result.is_error { "error" } else { "ok" },
-                        text::clip(&result.content, MAX_BLOCK_BYTES)
+                        text::clip(&result.content, budget)
                     ));
                 }
             }
@@ -352,12 +430,23 @@ mod tests {
         ])
     }
 
+    /// A byte cap nothing in these fixtures can exhaust, so the tests that
+    /// were written against the message count still measure the message count.
     fn compactor(llm: Arc<StubProvider>, keep_recent: usize) -> HistoryCompactor {
+        compactor_within(llm, keep_recent, 1024 * 1024)
+    }
+
+    fn compactor_within(
+        llm: Arc<StubProvider>,
+        keep_recent: usize,
+        keep_recent_bytes: usize,
+    ) -> HistoryCompactor {
         HistoryCompactor::new(
             llm,
             CompactionConfig {
                 enabled: true,
                 keep_recent_messages: keep_recent,
+                keep_recent_bytes,
                 model: None,
             },
         )
@@ -548,6 +637,112 @@ mod tests {
             transcript.contains("RECORD ONE"),
             "the earlier record must be fed back in whole, or it is lost one \
              compaction later: {transcript}"
+        );
+    }
+
+    #[test]
+    fn a_blocks_share_of_the_transcript_halves_with_distance() {
+        assert_eq!(block_budget(0), MAX_BLOCK_BYTES);
+        assert_eq!(block_budget(HALVING_DISTANCE - 1), MAX_BLOCK_BYTES);
+        assert_eq!(block_budget(HALVING_DISTANCE), MAX_BLOCK_BYTES / 2);
+        assert_eq!(block_budget(HALVING_DISTANCE * 2), MAX_BLOCK_BYTES / 4);
+        assert_eq!(
+            block_budget(u64::MAX),
+            MIN_BLOCK_BYTES,
+            "the oldest turn is still described, never erased"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bulky_tail_is_folded_further_than_the_message_count_would() {
+        // Twelve messages, which the count alone would protect in full - but
+        // each is 20 KB and the tail is allowed 50.
+        let mut conversation = Conversation::new();
+        for _ in 0..12 {
+            conversation.push(Message::assistant_text("y".repeat(20_000)));
+        }
+        assert_eq!(
+            conversation.compaction_split(12),
+            None,
+            "by count alone this folds nothing, which is the bug"
+        );
+
+        let report = compactor_within(StubProvider::answering("RECORD"), 12, 50 * 1024)
+            .compact("s1", &mut conversation)
+            .await
+            .expect("the byte cap must force the fold the count would not");
+
+        assert_eq!(report.folded_messages, 10, "50 KB is room for two of them");
+        assert_eq!(conversation.len(), 3, "the summary plus the two that fit");
+        assert!(report.after_bytes < report.before_bytes, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn the_transcript_thins_out_towards_the_bottom() {
+        let llm = StubProvider::answering("RECORD");
+        let mut conversation = Conversation::new();
+        for index in 0..20 {
+            conversation.push(Message::assistant_text(format!(
+                "<{index:02}>{}",
+                "x".repeat(3_000)
+            )));
+        }
+
+        compactor(llm.clone(), 2)
+            .compact("s1", &mut conversation)
+            .await
+            .unwrap();
+
+        let transcript = llm.request().messages[0].text();
+        let oldest = rendered_block(&transcript, "<00>");
+        let newest = rendered_block(&transcript, "<17>");
+
+        assert!(
+            newest > oldest * 2,
+            "detail must thin out with distance: <17> kept {newest} bytes, <00> kept {oldest}"
+        );
+        assert!(
+            oldest >= MIN_BLOCK_BYTES,
+            "and must never vanish altogether: {oldest}"
+        );
+    }
+
+    /// Byte length of the rendered block the marker opens.
+    fn rendered_block(transcript: &str, marker: &str) -> usize {
+        let start = transcript
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker} never reached the summariser"));
+        transcript[start..]
+            .find('\n')
+            .expect("a rendered block ends in a newline")
+    }
+
+    #[tokio::test]
+    async fn a_distant_summary_is_still_carried_forward_whole() {
+        // The failure this pins is a compaction quietly undoing the one before
+        // it: the previous record is the oldest thing in the history, so a
+        // thinning rule that did not exempt it would cut it first.
+        let record = format!("RECORD ONE {}", "d".repeat(4_000));
+        let mut conversation = history();
+        compactor(StubProvider::answering(&record), 2)
+            .compact("s1", &mut conversation)
+            .await
+            .unwrap();
+
+        for index in 0..30 {
+            conversation.push(Message::assistant_text(format!("filler {index}")));
+        }
+
+        let second = StubProvider::answering("RECORD TWO");
+        compactor(second.clone(), 2)
+            .compact("s1", &mut conversation)
+            .await
+            .unwrap();
+
+        let transcript = second.request().messages[0].text();
+        assert!(
+            transcript.contains(&record),
+            "the earlier record must survive whole, however far back it sits"
         );
     }
 
