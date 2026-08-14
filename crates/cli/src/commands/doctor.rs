@@ -48,6 +48,31 @@ fn print_configuration(app: &Application) {
         "capabilities",
         app.provider.capabilities().supports_tools
     );
+    print_sandbox(app);
+}
+
+/// What the sandbox *is*, not what was configured.
+///
+/// These two can differ, and the difference is the whole point of printing it:
+/// an operator who set a requirement and got something else needs to see that
+/// here rather than infer it from a command that failed strangely later.
+fn print_sandbox(app: &Application) {
+    let Some(runner) = &app.commands else {
+        println!("  {:<20} run_command is not registered", "sandbox");
+        return;
+    };
+
+    use agent_domain::ports::command::CommandRunner as _;
+    println!("  {:<20} {}", "sandbox", runner.sandbox().describe());
+
+    let egress = match runner.egress_port() {
+        Some(port) => format!(
+            "{} (via the proxy on 127.0.0.1:{port})",
+            app.settings.shell.allowed_domains.join(", ")
+        ),
+        None => "none - every outbound connection is refused".to_string(),
+    };
+    println!("  {:<20} {egress}", "command egress");
 }
 
 /// Smallest request that still proves the endpoint, the key and the model name

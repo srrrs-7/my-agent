@@ -141,6 +141,34 @@ pub enum FetchError {
     UnsupportedContent { url: String, content_type: String },
 }
 
+/// Failures produced by [`crate::ports::command::CommandRunner`].
+///
+/// A command that runs and *fails* is not an error here - a non-zero exit is
+/// ordinary output the model needs to see. These are the cases where the
+/// command never produced a usable result at all.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CommandError {
+    /// The request was refused before anything ran (empty command, a cwd that
+    /// does not exist).
+    #[error("the command was not run: {reason}")]
+    Refused { reason: String },
+
+    /// The sandbox could not be established. Deliberately fatal: falling back
+    /// to an unconfined run would silently remove the protection the operator
+    /// asked for.
+    #[error("the sandbox could not be applied: {reason}")]
+    SandboxUnavailable { reason: String },
+
+    #[error("the command could not be started: {message}")]
+    SpawnFailed { message: String },
+
+    #[error("the command was killed after {seconds}s")]
+    TimedOut { seconds: u64 },
+
+    #[error("io error while running the command: {message}")]
+    Io { message: String },
+}
+
 /// Failures produced while running a tool.
 #[derive(Debug, Error, Clone)]
 pub enum ToolError {

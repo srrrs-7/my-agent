@@ -13,6 +13,7 @@ use agent_application::agent::{
     FixedPromptBuilder,
 };
 use agent_application::tools::ToolRegistry;
+use agent_application::tools::exec::RunCommandTool;
 use agent_application::tools::file::{
     EditFileTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
 };
@@ -24,7 +25,8 @@ use agent_domain::ports::events::EventSink;
 use agent_domain::ports::llm::LlmProvider;
 use agent_domain::ports::prompt::PromptBuilder;
 use agent_domain::ports::tool::Tool;
-use agent_infrastructure::config::{ApprovalPolicy, PromptSettings, Settings};
+use agent_infrastructure::config::{ApprovalPolicy, PromptSettings, Settings, ShellSettings};
+use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
 use agent_infrastructure::tools::TimeoutTool;
@@ -41,9 +43,15 @@ pub struct Application {
     pub tools: Arc<ToolRegistry>,
     pub provider: Arc<dyn LlmProvider>,
     pub agent: AgentLoop,
+    /// Kept alive for the life of the process: it owns the egress proxy's
+    /// port, and the commands it confines refer to that port by number.
+    /// `doctor` also reads its reported sandbox rather than the configuration.
+    pub commands: Option<Arc<SandboxedCommandRunner>>,
 }
 
-pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
+/// Async because the egress proxy binds a socket at startup - see
+/// [`SandboxedCommandRunner::start`].
+pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
     let settings = resolve_settings(cli)?;
 
     // --- workspace sandbox ---------------------------------------------------
@@ -95,6 +103,29 @@ pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         tools = Arc::new(registry);
     }
 
+    // run_command is opt-in for a stronger reason than web_fetch: a command's
+    // effect cannot be read off its arguments. Startup fails outright when the
+    // sandbox is weaker than asked for, rather than registering the tool with
+    // less protection than the operator believes it has.
+    let commands = if settings.shell.enabled {
+        let runner = build_command_runner(&settings.shell, workspace.clone()).await?;
+
+        let mut registry = (*tools).clone();
+        registry.register(TimeoutTool::wrap(
+            Arc::new(RunCommandTool::new(
+                runner.clone(),
+                &settings.shell.allowed_domains,
+            )),
+            // The command has its own timeout; this outer one only catches a
+            // runner that never returns at all.
+            settings.agent_loop.tool_timeout + std::time::Duration::from_secs(600),
+        ));
+        tools = Arc::new(registry);
+        Some(runner)
+    } else {
+        None
+    };
+
     // --- the loop ------------------------------------------------------------
     let prompt = build_prompt_builder(&settings.prompt)?;
     let agent = AgentLoop::new(
@@ -129,7 +160,38 @@ pub fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         tools,
         provider,
         agent,
+        commands,
     })
+}
+
+/// Builds the command runner, turning a sandbox shortfall into an error the
+/// operator can act on.
+///
+/// The hint matters more than it looks: the failure is nearly always "this
+/// kernel is older than 6.7" or "this is macOS, where the mechanism is not
+/// written yet", and an operator who only sees "sandbox unavailable" will
+/// reach for the off switch rather than for the fix.
+async fn build_command_runner(
+    shell: &ShellSettings,
+    workspace: Arc<WorkspaceRoot>,
+) -> Result<Arc<SandboxedCommandRunner>> {
+    let runner = SandboxedCommandRunner::start(
+        workspace,
+        ExecConfig {
+            sandbox: shell.sandbox,
+            extra_writable: shell.extra_writable.clone(),
+            allowed_domains: shell.allowed_domains.clone(),
+        },
+    )
+    .await
+    .with_context(|| {
+        "cannot run commands under the sandbox AGENT_SHELL_SANDBOX asks for. Either use a \
+         platform that supports it (Linux 6.7+ for Landlock), or set AGENT_SHELL=false to \
+         drop the tool. AGENT_SHELL_SANDBOX=none disables the sandbox itself and is only \
+         safe in a container you already treat as disposable."
+    })?;
+
+    Ok(Arc::new(runner))
 }
 
 /// The default toolset, every tool wrapped in a timeout so that one

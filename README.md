@@ -132,6 +132,7 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 | `write_file` | mutating | 全文書き込み（親ディレクトリ自動作成） |
 | `edit_file` | mutating | 完全一致の部分置換。一致 0 件／複数件はエラー |
 | `web_fetch` | network | URL の内容をテキスト取得（**既定で無効**。`AGENT_WEB_FETCH=true` で有効化） |
+| `run_command` | destructive | シェルコマンドをサンドボックス内で実行（**既定で無効**。`AGENT_SHELL=true` で有効化） |
 
 `edit_file` を曖昧一致にしないのは意図的です。モデルが `read_file` で見た文字列と
 一致しない限り編集は成立せず、意図しない箇所への適用が構造的に起こりません。
@@ -146,6 +147,15 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 - 安全分類は `network` で、既定の承認ポリシーでは**毎回確認**が入り、承認プロンプトに
   URL 全体が表示されます（`AGENT_APPROVAL=auto` では確認が入らない点に注意）
 - 取得内容は指示ではなくデータとしてツール結果でのみモデルに渡ります
+
+`run_command` も**既定で無効**です。安全分類を `destructive` にしているのは、
+コマンドが必ず破壊的だからではなく、**引数を読んでも破壊的かどうか判断できない**
+からです。`cargo test` と `rm -rf /` は同じ形をしています。したがって承認プロンプトには
+シェル行がそのまま表示され、人間がそれを読んで判断します。
+
+封じ込めはコマンド文字列の検査ではなく OS が行います（§5）。許可リスト方式の
+コマンド検査を採用しなかったのは、`make` のようなエントリが 1 つ入るだけで
+`make exec CMD="..."` により任意実行と等価になり、リストが安全性を保証しないためです。
 
 ### context
 
@@ -194,6 +204,45 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 
 いずれも `crates/domain/src/model/workspace.rs` と
 `crates/infrastructure/src/fs/local.rs` のテストで固定しています。
+
+### 子プロセスのサンドボックス
+
+上記 2 段はこのプロセス自身のファイル操作にしか効きません。`run_command` が起動する
+子プロセスは `WorkspacePath` の外にいるため、封じ込めは OS から来る必要があります。
+
+**外部依存ゼロ**を設計上の制約にしています。この bin は CLI として配布し、将来は SDK
+としても配布するため、「動かす前に `apt install` が要る」サンドボックスは
+「実際には無効なサンドボックス」と同義になるからです。
+
+| OS | 機構 | 状態 |
+|---|---|---|
+| Linux 6.7+ | Landlock（syscall。インストール不要、非特権で自己適用） | 実装済み |
+| macOS | Seatbelt（OS 同梱） | 未実装（`AGENT_SHELL=true` で起動失敗） |
+| Windows | — | 非対応。WSL2 で実行してください |
+
+Landlock 層で実際に強制されるもの（`crates/infrastructure/tests/sandbox.rs` が
+**本物の子プロセスを起動して**固定しています）:
+
+- 書き込みはワークスペース＋セッション専用一時ディレクトリ＋操作者が明示した
+  追加ルートのみ。共有 `/tmp` は読み取り専用
+- 読み取りは広く許可。ツールチェインは全域を読むため、実用に耐える読み取り許可リストは
+  結局「ほぼ全部」になります。資格情報は環境変数の除去と下記の egress 許可リストで守ります
+- `*_API_KEY` / `*_TOKEN` / `*_SECRET` 等の環境変数は子プロセスに渡しません
+- 外向き TCP は egress プロキシのポート以外すべて拒否。プロキシは
+  ドメイン許可リスト（`AGENT_SHELL_NETWORK_ALLOW`）で `CONNECT` と絶対形式リクエストを
+  検査します。許可リストが空なら**プロキシを起動せず、通信は一切できません**
+- タイムアウト時はプロセスグループごと SIGKILL（バックグラウンドの孫プロセスを残さない）
+
+**この層の限界も明記します。** Landlock のルールはカーネルが *union* する純粋な
+許可リストで、拒否も「より具体的なルールが勝つ」規則もありません。したがって
+書き込み可能なワークスペースの中の `.git` だけを読み取り専用にすることは**表現できません**
+（`landlock_cannot_protect_git_inside_the_writable_workspace` テストがこの制限自体を固定しています）。
+また Landlock のネットワークルールは**ポート単位**で宛先アドレスを持たないため、
+「プロキシのポート」に居る別サービスには到達し得ます。どちらも network namespace 層
+（`SandboxKind::NetnsProxied`）で塞ぐべきもので、別 issue として管理しています。
+
+`AGENT_SHELL_SANDBOX` が満たせない環境では**起動に失敗します**。黙って弱い設定に
+フォールバックしないのは、静かに劣化するサンドボックスが最も危険だからです。
 
 ---
 
@@ -319,6 +368,10 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_WEB_FETCH_ALLOW_PRIVATE` | `false` | プライベート帯拒否の解除（イントラネット用。通常は触らない） |
 | `AGENT_WEB_FETCH_MAX_BYTES` | `1048576` | 取得サイズ上限 |
 | `AGENT_WEB_FETCH_TIMEOUT_SECS` | `30` | 取得の上限時間 |
+| `AGENT_SHELL` | `false` | `run_command` ツールの有効化（§4・§5 参照） |
+| `AGENT_SHELL_SANDBOX` | `confined` | 必須とする封じ込め。`confined` \| `isolated` \| `none`。満たせない環境では**起動失敗**（黙って弱くならない） |
+| `AGENT_SHELL_NETWORK_ALLOW` | —（**通信不可**） | コマンドが到達できるドメインのカンマ区切り。空なら egress プロキシを起動せず全拒否 |
+| `AGENT_SHELL_WRITABLE` | — | ワークスペース外で書き込みを許可するパスのカンマ区切り（外部のビルドキャッシュ用） |
 | `AGENT_PARALLEL_READ_TOOLS` | `true` | 読み取り系ツールの並列実行 |
 
 ### 生成とログ

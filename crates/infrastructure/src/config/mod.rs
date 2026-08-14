@@ -22,6 +22,8 @@ use std::time::Duration;
 use agent_domain::model::llm::{ModelId, ProviderId};
 use thiserror::Error;
 
+use crate::exec::SandboxRequirement;
+
 pub use env::{EnvSource, MapEnv, SystemEnv};
 pub use kinds::{ApprovalPolicy, ProviderKind, RouterKind};
 
@@ -151,6 +153,30 @@ impl Default for WebFetchSettings {
     }
 }
 
+/// The `run_command` tool.
+///
+/// Off by default, and for a stronger reason than `web_fetch`: a command is
+/// the one capability whose effect cannot be read off its arguments. Enabling
+/// it is a decision about how much of the machine the model may touch.
+///
+/// `sandbox` is a requirement, not a preference. If the platform cannot meet
+/// it, startup fails rather than quietly running commands with less
+/// confinement than the operator asked for - the failure mode that would make
+/// the setting worthless.
+#[derive(Debug, Clone, Default)]
+pub struct ShellSettings {
+    /// Off unless the operator says otherwise.
+    pub enabled: bool,
+    /// The confinement the operator will not run without.
+    pub sandbox: SandboxRequirement,
+    /// Domain suffixes commands may reach through the egress proxy. Empty
+    /// means no network at all, which is the default.
+    pub allowed_domains: Vec<String>,
+    /// Writable roots outside the workspace - build caches such as a
+    /// `CARGO_TARGET_DIR` that points elsewhere.
+    pub extra_writable: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub workspace: PathBuf,
@@ -159,6 +185,7 @@ pub struct Settings {
     pub agent_loop: LoopSettings,
     pub prompt: PromptSettings,
     pub web_fetch: WebFetchSettings,
+    pub shell: ShellSettings,
     /// Largest file the read tool will load.
     pub max_file_bytes: u64,
 }
@@ -190,19 +217,20 @@ impl Settings {
             },
             web_fetch: WebFetchSettings {
                 enabled: reader.parsed("AGENT_WEB_FETCH", false)?,
-                allowed_domains: reader
-                    .string("AGENT_WEB_FETCH_ALLOW")
-                    .map(|raw| {
-                        raw.split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                allowed_domains: reader.list("AGENT_WEB_FETCH_ALLOW"),
                 allow_private: reader.parsed("AGENT_WEB_FETCH_ALLOW_PRIVATE", false)?,
                 max_bytes: reader.parsed("AGENT_WEB_FETCH_MAX_BYTES", 1024 * 1024)?,
                 timeout: Duration::from_secs(reader.parsed("AGENT_WEB_FETCH_TIMEOUT_SECS", 30)?),
+            },
+            shell: ShellSettings {
+                enabled: reader.parsed("AGENT_SHELL", false)?,
+                sandbox: reader.parsed("AGENT_SHELL_SANDBOX", SandboxRequirement::default())?,
+                allowed_domains: reader.list("AGENT_SHELL_NETWORK_ALLOW"),
+                extra_writable: reader
+                    .list("AGENT_SHELL_WRITABLE")
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
             },
             max_file_bytes: reader.parsed("AGENT_MAX_FILE_BYTES", 2 * 1024 * 1024)?,
         })
@@ -322,6 +350,19 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         },
     );
     description.insert(
+        "run_command".into(),
+        if !settings.shell.enabled {
+            "disabled".to_string()
+        } else {
+            let egress = if settings.shell.allowed_domains.is_empty() {
+                "no network".to_string()
+            } else {
+                format!("allowlist: {}", settings.shell.allowed_domains.join(", "))
+            };
+            format!("enabled (sandbox: {}; {egress})", settings.shell.sandbox)
+        },
+    );
+    description.insert(
         "system prompt".into(),
         match (&settings.prompt.replace_file, &settings.prompt.append) {
             (None, None) => "built-in".to_string(),
@@ -367,6 +408,55 @@ mod tests {
             env.set("AGENT_WORKSPACE", "/workspace");
         }
         Settings::from_source(&env)
+    }
+
+    #[test]
+    fn the_shell_tool_is_off_and_networkless_by_default() {
+        // Both halves matter: forgetting either one is the difference between
+        // "no shell" and "a shell that can reach the internet".
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+
+        assert!(!settings.shell.enabled);
+        assert!(settings.shell.allowed_domains.is_empty());
+        assert_eq!(settings.shell.sandbox, SandboxRequirement::Confined);
+    }
+
+    #[test]
+    fn the_shell_allowlist_and_writable_roots_are_comma_separated() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SHELL", "true"),
+            (
+                "AGENT_SHELL_NETWORK_ALLOW",
+                "crates.io, static.crates.io , ",
+            ),
+            ("AGENT_SHELL_WRITABLE", "/cache,/workspace/target"),
+        ])
+        .unwrap();
+
+        assert!(settings.shell.enabled);
+        assert_eq!(
+            settings.shell.allowed_domains,
+            vec!["crates.io".to_string(), "static.crates.io".to_string()],
+            "blank entries must be dropped rather than becoming an empty allowlist entry"
+        );
+        assert_eq!(settings.shell.extra_writable.len(), 2);
+    }
+
+    #[test]
+    fn turning_the_sandbox_off_has_to_be_spelled_out() {
+        assert_eq!(
+            settings(&[("AGENT_MODEL", "m"), ("AGENT_SHELL_SANDBOX", "none")])
+                .unwrap()
+                .shell
+                .sandbox,
+            SandboxRequirement::Disabled
+        );
+
+        // A typo must not read as "off". Anything unrecognised is an error.
+        let error = settings(&[("AGENT_MODEL", "m"), ("AGENT_SHELL_SANDBOX", "nome")])
+            .expect_err("an unknown sandbox setting must abort startup");
+        assert!(error.to_string().contains("AGENT_SHELL_SANDBOX"), "{error}");
     }
 
     #[test]

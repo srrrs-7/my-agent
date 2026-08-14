@@ -88,6 +88,20 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Comma-separated list, empty entries dropped. Absent and empty both read
+    /// as "no entries", which every caller treats as the closed default.
+    pub(super) fn list(&self, key: &str) -> Vec<String> {
+        self.string(key)
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn optional<T>(&self, key: &str) -> Result<Option<T>, ConfigError>
     where
         T: FromStr,

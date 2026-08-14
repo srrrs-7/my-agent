@@ -8,8 +8,10 @@
 //! points inwards only, which is what lets the use cases be tested with fakes.
 
 pub mod config;
+pub mod exec;
 pub mod fs;
 pub mod llm;
+pub(crate) mod net;
 pub mod telemetry;
 pub mod tools;
 pub mod web;

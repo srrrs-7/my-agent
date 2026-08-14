@@ -55,6 +55,7 @@
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`, `AppendingPromptBuilder` | システムプロンプトの組み立て方針（既定・差し替え・追記） |
 | `ApprovalGate` | `CliApprovalGate` | human-in-the-loop |
 | `WebFetcher` | `GuardedWebFetcher` | 外向き HTTP（SSRF ガード・許可リスト・サイズ上限） |
+| `CommandRunner` | `SandboxedCommandRunner` | 子プロセス実行（OS レベルの封じ込め・egress 許可リスト） |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` | 進捗の可観測性 |
 
 すべて `dyn` 互換なので、合成ルートで実装を差し替えられます。
@@ -81,6 +82,31 @@ OpenAI 形式（`tool_calls` + `role:"tool"`）への写像は情報を落とし
 ただし字句的な検査だけではシンボリックリンクを防げないため、
 `LocalFileSystem` が canonicalize 後にもう一度ルート配下かを検査します
 （ファイルシステムに触れられるのはインフラ層だけなので、この分担になります）。
+
+### 3.2.1 子プロセスの封じ込めは OS から借りる
+
+`WorkspacePath` の型レベル制約は**このプロセスの**ファイル操作にしか効きません。
+`run_command` が起動する子プロセスはその外側にいるため、封じ込めは
+オペレーティングシステムから来る必要があります。ポート
+`CommandRunner::sandbox()` が返すのは*設定値ではなく実際に効いている封じ込め*で、
+両者は食い違い得るからこそ、この区別を型で持たせています。
+
+**外部依存ゼロ**を制約に選びました。この bin は CLI として、将来は SDK としても
+配布するため、「動かす前に `apt install bubblewrap` が要る」サンドボックスは
+実運用では無効になるのと同じです。Linux の Landlock は syscall、macOS の Seatbelt は
+OS 同梱、egress プロキシはプロセス内 — いずれもインストール不要で成立します。
+
+満たせない場合は**起動失敗**にしています。黙って弱い設定に落ちるサンドボックスは、
+操作者が守られていると誤認する分、無いより危険だからです。
+
+`SandboxKind` に全順序を入れていないのも同じ理由です。Seatbelt と Landlock は
+プラットフォームごとの対等な機構であって強弱ではなく、順序を付けると
+「Landlock 以上」という要求が macOS で起動失敗を引き起こします。要求は機構名ではなく
+性質（`confined` / `isolated`）で表現します。
+
+ドメイン許可リストにプロキシが必要なのは設計の好みではありません。Landlock の
+ネットワークルールはポート単位で、カーネルの `landlock_net_port_attr` に宛先ホストの
+フィールドが存在しません。宛先名を運べる唯一の手段が HTTP プロキシです。
 
 ### 3.3 ツール失敗は実行失敗ではない
 

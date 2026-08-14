@@ -5,7 +5,6 @@
 //! blocking), [`html`] the text reduction.
 
 mod fetcher;
-mod guard;
 mod html;
 
 pub use fetcher::{GuardedWebFetcher, WebFetchConfig};

@@ -33,13 +33,14 @@
 |---|---|
 | `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider` |
 | `LlmRouter` | `StaticRouter`, `ModelPrefixRouter` |
-| `Tool` | `application/src/tools/file/*`（実装）, `TimeoutTool`（装飾） |
+| `Tool` | `application/src/tools/{file,web,exec}/*`（実装）, `TimeoutTool`（装飾） |
 | `FileSystem` | `LocalFileSystem` |
 | `FileSearcher` | `IgnoreAwareSearcher` |
 | `ContextProvider` | `WorkspaceContextProvider` |
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`（差し替え）, `AppendingPromptBuilder`（追記・装飾） |
 | `ApprovalGate` | `CliApprovalGate` |
 | `WebFetcher` | `GuardedWebFetcher`（SSRF ガード付き・既定無効） |
+| `CommandRunner` | `SandboxedCommandRunner`（Linux: Landlock + egress プロキシ・既定無効） |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` |
 
 `LlmProvider` が合成パターンになっている点が重要です。ルータもリトライもそれ自体が `LlmProvider` なので、

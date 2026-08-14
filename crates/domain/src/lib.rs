@@ -20,7 +20,9 @@ pub mod model;
 pub mod ports;
 pub mod text;
 
-pub use error::{ApprovalError, DomainError, FetchError, FsError, LlmError, ToolError};
+pub use error::{
+    ApprovalError, CommandError, DomainError, FetchError, FsError, LlmError, ToolError,
+};
 pub use model::{
     context::ContextSnapshot,
     conversation::Conversation,
@@ -34,6 +36,7 @@ pub use model::{
 };
 pub use ports::{
     approval::{ApprovalDecision, ApprovalGate, ApprovalRequest},
+    command::{CommandOutput, CommandRequest, CommandRunner, SandboxKind},
     context::ContextProvider,
     events::{AgentEvent, EventSink, FinishReason, NullEventSink},
     file_system::{DirEntry, EntryKind, FileSystem},

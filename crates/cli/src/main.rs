@@ -47,7 +47,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
     // Without a TTY there is nobody to answer an approval prompt, so the gate
     // has to deny rather than block forever.
     let interactive = std::io::stdin().is_terminal();
-    let app = composition::build(&cli, interactive)?;
+    let app = composition::build(&cli, interactive).await?;
 
     Ok(match cli.resolve_command() {
         Command::Run { prompt } => commands::run::execute(&app, prompt.join(" ")).await?,

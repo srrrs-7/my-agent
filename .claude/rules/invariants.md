@@ -40,6 +40,20 @@ make exec CMD="grep -rn 'tokio\|agent_infrastructure' crates/application/src/ | 
 `guard()` には既知の落とし穴があります: 既存パスに空の tail を `join` すると末尾スラッシュが付き、
 通常ファイルへの全 syscall が ENOTDIR になります。早期 return で回避済みなので消さないでください。
 
+**この不変条件は子プロセスには効きません。** `run_command` が起動したプロセスは
+`WorkspacePath` の外側にいるため、封じ込めは OS が行います（`infrastructure/src/exec/`）。
+ここを触るときの契約:
+
+- **黙って弱くならない** — 要求された封じ込めが得られない場合は
+  `CommandError::SandboxUnavailable` で起動を失敗させる。フォールバックを足さないでください
+- **`CommandRunner::sandbox()` は実際に効いているものを返す** — 設定値を返さない。
+  `agent doctor` とツール説明はこちらを表示します
+- **外部バイナリに依存しない** — CLI/SDK として配布するため、`apt install` が要る機構は
+  実質的に無効なサンドボックスと同じです
+- **サンドボックスの主張はテストで実証する** — ルールが「構築できる」ことではなく、
+  実際の子プロセスが**できなかった**ことを `crates/infrastructure/tests/sandbox.rs` で固定する。
+  制限を回避できない場合は、制限そのものを assert して残す
+
 ## 3. ツール失敗は実行失敗ではない
 
 未知のツール、引数不正、承認拒否、タイムアウト — すべて `is_error: true` の `tool_result` として

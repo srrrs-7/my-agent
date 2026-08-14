@@ -15,8 +15,8 @@ use futures::StreamExt as _;
 use tracing::debug;
 use url::Url;
 
-use super::guard;
 use super::html::html_to_text;
+use crate::net::guard::{DomainScope, HostPolicy, Rejection, RejectionKind};
 
 /// How many redirect hops are followed before giving up. Fixed: a legitimate
 /// documentation URL does not need more, and every hop is re-validated.
@@ -37,7 +37,22 @@ pub struct WebFetchConfig {
 
 pub struct GuardedWebFetcher {
     client: reqwest::Client,
+    policy: HostPolicy,
     config: WebFetchConfig,
+}
+
+/// Attaches the URL that a shared-guard rejection was about.
+fn rejected(url: &str, rejection: Rejection) -> FetchError {
+    match rejection.kind {
+        RejectionKind::Malformed => FetchError::InvalidUrl {
+            url: url.to_string(),
+            reason: rejection.reason,
+        },
+        RejectionKind::Blocked => FetchError::Blocked {
+            url: url.to_string(),
+            reason: rejection.reason,
+        },
+    }
 }
 
 impl GuardedWebFetcher {
@@ -52,33 +67,35 @@ impl GuardedWebFetcher {
                 url: String::new(),
                 message: format!("cannot build the HTTP client: {error}"),
             })?;
-        Ok(Self { client, config })
+
+        let policy = HostPolicy {
+            allow_private: config.allow_private,
+            // An unset allowlist opens onto the public internet here; the
+            // command sandbox makes the opposite choice with the same type.
+            scope: if config.allowed_domains.is_empty() {
+                DomainScope::AnyPublic
+            } else {
+                DomainScope::Only(config.allowed_domains.clone())
+            },
+        };
+
+        Ok(Self {
+            client,
+            policy,
+            config,
+        })
     }
 
     /// Full admission check for one URL (original or redirect target).
     async fn admit(&self, raw: &str) -> Result<Url, FetchError> {
-        let url = guard::check_url(raw, self.config.allow_private)?;
-
-        if !self.config.allowed_domains.is_empty() {
-            let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-            let admitted = self.config.allowed_domains.iter().any(|entry| {
-                let entry = entry.trim_start_matches('.').to_ascii_lowercase();
-                host == entry || host.ends_with(&format!(".{entry}"))
-            });
-            if !admitted {
-                return Err(FetchError::Blocked {
-                    url: raw.to_string(),
-                    reason: format!(
-                        "host `{host}` is not on the allowlist ({})",
-                        self.config.allowed_domains.join(", ")
-                    ),
-                });
-            }
-        }
+        let url = self
+            .policy
+            .check_url(raw)
+            .map_err(|rejection| rejected(raw, rejection))?;
 
         // Resolve and vet every address behind a hostname. IP literals were
         // already vetted lexically.
-        if !self.config.allow_private {
+        if self.policy.resolves_before_connect() {
             if let Some(url::Host::Domain(name)) = url.host() {
                 let port = url.port_or_known_default().unwrap_or(443);
                 let addrs: Vec<IpAddr> = tokio::net::lookup_host((name, port))
@@ -89,7 +106,9 @@ impl GuardedWebFetcher {
                     })?
                     .map(|socket| socket.ip())
                     .collect();
-                guard::check_resolved_addrs(raw, addrs)?;
+                self.policy
+                    .check_addrs(addrs)
+                    .map_err(|rejection| rejected(raw, rejection))?;
             }
         }
 

@@ -5,6 +5,7 @@
 //! which usually means "short, unambiguous, and explicit about what to do
 //! next when something went wrong".
 
+pub mod exec;
 pub mod file;
 pub mod registry;
 pub mod util;
