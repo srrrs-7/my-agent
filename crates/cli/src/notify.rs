@@ -77,8 +77,10 @@ impl NotifyPolicy {
 /// The notification for a confirmation prompt.
 ///
 /// `request.summary` is left out on purpose: it quotes the model's arguments
-/// (up to several kilobytes of file contents, a shell command, a URL), and
-/// none of that should reach a chat channel unread.
+/// (up to several kilobytes of file contents, a shell command, a URL), and a
+/// page that only says "come back to the terminal" has no use for them. When
+/// the prompt can be answered from the phone, this is not sent at all - the
+/// remote approver sends its own, with [`remote_detail`] in it.
 pub fn approval_pending(session_id: &str, request: &ApprovalRequest) -> Notification {
     Notification {
         session_id: session_id.to_string(),
@@ -180,6 +182,29 @@ fn excerpt(text: &str, max_chars: usize) -> Option<String> {
     Some(head)
 }
 
+/// Longest call description sent with a prompt that can be answered from
+/// the phone. Enough for a command line or the head of an edit; a whole file
+/// written by `write_file` is cut, and the terminal still shows all of it.
+pub const MAX_REMOTE_DETAIL_CHARS: usize = 600;
+
+/// What a remotely answerable prompt says about the call.
+///
+/// The one place the model's arguments leave the machine, and only because
+/// someone asked to approve from the phone: approving there without seeing
+/// what is approved would be worse. So the order matters - known secrets are
+/// hidden first and the text is cut after, for the same reason as with
+/// [`turn_outcome`]: cutting first could leave the opening of a key, which
+/// no longer matches it as a whole. Control characters go too, as they do
+/// on the terminal.
+pub fn remote_detail(summary: &str, redactor: &Redactor) -> String {
+    let hidden = redactor.redact(summary);
+    excerpt(
+        &agent_domain::text::printable(&hidden),
+        MAX_REMOTE_DETAIL_CHARS,
+    )
+    .unwrap_or_default()
+}
+
 /// The shared sender. One instance per process, handed to the approval gate
 /// and to whichever subcommand runs.
 pub struct Notifications {
@@ -232,6 +257,17 @@ impl Notifications {
     pub fn begin_turn(&self, session_id: &str) {
         *lock(&self.session_id) = session_id.to_string();
         self.engaged();
+    }
+
+    /// The session the current turn belongs to.
+    pub fn session_id(&self) -> String {
+        lock(&self.session_id).clone()
+    }
+
+    /// The redactor excerpts go through, for anything else that leaves the
+    /// machine with the model's words in it.
+    pub fn redactor(&self) -> &Arc<Redactor> {
+        &self.redactor
     }
 
     /// A human just answered something. The clock for "was this turn long?"
@@ -519,6 +555,39 @@ pub(crate) mod tests {
                 "no part of the key may leave with a {limit}-char excerpt: {shown}"
             );
         }
+    }
+
+    #[test]
+    fn a_remote_detail_hides_secrets_before_it_is_cut() {
+        const KEY: &str = "sk-ant-0123456789abcdef";
+        let redactor = Redactor::new([KEY.to_string()]);
+        // The key starts a few characters before the limit: cut first, and
+        // its opening would survive with no whole key left to match.
+        let padding = "x".repeat(MAX_REMOTE_DETAIL_CHARS - 6);
+        let summary = format!("write_file(content=\"{padding}{KEY}\")");
+
+        let detail = remote_detail(&summary, &redactor);
+
+        assert!(!detail.contains("sk-ant"), "{detail}");
+        assert!(detail.ends_with('…'), "the detail was cut: {detail}");
+        assert!(
+            detail.chars().count() <= MAX_REMOTE_DETAIL_CHARS + 1,
+            "{} chars",
+            detail.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_remote_detail_has_no_control_characters() {
+        let detail = remote_detail(
+            "run_command(command=\"rm -rf /\r\x1b[2Kls\u{202E}\")",
+            &Redactor::default(),
+        );
+        assert!(
+            !detail.chars().any(agent_domain::text::is_unprintable),
+            "{detail:?}"
+        );
+        assert!(detail.contains("rm -rf /"), "{detail}");
     }
 
     #[tokio::test]

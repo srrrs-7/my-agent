@@ -2,7 +2,9 @@
 //!
 //! [`WebhookNotifier`] implements the [`agent_domain::ports::notify::Notifier`]
 //! port for three wire formats: ntfy's JSON publish, a Slack incoming webhook,
-//! and a plain JSON body for anything else.
+//! and a plain JSON body for anything else. [`NtfyRemoteApprover`] adds the
+//! way back for ntfy only: approve/deny buttons whose replies are read through
+//! an outbound subscription.
 //!
 //! Two decisions that are easy to undo by accident:
 //!
@@ -15,6 +17,7 @@
 //!   self-hosted ntfy on the LAN or on localhost is the common case the guard
 //!   would refuse.
 
+mod ntfy_approval;
 mod webhook;
 
 use std::fmt;
@@ -23,6 +26,7 @@ use std::time::Duration;
 
 use url::Url;
 
+pub use ntfy_approval::{NtfyRemoteApprover, RemoteApprovalSetupError};
 pub use webhook::WebhookNotifier;
 
 /// Longest a single delivery may take before it is abandoned. Short, because
@@ -171,13 +175,9 @@ pub(crate) fn endpoint(url: &WebhookUrl, format: NotifyFormat) -> Result<Endpoin
     let topic = segments.pop().ok_or_else(|| {
         "ntfy needs the topic as the last path segment, e.g. https://ntfy.sh/<topic>".to_string()
     })?;
-    // ntfy's own rule. Checked here so a typo fails at startup rather than as
-    // a 400 on the first notification, which nobody would be watching for.
-    if topic.len() > 64
-        || !topic
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    // Checked here so a typo fails at startup rather than as a 400 on the
+    // first notification, which nobody would be watching for.
+    if !is_valid_topic(topic) {
         return Err(
             "the ntfy topic (the last path segment) may only contain [A-Za-z0-9_-], \
              up to 64 characters"
@@ -199,9 +199,67 @@ pub(crate) fn endpoint(url: &WebhookUrl, format: NotifyFormat) -> Result<Endpoin
     })
 }
 
+/// ntfy's own rule for topic names.
+pub(crate) fn is_valid_topic(topic: &str) -> bool {
+    !topic.is_empty()
+        && topic.len() <= 64
+        && topic
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// An ntfy access token (`tk_...`), sent as a bearer token.
+///
+/// No `Display` and a `Debug` that prints nothing of it, for the same reason
+/// as [`WebhookUrl`]: settings are printed by `doctor` and end up in logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NtfyToken(String);
+
+impl NtfyToken {
+    /// Accepts any non-empty value without whitespace. ntfy's own tokens are
+    /// `tk_` plus 29 characters, but a proxy in front of a self-hosted server
+    /// may hand out its own, so the shape is not checked further.
+    pub fn parse(raw: &str) -> Result<Self, &'static str> {
+        if raw.is_empty() || raw.chars().any(char::is_whitespace) {
+            return Err("expected an ntfy access token such as tk_..., without spaces");
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    pub(crate) fn bearer(&self) -> String {
+        format!("Bearer {}", self.0)
+    }
+
+    pub(crate) fn secret(&self) -> String {
+        self.0.clone()
+    }
+}
+
+impl fmt::Debug for NtfyToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NtfyToken(…)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_shows_nothing_of_itself_in_debug() {
+        let token = NtfyToken::parse("tk_AgQdq7mVBoFD37zQVN29RhuMzNIz2").unwrap();
+        assert!(!format!("{token:?}").contains("tk_"), "{token:?}");
+        assert!(NtfyToken::parse("tk_a b").is_err());
+        assert!(NtfyToken::parse("").is_err());
+    }
+
+    #[test]
+    fn topic_names_follow_ntfys_rule() {
+        assert!(is_valid_topic("agent-replies_1"));
+        assert!(!is_valid_topic(""));
+        assert!(!is_valid_topic("a.b"));
+        assert!(!is_valid_topic(&"a".repeat(65)));
+    }
 
     fn url(raw: &str) -> WebhookUrl {
         WebhookUrl::parse(raw).unwrap()

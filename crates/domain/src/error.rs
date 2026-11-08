@@ -328,3 +328,28 @@ pub enum NotifyError {
     #[error("the notification endpoint answered with HTTP {status}")]
     HttpStatus { status: u16 },
 }
+
+/// Failures produced by [`crate::ports::remote_approval::RemoteApprover`]
+/// implementations.
+///
+/// Every one of them means the same thing to the caller: the remote channel
+/// will not answer this prompt, and the terminal is still waiting. None is a
+/// denial. Like [`NotifyError`], none carries the destination - the topic is
+/// a credential.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum RemoteApprovalError {
+    #[error("the remote approval server could not be reached: {message}")]
+    Transport { message: String },
+
+    #[error("the remote approval server answered with HTTP {status}")]
+    HttpStatus { status: u16 },
+
+    #[error("the subscription to remote replies ended")]
+    Closed,
+
+    #[error("the remote approval expired after {seconds}s; its token no longer works")]
+    Expired { seconds: u64 },
+
+    #[error("cannot create a one-time approval token: {message}")]
+    Token { message: String },
+}

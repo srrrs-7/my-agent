@@ -30,6 +30,7 @@ use agent_domain::ports::events::EventSink;
 use agent_domain::ports::llm::LlmProvider;
 use agent_domain::ports::notify::{Notifier, NullNotifier};
 use agent_domain::ports::prompt::PromptBuilder;
+use agent_domain::ports::remote_approval::{NullRemoteApprover, RemoteApprover};
 use agent_domain::ports::session_store::SessionStore;
 use agent_domain::ports::tool::Tool;
 use agent_domain::ports::tool_server::ToolServer;
@@ -40,7 +41,7 @@ use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
 use agent_infrastructure::mcp::{McpConfig, McpServer, start_servers};
-use agent_infrastructure::notify::WebhookNotifier;
+use agent_infrastructure::notify::{NtfyRemoteApprover, WebhookNotifier};
 use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
 use agent_infrastructure::tools::{DependencyWatchTool, RedactingTool, Redactor, TimeoutTool};
 use agent_infrastructure::web::{GuardedWebFetcher, WebFetchConfig};
@@ -70,6 +71,10 @@ pub struct Application {
     /// The same instance the approval gate holds: the gate restarts the turn
     /// clock when a prompt is answered, and the subcommands read it.
     pub notifications: Arc<Notifications>,
+    /// What the approval gate races against the terminal. Active only when
+    /// remote approval is configured, the session is interactive, and the
+    /// server passed the startup checks - `doctor` reports which.
+    pub remote_approval: Arc<dyn RemoteApprover>,
     /// The MCP servers, running for the life of the process. Their tools hold
     /// them too; dropping the last handle stops the server and its group.
     pub tool_servers: Vec<Arc<McpServer>>,
@@ -213,9 +218,11 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
             .with_redactor(redactor.clone()),
     );
 
+    let remote_approval = remote_approver(&settings.notify, interactive).await?;
     let approval: Arc<dyn ApprovalGate> = Arc::new(
         CliApprovalGate::new(settings.approval, interactive, notifications.clone())
-            .with_dependency_changes_allowed(settings.allow_dependency_changes),
+            .with_dependency_changes_allowed(settings.allow_dependency_changes)
+            .with_remote(remote_approval.clone()),
     );
 
     let checkpoints = Arc::new(CheckpointJournal::new(file_system.clone()));
@@ -344,6 +351,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         sessions,
         commands,
         notifications,
+        remote_approval,
         tool_servers,
         redactor,
         checkpoints,
@@ -491,8 +499,47 @@ fn webhook(settings: &NotifySettings) -> Result<Option<WebhookNotifier>> {
         settings.format,
         agent_infrastructure::notify::DEFAULT_TIMEOUT,
     )
-    .context("cannot set up webhook notifications")?;
+    .context("cannot set up webhook notifications")?
+    .with_token(settings.ntfy_token.clone());
     Ok(Some(webhook))
+}
+
+/// Remote approval, when it is configured and could ever be used.
+///
+/// A session that is not interactive denies every prompt without asking
+/// (`agent run` without a terminal, `eval`), so there is nothing to answer
+/// from the phone and nothing is checked or sent.
+///
+/// Otherwise the server must pass the startup checks or the agent does not
+/// start: a reply topic the operator set, quietly dropped because the server
+/// let strangers read the buttons, would be a second way to approve that is
+/// weaker than the operator believes.
+async fn remote_approver(
+    settings: &NotifySettings,
+    interactive: bool,
+) -> Result<Arc<dyn RemoteApprover>> {
+    if !interactive || settings.remote_approval.is_none() {
+        return Ok(Arc::new(NullRemoteApprover));
+    }
+    let approver = NtfyRemoteApprover::connect(settings).await.context(
+        "cannot start remote approval (AGENT_NOTIFY_NTFY_REPLY_TOPIC). Unset it to answer \
+         prompts at the terminal only",
+    )?;
+    let Some(approver) = approver else {
+        return Ok(Arc::new(NullRemoteApprover));
+    };
+
+    let shares_token = settings.remote_approval.as_ref().is_some_and(|remote| {
+        remote.reply_token.is_none() || remote.reply_token == settings.ntfy_token
+    });
+    if shares_token {
+        warn!(
+            "the approve/deny buttons carry AGENT_NOTIFY_NTFY_TOKEN, so anyone who reads a \
+             notification gets everything that token can do. Set AGENT_NOTIFY_NTFY_REPLY_TOKEN \
+             to a token that can only write to the reply topic"
+        );
+    }
+    Ok(Arc::new(approver))
 }
 
 /// The default toolset, every tool wrapped in a timeout so that one

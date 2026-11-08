@@ -50,6 +50,12 @@ fn print_configuration(app: &Application) {
     );
     print_sandbox(app);
     print_tool_servers(app);
+    if app.remote_approval.is_active() {
+        println!(
+            "  {:<20} on: the ntfy server refused anonymous access to both topics at startup",
+            "remote check"
+        );
+    }
 }
 
 /// Each running MCP server with the confinement it actually got.

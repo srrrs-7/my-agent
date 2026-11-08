@@ -454,3 +454,184 @@ async fn read_head_and_body(socket: &mut tokio::net::TcpStream) -> Option<(Strin
         String::from_utf8_lossy(&buffer[header_end..end]).to_string(),
     ))
 }
+
+/// What [`StreamingServer`] does with one request.
+#[derive(Debug, Clone)]
+pub enum Reply {
+    /// Answer and close, like [`RecordingServer`].
+    Respond(Response),
+    /// Answer `200 OK` with a body that never ends on its own: every line
+    /// later given to [`StreamingServer::push_line`] is written to it, until
+    /// the client hangs up. A long-poll subscription, as ntfy serves one.
+    Stream,
+}
+
+/// What [`StreamingServer`] has seen so far.
+#[derive(Debug, Clone, Default)]
+pub struct ServerSnapshot {
+    /// Every request, oldest first.
+    pub requests: Vec<RecordedRequest>,
+    /// Streams currently held open.
+    pub open_streams: usize,
+    /// Streams the client hung up on.
+    pub closed_streams: usize,
+}
+
+type Route = Arc<dyn Fn(&RecordedRequest) -> Reply + Send + Sync>;
+
+/// A server that decides per request whether to answer or to hold a stream
+/// open, and can write to its open streams later.
+///
+/// What a subscription needs that [`RecordingServer`] cannot give: a reply
+/// written *after* the client did something else (published a message), and
+/// a way to see that the client hung up. Waiting is done with
+/// [`Self::wait_until`], which wakes on every change, so a test needs no
+/// sleep to see a request arrive or a stream close.
+pub struct StreamingServer {
+    url: String,
+    state: Arc<Mutex<ServerSnapshot>>,
+    changes: tokio::sync::watch::Sender<u64>,
+    lines: tokio::sync::broadcast::Sender<String>,
+    handle: JoinHandle<()>,
+}
+
+impl StreamingServer {
+    pub async fn start(route: impl Fn(&RecordedRequest) -> Reply + Send + Sync + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let address = listener.local_addr().expect("local address");
+        let state = Arc::new(Mutex::new(ServerSnapshot::default()));
+        let (changes, _) = tokio::sync::watch::channel(0_u64);
+        let (lines, _) = tokio::sync::broadcast::channel(64);
+        let route: Route = Arc::new(route);
+
+        let handle = {
+            let state = state.clone();
+            let changes = changes.clone();
+            let lines = lines.clone();
+            tokio::spawn(async move {
+                // Owned by the accept loop, so aborting it ends every
+                // connection too.
+                let mut connections = tokio::task::JoinSet::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    connections.spawn(serve(
+                        socket,
+                        route.clone(),
+                        state.clone(),
+                        changes.clone(),
+                        lines.clone(),
+                    ));
+                }
+            })
+        };
+
+        Self {
+            url: format!("http://{address}"),
+            state,
+            changes,
+            lines,
+            handle,
+        }
+    }
+
+    /// `http://127.0.0.1:<port>`, without a trailing slash.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn snapshot(&self) -> ServerSnapshot {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Writes `line` and a newline to every stream open right now.
+    pub fn push_line(&self, line: &str) {
+        let _ = self.lines.send(line.to_string());
+    }
+
+    /// Waits until `condition` holds, and returns the snapshot it held for.
+    pub async fn wait_until(
+        &self,
+        mut condition: impl FnMut(&ServerSnapshot) -> bool,
+    ) -> ServerSnapshot {
+        let mut changes = self.changes.subscribe();
+        loop {
+            changes.borrow_and_update();
+            let snapshot = self.snapshot();
+            if condition(&snapshot) {
+                return snapshot;
+            }
+            changes
+                .changed()
+                .await
+                .expect("the streaming server stopped");
+        }
+    }
+}
+
+impl Drop for StreamingServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn serve(
+    mut socket: tokio::net::TcpStream,
+    route: Route,
+    state: Arc<Mutex<ServerSnapshot>>,
+    changes: tokio::sync::watch::Sender<u64>,
+    lines: tokio::sync::broadcast::Sender<String>,
+) {
+    let update = |change: &dyn Fn(&mut ServerSnapshot)| {
+        change(&mut state.lock().unwrap_or_else(PoisonError::into_inner));
+        changes.send_modify(|version| *version += 1);
+    };
+
+    let Some(request) = read_request(&mut socket).await else {
+        return;
+    };
+    let reply = route(&request);
+    // Subscribed before the stream is announced as open, so a line pushed by
+    // a test that saw it open is not missed.
+    let mut receiver = lines.subscribe();
+
+    match reply {
+        Reply::Respond(response) => {
+            // Recorded before answering, as in `RecordingServer`: a client
+            // that saw the reply finds its request in the record.
+            update(&|snapshot| snapshot.requests.push(request.clone()));
+            let _ = socket.write_all(response.render().as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+        Reply::Stream => {
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
+                        connection: close\r\n\r\n";
+            update(&|snapshot| {
+                snapshot.requests.push(request.clone());
+                snapshot.open_streams += 1;
+            });
+            let mut probe = [0_u8; 1024];
+            let mut open = socket.write_all(head.as_bytes()).await.is_ok();
+            while open {
+                tokio::select! {
+                    line = receiver.recv() => {
+                        open = match line {
+                            Ok(line) => socket.write_all(format!("{line}\n").as_bytes()).await.is_ok(),
+                            Err(_) => false,
+                        };
+                    }
+                    read = socket.read(&mut probe) => {
+                        open = !matches!(read, Ok(0) | Err(_));
+                    }
+                }
+            }
+            update(&|snapshot| {
+                snapshot.open_streams -= 1;
+                snapshot.closed_streams += 1;
+            });
+        }
+    }
+}
