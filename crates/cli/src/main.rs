@@ -1,22 +1,8 @@
-//! `agent` - a sandboxed, loop-driven coding agent.
+//! The `agent` binary: process setup over the `agent_cli` library.
 //!
-//! Layer map (dependencies point inwards only):
-//!
-//! ```text
-//!   agent-cli ............ this crate: argv, rendering, composition root
-//!     -> agent-application  the loop, the tools, prompt assembly
-//!     -> agent-infrastructure  HTTP clients, filesystem, config
-//!          -> agent-domain     entities, value objects, ports
-//! ```
-
-mod approval;
-mod args;
-mod commands;
-mod composition;
-mod ctrl_c;
-mod input;
-mod notify;
-mod render;
+//! Only what belongs to a process lives here - `.env`, logging, the runtime
+//! and its bounded shutdown, the exit code. Everything a test may want to
+//! build is in the library (see `lib.rs`).
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -25,7 +11,8 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 
-use crate::args::{Cli, Command};
+use agent_cli::args::{Cli, Command};
+use agent_cli::{commands, composition};
 
 /// How long exit waits for blocking work still running on the runtime.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -105,12 +92,4 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             ExitCode::SUCCESS
         }
     })
-}
-
-/// Fresh identifier for a conversation.
-///
-/// It names the session's log file, so it has to stay unique across runs and
-/// not merely within a process - which is what rules out a counter.
-pub(crate) fn session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
 }
