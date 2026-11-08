@@ -11,6 +11,12 @@
 //!   regardless of which ones ran concurrently.
 //! * **Only read-only calls run concurrently.** Two writes in one turn may well
 //!   touch the same file, so they run sequentially in the requested order.
+//! * **An interrupt does not unanswer anything.** When the turn is interrupted
+//!   the dispatcher stops starting calls, abandons the ones in flight, and
+//!   still returns one result per call: the real one for each call that
+//!   finished, and an error saying what happened for the rest. A call that was
+//!   never started and one that was cut off half-way get different texts,
+//!   because only the second can have left something behind.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,7 +28,23 @@ use agent_domain::ports::tool::Tool;
 use agent_domain::text;
 use futures::future::join_all;
 
+use super::interrupt::Interrupt;
 use crate::tools::registry::ToolRegistry;
+
+/// What the model is told about a call the interrupt reached before it
+/// started. Nothing ran, so there is nothing to check - only a decision the
+/// user has not made yet.
+const NOT_STARTED: &str = "Not executed: the user interrupted the turn before this call ran, so \
+     nothing was changed by it. Do not re-run it on your own - wait for the user's next message \
+     and follow it.";
+
+/// What the model is told about a call that was running when the interrupt
+/// arrived. Its effect is unknown, and the model is the one that has to find
+/// out before building on it.
+const CUT_OFF: &str = "Interrupted by the user while running: this call may have been partially \
+     applied. Check the current state (re-read the files it touched, inspect what the command \
+     changed) before relying on it or running it again, and wait for the user's next message \
+     before deciding whether to.";
 
 /// Longest rendering of a call shown to a human at approval time.
 const MAX_SUMMARY_BYTES: usize = 160;
@@ -79,13 +101,20 @@ impl ToolDispatcher {
         self.tools.definitions()
     }
 
-    /// Produces exactly one [`ToolResult`] per call, in call order.
-    pub async fn dispatch(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
+    /// Produces exactly one [`ToolResult`] per call, in call order - also when
+    /// `interrupt` fires part-way through.
+    pub async fn dispatch(&self, calls: &[ToolCall], interrupt: &Interrupt) -> Vec<ToolResult> {
         // Phase 1 - resolve and authorise, sequentially: the approval gate may
         // be an interactive prompt, and two prompts at once are unreadable.
+        // An interrupt during a prompt abandons it: no answer means no
+        // approval, so that call and every one after it is left unrun.
         let mut plans = Vec::with_capacity(calls.len());
         for call in calls {
-            plans.push(self.plan(call).await);
+            let plan = interrupt
+                .guard(self.plan(call))
+                .await
+                .unwrap_or_else(|| Plan::Short(ToolResult::error(call, NOT_STARTED)));
+            plans.push(plan);
         }
 
         // Phase 2 - split by safety, then run.
@@ -110,7 +139,10 @@ impl ToolDispatcher {
             let running = concurrent
                 .into_iter()
                 .map(|(index, tool, safety)| async move {
-                    (index, self.invoke(tool, &calls[index], safety).await)
+                    (
+                        index,
+                        self.invoke(tool, &calls[index], safety, interrupt).await,
+                    )
                 });
             for (index, result) in join_all(running).await {
                 results[index] = Some(result);
@@ -118,7 +150,7 @@ impl ToolDispatcher {
         }
 
         for (index, tool, safety) in sequential {
-            results[index] = Some(self.invoke(tool, &calls[index], safety).await);
+            results[index] = Some(self.invoke(tool, &calls[index], safety, interrupt).await);
         }
 
         results
@@ -175,17 +207,31 @@ impl ToolDispatcher {
         }
     }
 
-    async fn invoke(&self, tool: Arc<dyn Tool>, call: &ToolCall, safety: ToolSafety) -> ToolResult {
+    async fn invoke(
+        &self,
+        tool: Arc<dyn Tool>,
+        call: &ToolCall,
+        safety: ToolSafety,
+        interrupt: &Interrupt,
+    ) -> ToolResult {
+        // Checked before announcing the call: one that never starts must not
+        // show up on screen as started.
+        if interrupt.is_fired() {
+            return ToolResult::error(call, NOT_STARTED);
+        }
         self.events.emit(AgentEvent::ToolCallStarted {
             call: call.clone(),
             safety,
         });
         let started = Instant::now();
-        let outcome = tool.execute(call.arguments.clone()).await;
+        let outcome = interrupt.guard(tool.execute(call.arguments.clone())).await;
         let duration = started.elapsed();
 
         let (result, summary) = match outcome {
-            Ok(outcome) => {
+            // Dropping the tool's future is what stops it; a running command
+            // takes its process group down with it (see the command runner).
+            None => (ToolResult::error(call, CUT_OFF), "interrupted".to_string()),
+            Some(Ok(outcome)) => {
                 let (content, truncated) =
                     text::truncate_owned(&outcome.content, self.config.max_tool_output_bytes);
                 let summary = outcome
@@ -201,7 +247,7 @@ impl ToolDispatcher {
                 };
                 (ToolResult::ok(call, content), summary)
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 let message = error.to_string();
                 (ToolResult::error(call, message.clone()), message)
             }

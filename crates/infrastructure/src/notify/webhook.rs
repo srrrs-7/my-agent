@@ -181,6 +181,8 @@ fn title(kind: NotificationKind) -> &'static str {
         NotificationKind::Approval => "agent: waiting for approval",
         NotificationKind::Completed => "agent: turn finished",
         NotificationKind::Failed => "agent: turn did not finish",
+        // Never sent (the policy refuses it); named so the match stays whole.
+        NotificationKind::Interrupted => "agent: turn interrupted",
     }
 }
 
@@ -190,6 +192,7 @@ fn tag(kind: NotificationKind) -> &'static str {
         NotificationKind::Approval => "bell",
         NotificationKind::Completed => "white_check_mark",
         NotificationKind::Failed => "warning",
+        NotificationKind::Interrupted => "stop_sign",
     }
 }
 
@@ -215,6 +218,7 @@ fn message(notification: &Notification) -> String {
                     "Stopped after {elapsed}: the provider ended the turn ({}).",
                     text::truncate(stop_reason, 64)
                 ),
+                FinishReason::Interrupted => format!("Interrupted by the user after {elapsed}."),
             };
             if let Some(excerpt) = excerpt {
                 body.push_str("\n\n");

@@ -13,6 +13,7 @@ mod approval;
 mod args;
 mod commands;
 mod composition;
+mod ctrl_c;
 mod input;
 mod notify;
 mod render;
@@ -87,10 +88,7 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
 
     Ok(match command {
         Command::Run { prompt } => commands::run::execute(&app, prompt.join(" ")).await?,
-        Command::Chat { .. } => {
-            commands::chat::execute(&app, resume).await?;
-            ExitCode::SUCCESS
-        }
+        Command::Chat { .. } => commands::chat::execute(&app, resume).await?,
         Command::Sessions { delete } => {
             match delete {
                 Some(id) => commands::sessions::delete(&app, &id).await?,

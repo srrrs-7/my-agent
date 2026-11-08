@@ -10,6 +10,10 @@
 //! * **The timeout kills the process group.** Killing the direct child leaves
 //!   a shell's grandchildren running; putting the child in its own group and
 //!   signalling the group is what actually stops `sh -c 'sleep 1000 &'`.
+//! * **So does being abandoned.** When the caller drops the future - the turn
+//!   was interrupted - `kill_on_drop` alone would stop only the direct child.
+//!   A guard kills the group first, while the child is still unreaped, so the
+//!   group id cannot yet belong to anyone else.
 //!
 //! The child is detached into its own *session*, which does both jobs at once
 //! and closes a hole that a process group alone leaves open: a child sharing
@@ -64,6 +68,10 @@ pub(crate) async fn run_capped(
     let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    // Declared after `child`, so it is dropped before it: the group is killed
+    // while the child is at worst a zombie, which keeps its pid - and with it
+    // the group id - from being handed to an unrelated process.
+    let mut group = GroupGuard { pid };
 
     // Each stream gets half the budget, so a chatty stderr cannot crowd out
     // the stdout the model is usually after.
@@ -71,6 +79,9 @@ pub(crate) async fn run_capped(
     let capture = async {
         let (out, err) = tokio::join!(read_capped(stdout, half), read_capped(stderr, half));
         let status = child.wait().await;
+        // Reaped: from here on the pid may be reused, and signalling its
+        // group could hit a stranger.
+        group.disarm();
         (out, err, status)
     };
 
@@ -126,6 +137,23 @@ async fn read_capped<R: AsyncRead + Unpin>(reader: Option<R>, limit: usize) -> (
     }
 
     (String::from_utf8_lossy(&kept).into_owned(), truncated)
+}
+
+/// Kills the child's process group when dropped, unless disarmed first.
+struct GroupGuard {
+    pid: Option<u32>,
+}
+
+impl GroupGuard {
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        kill_group(self.pid.take());
+    }
 }
 
 #[cfg(unix)]
@@ -208,6 +236,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, CommandError::TimedOut { .. }), "{error:?}");
+    }
+
+    /// Whether `pid` is still a process we could signal.
+    fn alive(pid: i32) -> bool {
+        // Signal 0 checks for existence without delivering anything.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Abandoning the run - what an interrupted turn does - must take the
+    /// whole group down, not only the shell. The background `sleep` is the
+    /// grandchild a plain `kill_on_drop` leaves behind.
+    #[tokio::test]
+    async fn dropping_the_run_kills_the_grandchildren_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let line = format!(
+            "sleep 100 & echo $! > {}.tmp && mv {0}.tmp {0}; wait",
+            pid_file.display()
+        );
+        let mut run = Box::pin(run_capped(shell(&line), Duration::from_secs(60), 4096));
+
+        // Bounded poll on process state, driving the run while we wait: the
+        // pid file appears (atomically, via `mv`) once the grandchild exists.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                break text.trim().parse::<i32>().expect("a pid");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shell never started its child"
+            );
+            tokio::select! {
+                _ = &mut run => panic!("the run finished on its own"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        };
+        assert!(alive(grandchild), "the grandchild should be running");
+
+        drop(run);
+
+        // SIGKILL is asynchronous; the grandchild is reparented to init and
+        // reaped there, so it may take a moment to disappear.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while alive(grandchild) {
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {grandchild} survived the dropped run"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "gone, not merely unsignalable"
+        );
     }
 
     #[tokio::test]

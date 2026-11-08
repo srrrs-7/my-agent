@@ -4,6 +4,7 @@ created: 2026-11-08
 urgency: medium
 importance: high
 priority: P1
+started: 2026-11-08
 scope: [domain, application, infrastructure, cli, docs]
 ---
 
@@ -59,17 +60,17 @@ scope: [domain, application, infrastructure, cli, docs]
 
 - [ ] chat でターン実行中に中断すると、会話が残ってプロンプトに戻る。続けて送った入力のリクエストに、
       直前のターンの経過（中断された旨を含む）が載る
-- [ ] 中断時点で結果のない `tool_call` すべてに「ユーザーが中断した」旨の `tool_result` が付き、
+- [x] 中断時点で結果のない `tool_call` すべてに「ユーザーが中断した」旨の `tool_result` が付き、
       次のリクエストが拒否されない形であることをループのテストで固定する
-- [ ] セッションログにも同じ結果が記録され、`--resume` で中断したターンの途中経過が戻る
-- [ ] ターン実行中の 2 回目の中断、またはプロンプト待ち中の中断で chat が終了する
-- [ ] `run` が中断で 130 を返す（実バイナリに SIGINT を送るテスト。`tests/notify_e2e.rs` と同じ方式）
-- [ ] `run_command` 実行中の中断で孫プロセスまで止まることを、実プロセスで固定する
+- [x] セッションログにも同じ結果が記録され、`--resume` で中断したターンの途中経過が戻る
+- [x] ターン実行中の 2 回目の中断、またはプロンプト待ち中の中断で chat が終了する
+- [x] `run` が中断で 130 を返す（実バイナリに SIGINT を送るテスト。`tests/notify_e2e.rs` と同じ方式）
+- [x] `run_command` 実行中の中断で孫プロセスまで止まることを、実プロセスで固定する
       （`sh -c 'sleep 1000 &'` の形）
-- [ ] 承認プロンプト中に中断しても、次に入力した 1 行が失われない
-- [ ] 中断したターンで何を通知するか（しないか）が決まっていて、テストで固定されている
+- [x] 承認プロンプト中に中断しても、次に入力した 1 行が失われない
+- [x] 中断したターンで何を通知するか（しないか）が決まっていて、テストで固定されている
 - [ ] `make chat`（`docker compose run`）経由でも同じ挙動であることを手で確かめ、ここに記録する
-- [ ] `make check` が緑
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -112,3 +113,5 @@ score 8 → P1。
 - **run_command の孫プロセス**: `infrastructure/src/exec/capture.rs` に drop guard（drop 時に kill_group、`child.wait()` 後に解除、reap 前に kill）。実プロセスのテストで孫が ESRCH になることを固定
 - cli: stdin は**ランタイム外の専用リーダースレッド + チャネル**にする（`spawn_blocking` 毎回方式は承認中断で次の行を飲み込む）。`ctrl_c()` は chat / run の中だけで登録。状態機械: プロンプト待ち中 → 終了(0) / ターン中 → fire / 後始末中に再度 → future 放棄して終了(130)。`agent run` の中断は 130、drain は待つ
 - やってはいけない: run の future を drop して中断する（終了経路以外）、tool_call の削除、Err で返す、application に tokio、`[interrupted]` の書き足し、`std::process::exit`
+
+- 2026-11-08 実装（設計どおり、逸脱なし）。残り: (1) `make chat` 経由（tini 経由の SIGINT 到達、^C の表示）を手で確認 (2) 達成条件 1 つ目の「続けて送った入力のリクエストに中断が分かる」は、ツール実行中の中断では満たす（結果文に残る）が、モデル要求中の中断では設計上なにも注入しないため痕跡が残らない — このままでよいかを実機確認と合わせて判断する

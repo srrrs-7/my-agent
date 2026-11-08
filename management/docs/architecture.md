@@ -234,8 +234,29 @@ pub struct RequestMetadata {
 2. **順序を保つ** — 並列実行したものも要求順に並べ直す
 3. **並列化するのは読み取り系だけ** — 同一ターンの 2 つの書き込みは同じファイルを触りうる
 
-ループ側は `dispatcher.dispatch(&calls).await` の 1 行になり、
+ループ側は `dispatcher.dispatch(&calls, &interrupt).await` の 1 行になり、
 承認・並列化・出力切り詰めの詳細を知りません。
+
+### 3.6.1 協調的中断（Ctrl-C）
+
+ターンを止めるのに**ループの future を drop しません**。drop すると、アシスタントの `tool_call` を
+会話とログに積んだ直後のような「結果のない呼び出し」で履歴が終わり、次のリクエストが拒否されます（不変条件 §4）。
+
+代わりに `application/src/agent/interrupt.rs` の `Interrupt`（std のみ・Clone で共有・一度発火したら戻らない・
+複数 waker 対応）をターンごとに `run_until(session, input, &interrupt)` へ渡し、ターンの側が止まります。
+ポートにしないのは差し替えるものがないからで、tokio に依存しないので application に置けます（§1）。
+
+- 確認点は **反復の先頭・圧縮の要約リクエスト・モデル要求（ストリーム含む）・ディスパッチャ内**（承認待ち・並列・直列）だけ
+- ディスパッチャは中断されても**入力と同じ数の結果を要求順で**返す。完了済みは実結果、未開始は「実行されていない」、
+  実行中は「一部反映されている可能性がある。状態を確かめてから」（どちらも `is_error: true`）
+- 順序は push → record → 中断なら return。呼び出しを会話から**削除して直さない**（追記専用のログと食い違う）
+- 中断は `Ok(AgentOutcome { reason: FinishReason::Interrupted })` で返す。`Err` はプロバイダが壊れたときだけ（§3）
+- ストリーミング途中の断片は履歴に残さず、`[interrupted]` のような文言も足さない
+
+cli 側（`cli/src/ctrl_c.rs`）は「プロンプト待ち → 終了(0) / ターン中 → 発火 / 後始末中にもう一度 → 放棄して終了(130)」
+の状態機械で、時間窓ではなく状態で判定します。SIGINT のハンドラは `chat` と `run` の中だけで登録します。
+stdin はランタイム外の専用スレッド + チャネルで読むので、中断で放棄した承認プロンプトが次の 1 行を飲み込みません。
+`run_command` の子は drop guard（`infrastructure/src/exec/capture.rs`）が reap 前にプロセスグループごと止めます。
 
 ### 3.7 設定を `EnvSource` 越しに読む
 
@@ -303,9 +324,10 @@ Anthropic アダプタはこの前置きにキャッシュの印を付けます�
 | 全体 | E2E（`crates/cli/tests/end_to_end.rs`） | HTTP → ループ → 実ファイル書き込み |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/notify_e2e.rs`） | 合成ルート → `run` / `chat` → 終了処理。Webhook 通知の到達・中身・終了コード |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/plan_e2e.rs`） | `todo_write` の登録・承認なしでの実行・stderr への表示・`--resume` での復元・`/reset` |
+| 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/interrupt_e2e.rs`） | SIGINT で `run` が 130、`chat` はターンだけ止まりプロンプトに戻る、プロンプト待ちの Ctrl-C は 0 |
 
 モックサーバは `crates/test-support` に置いて infrastructure と cli の
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 542 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 569 本）。

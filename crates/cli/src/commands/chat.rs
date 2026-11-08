@@ -1,11 +1,17 @@
 //! `agent chat` - an interactive session that keeps the conversation.
+//!
+//! Ctrl-C stops the running turn and comes back to the prompt with the
+//! conversation intact; at the prompt it quits. See [`crate::ctrl_c`].
 
-use agent_application::agent::Session;
+use std::process::ExitCode;
+
+use agent_application::agent::{Interrupt, Session};
 use anyhow::Result;
 
 use crate::args::Resume;
 use crate::commands::tools;
 use crate::composition::Application;
+use crate::ctrl_c::{CtrlC, Sigint, TurnEnd, drive};
 use crate::input::prompt_line;
 use crate::notify::DRAIN_TIMEOUT;
 use crate::render::{describe_plan, describe_usage};
@@ -15,7 +21,8 @@ const HELP: &str = "  /reset  start a new conversation\n  \
                       /usage  tokens used so far\n  \
                       /plan   the model's current work plan\n  \
                       /tools  list the tools the model can call\n  \
-                      /exit   quit";
+                      /exit   quit\n  \
+                      Ctrl-C  stop the running turn (at the prompt: quit)";
 
 /// What the REPL should do with a line before it reaches the model.
 enum Input {
@@ -25,21 +32,35 @@ enum Input {
     Prompt,
 }
 
-pub async fn execute(app: &Application, resume: Resume) -> Result<()> {
+pub async fn execute(app: &Application, resume: Resume) -> Result<ExitCode> {
     let result = repl(app, resume).await;
-    // Every way out of the loop passes here - `/exit`, Ctrl-D, and a broken
-    // stdin - so the last turn's notification is not lost with the process.
+    // Every way out of the loop passes here - `/exit`, Ctrl-D, Ctrl-C and a
+    // broken stdin - so the last turn's notification is not lost with the
+    // process.
     app.notifications.drain(DRAIN_TIMEOUT).await;
     result
 }
 
-async fn repl(app: &Application, resume: Resume) -> Result<()> {
+async fn repl(app: &Application, resume: Resume) -> Result<ExitCode> {
+    let mut sigint = Sigint::listen()?;
+    let mut keys = CtrlC::new();
     banner(app);
 
     let mut session = start(app, resume).await;
 
     loop {
-        let Some(line) = prompt_line("\n› ").await? else {
+        let line = tokio::select! {
+            // Dropping the prompt here loses nothing typed: see `input`.
+            () = sigint.recv() => match keys.pressed().exit_code() {
+                Some(code) => {
+                    eprintln!();
+                    return Ok(code);
+                }
+                None => continue,
+            },
+            line = prompt_line("\n› ") => line?,
+        };
+        let Some(line) = line else {
             // Ctrl-D.
             eprintln!();
             break;
@@ -57,7 +78,14 @@ async fn repl(app: &Application, resume: Resume) -> Result<()> {
         }
 
         app.notifications.begin_turn(&session.id);
-        let result = app.agent.run(&mut session, line).await;
+        let interrupt = Interrupt::new();
+        let turn = app.agent.run_until(&mut session, line, &interrupt);
+        let result = match drive(turn, &interrupt, &mut sigint, &mut keys).await {
+            TurnEnd::Finished(result) => result,
+            TurnEnd::Abandoned(code) => return Ok(code),
+        };
+        // An interrupted turn is `Ok` and the session carries on from it; the
+        // notifier is told, and its policy is what keeps it quiet.
         app.notifications.turn_finished(&result);
 
         // A failed turn must not end the session: the user may want to fix the
@@ -67,7 +95,7 @@ async fn repl(app: &Application, resume: Resume) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The session the REPL opens with.
@@ -164,7 +192,7 @@ fn banner(app: &Application) {
         app.workspace.display(),
         app.settings.approval.as_str()
     );
-    eprintln!("type /help for commands, /exit or Ctrl-D to quit");
+    eprintln!("type /help for commands, /exit or Ctrl-D to quit, Ctrl-C to stop a turn");
 }
 
 #[cfg(test)]

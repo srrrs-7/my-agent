@@ -56,12 +56,18 @@ pub enum NotificationEvent {
     },
 }
 
-/// The three things an operator can subscribe to.
+/// What a notification is about. The first three are what an operator can
+/// subscribe to ([`Self::ALL`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NotificationKind {
     Approval,
     Completed,
     Failed,
+    /// A turn the human stopped themselves. Deliberately not in [`Self::ALL`]
+    /// and so not subscribable: whoever pressed Ctrl-C is at the terminal,
+    /// and paging them about it would be noise. Named rather than folded into
+    /// `Failed` so that nothing has to remember to filter it back out.
+    Interrupted,
 }
 
 impl NotificationKind {
@@ -72,7 +78,13 @@ impl NotificationKind {
             Self::Approval => "approval",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
         }
+    }
+
+    /// Whether an operator can ask to hear about this kind at all.
+    pub fn is_subscribable(self) -> bool {
+        Self::ALL.contains(&self)
     }
 }
 
@@ -90,9 +102,15 @@ impl Notification {
                 reason: FinishReason::Completed,
                 ..
             } => NotificationKind::Completed,
-            NotificationEvent::TurnFinished { .. } | NotificationEvent::TurnFailed { .. } => {
-                NotificationKind::Failed
+            NotificationEvent::TurnFinished {
+                reason: FinishReason::Interrupted,
+                ..
+            } => NotificationKind::Interrupted,
+            NotificationEvent::TurnFinished {
+                reason: FinishReason::MaxIterations { .. } | FinishReason::Stopped { .. },
+                ..
             }
+            | NotificationEvent::TurnFailed { .. } => NotificationKind::Failed,
         }
     }
 }
@@ -152,6 +170,18 @@ mod tests {
             })
             .kind(),
             NotificationKind::Failed
+        );
+    }
+
+    #[test]
+    fn an_interrupted_turn_is_neither_a_failure_nor_subscribable() {
+        let kind = finished(FinishReason::Interrupted).kind();
+        assert_eq!(kind, NotificationKind::Interrupted);
+        assert!(!kind.is_subscribable());
+        assert!(
+            NotificationKind::ALL
+                .iter()
+                .all(|kind| kind.is_subscribable())
         );
     }
 

@@ -57,9 +57,12 @@ impl NotifyPolicy {
     /// The duration threshold applies to completions only. A prompt waiting
     /// for an answer and a turn that gave up both need the human however
     /// quickly they happened.
+    ///
+    /// A turn the human interrupted is never sent, whatever the settings say:
+    /// the person who pressed Ctrl-C is at the terminal already.
     pub fn wants(&self, notification: &Notification) -> bool {
         let kind = notification.kind();
-        if !self.events.contains(&kind) {
+        if !kind.is_subscribable() || !self.events.contains(&kind) {
             return false;
         }
         match (&notification.event, kind) {
@@ -393,6 +396,51 @@ pub(crate) mod tests {
         assert!(policy.wants(&gave_up));
         assert!(policy.wants(&broke));
         assert!(policy.wants(&approval_pending("s", &request())));
+    }
+
+    #[test]
+    fn an_interrupted_turn_is_never_sent() {
+        let policy = NotifyPolicy {
+            // Even a policy that somehow lists it, and with no threshold.
+            events: vec![
+                NotificationKind::Approval,
+                NotificationKind::Completed,
+                NotificationKind::Failed,
+                NotificationKind::Interrupted,
+            ],
+            min_turn: Duration::ZERO,
+            excerpt_chars: 100,
+        };
+        let interrupted = turn_outcome(
+            "s",
+            &outcome(FinishReason::Interrupted, "half an answer"),
+            Duration::from_secs(3600),
+            100,
+            &Redactor::default(),
+        );
+        assert_eq!(interrupted.kind(), NotificationKind::Interrupted);
+        assert!(!policy.wants(&interrupted), "{interrupted:?}");
+        assert!(!everything().wants(&interrupted), "{interrupted:?}");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_turn_reaches_no_notifier() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let notifications = Notifications::new(notifier.clone(), everything());
+        notifications.begin_turn("s");
+        let started = notifications.last_engaged();
+
+        notifications.turn_finished_at(
+            &outcome(FinishReason::Interrupted, ""),
+            started + Duration::from_secs(3600),
+        );
+        notifications.drain(DRAIN_TIMEOUT).await;
+
+        assert!(
+            lock(&notifier.sent).is_empty(),
+            "{:?}",
+            lock(&notifier.sent)
+        );
     }
 
     #[test]

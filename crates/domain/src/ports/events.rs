@@ -17,6 +17,9 @@ pub enum FinishReason {
     MaxIterations { limit: u32 },
     /// The provider stopped for its own reason (token limit, stop sequence).
     Stopped { stop_reason: String },
+    /// Someone asked the turn to stop (Ctrl-C). The history is left well
+    /// formed - every `tool_call` answered - so the session can carry on.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, PartialEq)]

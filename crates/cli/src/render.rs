@@ -76,6 +76,20 @@ impl TerminalRenderer {
         let _ = stdout.flush();
     }
 
+    /// Ends a streamed answer that will never get its `AssistantMessage` - the
+    /// turn was interrupted mid-stream - so the next line does not start
+    /// after half a sentence, and the next turn's answer is not mistaken for
+    /// its continuation.
+    fn end_stream(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.streaming {
+            state.streaming = false;
+            let mut stdout = std::io::stdout();
+            let _ = writeln!(stdout);
+            let _ = stdout.flush();
+        }
+    }
+
     fn answer(&self, text: &str) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let mut stdout = std::io::stdout();
@@ -196,32 +210,44 @@ impl EventSink for TerminalRenderer {
                 reason,
                 iterations,
                 usage,
-            } => match reason {
-                FinishReason::Completed => {
-                    if self.verbose {
-                        self.status(self.paint(
-                            DIM,
-                            &format!(
-                                "· done in {iterations} iteration(s), {} tokens{}",
-                                usage.total(),
-                                cache_suffix(&usage)
-                            ),
-                        ));
-                    }
-                }
-                FinishReason::MaxIterations { limit } => {
+            } => {
+                self.end_stream();
+                self.run_finished(reason, iterations, usage);
+            }
+        }
+    }
+}
+
+impl TerminalRenderer {
+    fn run_finished(&self, reason: FinishReason, iterations: u32, usage: TokenUsage) {
+        match reason {
+            FinishReason::Completed => {
+                if self.verbose {
                     self.status(self.paint(
-                        YELLOW,
+                        DIM,
                         &format!(
-                            "! stopped after the {limit}-iteration budget; the answer above may \
-                             be incomplete (raise --max-iterations to allow more)"
+                            "· done in {iterations} iteration(s), {} tokens{}",
+                            usage.total(),
+                            cache_suffix(&usage)
                         ),
                     ));
                 }
-                FinishReason::Stopped { stop_reason } => {
-                    self.status(self.paint(YELLOW, &format!("! the model stopped: {stop_reason}")));
-                }
-            },
+            }
+            FinishReason::MaxIterations { limit } => {
+                self.status(self.paint(
+                    YELLOW,
+                    &format!(
+                        "! stopped after the {limit}-iteration budget; the answer above may \
+                             be incomplete (raise --max-iterations to allow more)"
+                    ),
+                ));
+            }
+            FinishReason::Stopped { stop_reason } => {
+                self.status(self.paint(YELLOW, &format!("! the model stopped: {stop_reason}")));
+            }
+            FinishReason::Interrupted => {
+                self.status(self.paint(YELLOW, "! interrupted"));
+            }
         }
     }
 }
@@ -341,6 +367,28 @@ mod tests {
         assert_eq!(renderer.checklist(&Plan::default()), "☐ plan cleared");
         assert_eq!(describe_plan(Some(&plan)), renderer.checklist(&plan));
         assert_eq!(describe_plan(None), "no plan");
+    }
+
+    #[test]
+    fn a_finished_run_ends_an_answer_left_streaming() {
+        let renderer = TerminalRenderer::new(false, true);
+        // Empty, so the test prints nothing but the line ending.
+        renderer.emit(AgentEvent::AssistantDelta {
+            text: String::new(),
+        });
+        assert!(renderer.state.lock().unwrap().streaming);
+
+        // Interrupted mid-stream: no `AssistantMessage` is coming.
+        renderer.emit(AgentEvent::RunFinished {
+            reason: FinishReason::Interrupted,
+            iterations: 1,
+            usage: TokenUsage::default(),
+        });
+
+        assert!(
+            !renderer.state.lock().unwrap().streaming,
+            "the next turn's answer would be swallowed as a continuation"
+        );
     }
 
     #[test]

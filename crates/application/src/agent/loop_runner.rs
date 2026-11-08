@@ -20,6 +20,13 @@
 //! unknown, or is refused by the user comes back as an error-flagged
 //! `tool_result`, because a model correcting its own mistake is the normal
 //! case rather than an exception.
+//!
+//! An interrupt (see [`super::interrupt`]) is not a failure either: the turn
+//! returns `Ok` with [`FinishReason::Interrupted`], after making sure the
+//! history it leaves behind is one the next request can be built on. It is
+//! looked for at the top of each iteration, during a compaction, during the
+//! model request, and inside the dispatcher - nowhere else, because between
+//! those points the loop is only appending what it already has.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,6 +48,7 @@ use tracing::{debug, warn};
 use super::compaction::{CompactionConfig, HistoryCompactor};
 use super::config::AgentLoopConfig;
 use super::dispatch::{DispatchConfig, ToolDispatcher};
+use super::interrupt::Interrupt;
 use super::plan;
 use super::session::Session;
 use crate::error::AppError;
@@ -144,6 +152,23 @@ impl AgentLoop {
         session: &mut Session,
         user_input: impl Into<String>,
     ) -> Result<AgentOutcome, AppError> {
+        self.run_until(session, user_input, &Interrupt::new()).await
+    }
+
+    /// [`Self::run`], stopping early once `interrupt` fires.
+    ///
+    /// An interrupted turn returns `Ok` with [`FinishReason::Interrupted`] and
+    /// leaves `session` ready for the next one: every `tool_call` in it has a
+    /// result, in memory and in the log alike. Nothing is added to say that it
+    /// was interrupted beyond those results, and nothing is taken away - a
+    /// half-streamed answer was never part of the history, and a call the
+    /// model made stays where it was, answered.
+    pub async fn run_until(
+        &self,
+        session: &mut Session,
+        user_input: impl Into<String>,
+        interrupt: &Interrupt,
+    ) -> Result<AgentOutcome, AppError> {
         let tools = self.advertised_tools();
         let system_prompt = self.system_prompt(session, &tools).await?;
         // A zero budget would silently answer nothing; one round-trip is the
@@ -159,17 +184,31 @@ impl AgentLoop {
         });
 
         for iteration in 1..=limit {
+            if interrupt.is_fired() {
+                return Ok(self.interrupted(session, iteration - 1));
+            }
             self.events
                 .emit(AgentEvent::IterationStarted { iteration, limit });
-            self.fit_history(session).await;
+            if self.fit_history(session, interrupt).await.is_none() {
+                return Ok(self.interrupted(session, iteration));
+            }
 
             let request = self.build_request(session, &system_prompt, &tools, iteration);
             let started = Instant::now();
-            let response = if self.config.stream {
-                self.chat_streaming(request).await?
-            } else {
-                self.llm.chat(request).await?
+            // Abandoning the request leaves nothing to undo: the response is
+            // only pushed once it is complete, so whatever was streamed so far
+            // was shown and is gone.
+            let pending = async {
+                if self.config.stream {
+                    self.chat_streaming(request).await
+                } else {
+                    self.llm.chat(request).await.map_err(AppError::from)
+                }
             };
+            let Some(response) = interrupt.guard(pending).await else {
+                return Ok(self.interrupted(session, iteration));
+            };
+            let response = response?;
 
             session.usage.accumulate(response.usage);
             self.events.emit(AgentEvent::ModelResponded {
@@ -196,13 +235,19 @@ impl AgentLoop {
             }
 
             debug!(iteration, calls = calls.len(), "dispatching tool calls");
-            let results = self.dispatcher.dispatch(&calls).await;
+            // Answers every call even when interrupted, so the results are
+            // pushed and recorded before the interrupt is acted on - never
+            // instead of it.
+            let results = self.dispatcher.dispatch(&calls, interrupt).await;
             session.conversation.push(Message::tool_results(results));
             self.record(session, 1).await;
             // The call and its result, read now: by the next shortening the
             // call that wrote the plan may already be gone.
             if let Some(plan) = plan::refresh(session, 2) {
                 self.events.emit(AgentEvent::PlanUpdated { plan });
+            }
+            if interrupt.is_fired() {
+                return Ok(self.interrupted(session, iteration));
             }
         }
 
@@ -332,7 +377,11 @@ impl AgentLoop {
     /// front, whenever there is unfinished work: without the reservation the
     /// note would push a history trimmed to exactly the budget back over it,
     /// and the next iteration would trim again just to make room for it.
-    async fn fit_history(&self, session: &mut Session) {
+    ///
+    /// `None` when `interrupt` fired during the compaction. The summary is
+    /// abandoned before it changed anything, and trimming is skipped too: the
+    /// turn is ending, and the next one fits the history again first.
+    async fn fit_history(&self, session: &mut Session, interrupt: &Interrupt) -> Option<()> {
         let reminder = plan::reminder(session.plan());
         let budget = self
             .config
@@ -341,10 +390,12 @@ impl AgentLoop {
         let mut shortened = false;
 
         if session.conversation.approx_bytes() > budget
-            && let Some(report) = self
-                .compactor
-                .compact(&session.id, &mut session.conversation)
-                .await
+            && let Some(report) = interrupt
+                .guard(
+                    self.compactor
+                        .compact(&session.id, &mut session.conversation),
+                )
+                .await?
         {
             shortened = true;
             self.events.emit(AgentEvent::HistoryCompacted {
@@ -371,6 +422,7 @@ impl AgentLoop {
             session.conversation.push(reminder);
             self.record(session, 1).await;
         }
+        Some(())
     }
 
     fn build_request(
@@ -392,6 +444,18 @@ impl AgentLoop {
                 requires_tools: !tools.is_empty(),
                 hints: Default::default(),
             })
+    }
+
+    /// The outcome of a turn that stopped because it was asked to. No final
+    /// text: there is no answer, and inventing one would put words in the
+    /// model's mouth.
+    fn interrupted(&self, session: &Session, iterations: u32) -> AgentOutcome {
+        self.finish(
+            session,
+            String::new(),
+            iterations,
+            FinishReason::Interrupted,
+        )
     }
 
     fn finish(
