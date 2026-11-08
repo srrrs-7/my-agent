@@ -87,3 +87,8 @@ Ctrl-C 中断（progress）が同じ kill 経路を触っており、そちら�
     エージェント自身を固める案。まとめて入れるなら置き場所を揃える
   - `done/2026-11-08_sandboxed-mcp-client.md`、`done/2026-08-14_sandboxed-command-execution-tool.md`
 - 出典: 2026-11-08 のレビュー（security）で見送ったもの
+- **実測（2026-11-08、dev コンテナ）:** `/sys/fs/cgroup` は `cgroup2 ro` でマウントされ、`mkdir` は
+  `Read-only file system`。cgroup 案は基準環境で実証できないため採らず、subreaper +
+  「エージェントの子で、tokio が起動したものではなく、別セッションにいるもの」だけを pid 指定で
+  回収する方式にした（`infrastructure/src/exec/reaper.rs`）。得られない環境では起動は失敗させず、
+  `agent doctor` の `detached children` 行とツール説明に表示する（root の決定）

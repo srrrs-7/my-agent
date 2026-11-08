@@ -75,3 +75,11 @@ scope: [infrastructure, cli, docs]
   - `done/2026-11-08_secret-file-protection.md`（伏せ字と環境変数の除去）、
     `done/2026-11-08_sandboxed-mcp-client.md`（`env_from`）
 - 出典: 2026-11-08 のレビュー（security）で見送ったもの
+- **検証結果（2026-11-08、dev コンテナ / Linux 6.8.0）: 仮説どおり、confined の子からは読めない。**
+  エージェント（テストプロセス）は dumpable のまま、同じ uid・同じ pid に対して
+  - `AGENT_SHELL_SANDBOX=none` の `run_command` → 読める（対照）
+  - Landlock 下の `run_command` → 読めない（`sandbox.rs::a_confined_command_cannot_read_the_agents_environment`）
+  - `SandboxKind::None` の MCP サーバ → 読める（対照）／ Landlock 下の MCP サーバ → 読めない
+    （`mcp_sandbox.rs::a_confined_server_cannot_read_the_agents_environment`）
+  `none` の穴は `main` 先頭の `PR_SET_DUMPABLE=0`（`exec::protect_agent_process`）で塞ぎ、
+  `tests/agent_process.rs` が「呼ぶ前は読める／呼んだ後は読めない」を固定した

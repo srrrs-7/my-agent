@@ -72,6 +72,17 @@ fn describe(runner: &dyn CommandRunner, allowed_domains: &[String]) -> String {
         )
     };
 
+    // Either way the model learns that a command cannot leave something
+    // running: the difference is only whether that is complete.
+    let lifetime = if runner.stops_detached_descendants() {
+        "Every process the command starts is stopped when it ends, including \
+         ones that detach with `setsid`, so do not start servers or daemons \
+         expecting them to keep running."
+    } else {
+        "Background processes in the command's process group are stopped when it \
+         ends; ones that detach with `setsid` are not stopped on this platform."
+    };
+
     format!(
         "Run a shell command in the workspace and return its output.\n\
          Use it for builds, tests, formatters and version control - anything the \
@@ -79,6 +90,7 @@ fn describe(runner: &dyn CommandRunner, allowed_domains: &[String]) -> String {
          Sandbox: {}. Writes outside the workspace are refused by the operating \
          system, not by convention.\n\
          {network}\n\
+         {lifetime}\n\
          The command runs under `/bin/sh -c`, so pipes and redirection work. \
          Long output is truncated; narrow it yourself (`| tail -40`) rather than \
          relying on that.",
@@ -209,6 +221,7 @@ mod tests {
 
     struct StubRunner {
         kind: SandboxKind,
+        detached: bool,
         result: Mutex<Option<Result<CommandOutput, CommandError>>>,
         seen: Mutex<Option<CommandRequest>>,
     }
@@ -217,6 +230,7 @@ mod tests {
         fn ok(output: CommandOutput) -> Arc<Self> {
             Arc::new(Self {
                 kind: SandboxKind::LandlockConfined,
+                detached: true,
                 result: Mutex::new(Some(Ok(output))),
                 seen: Mutex::new(None),
             })
@@ -225,6 +239,7 @@ mod tests {
         fn failing(error: CommandError) -> Arc<Self> {
             Arc::new(Self {
                 kind: SandboxKind::LandlockConfined,
+                detached: true,
                 result: Mutex::new(Some(Err(error))),
                 seen: Mutex::new(None),
             })
@@ -235,6 +250,10 @@ mod tests {
     impl CommandRunner for StubRunner {
         fn sandbox(&self) -> SandboxKind {
             self.kind
+        }
+
+        fn stops_detached_descendants(&self) -> bool {
+            self.detached
         }
 
         async fn run(&self, request: CommandRequest) -> Result<CommandOutput, CommandError> {
@@ -373,6 +392,28 @@ mod tests {
         let tool = RunCommandTool::new(StubRunner::ok(output(0, "", "")), &[]);
         let description = tool.definition().description;
         assert!(description.contains("no network access"), "{description}");
+    }
+
+    #[test]
+    fn the_description_says_whether_detached_processes_are_stopped() {
+        let tool = RunCommandTool::new(StubRunner::ok(output(0, "", "")), &[]);
+        let description = tool.definition().description;
+        assert!(
+            description.contains("Every process the command starts is stopped"),
+            "{description}"
+        );
+
+        let runner = Arc::new(StubRunner {
+            kind: SandboxKind::LandlockConfined,
+            detached: false,
+            result: Mutex::new(None),
+            seen: Mutex::new(None),
+        });
+        let description = RunCommandTool::new(runner, &[]).definition().description;
+        assert!(
+            description.contains("ones that detach with `setsid` are not stopped"),
+            "the model must not be told more than holds: {description}"
+        );
     }
 
     #[test]

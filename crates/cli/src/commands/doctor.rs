@@ -50,6 +50,9 @@ fn print_configuration(app: &Application) {
     );
     print_sandbox(app);
     print_tool_servers(app);
+    if app.commands.is_some() || !app.tool_servers.is_empty() {
+        print_detached(agent_infrastructure::exec::detached_reaping());
+    }
 }
 
 /// Each running MCP server with the confinement it actually got.
@@ -91,6 +94,19 @@ fn print_sandbox(app: &Application) {
         None => "none - every outbound connection is refused".to_string(),
     };
     println!("  {:<20} {egress}", "command egress");
+}
+
+/// Whether a descendant that leaves its process group is still stopped with
+/// its command or MCP server. Process-wide, so one line covers both.
+fn print_detached(reaping: Result<(), String>) {
+    let line = match reaping {
+        Ok(()) => "stopped with their command or server (subreaper)".to_string(),
+        Err(reason) => format!(
+            "NOT stopped: {reason}. A descendant that calls `setsid` can outlive its \
+             command or server"
+        ),
+    };
+    println!("  {:<20} {line}", "detached children");
 }
 
 /// Smallest request that still proves the endpoint, the key and the model name

@@ -42,9 +42,11 @@
 //! is killed at that point. That is a command detaching itself from the
 //! capture, which is the behaviour being shut down here.
 //!
-//! What this cannot reach is a process that left the group: `setsid` (or
-//! `setpgid`) puts it beyond a group signal. The OS sandbox still confines
-//! it, but it can outlive the call. The README states this residual risk.
+//! A process that left the group - `setsid` or `setpgid` - is beyond a group
+//! signal, so the group kill is followed by a sweep for those
+//! ([`super::reaper`]), and the call returns only once everything it found
+//! has been reaped. Where the platform offers no way to find them, they can
+//! outlive the call; `agent doctor` and the tool description say so.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -55,6 +57,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use super::process::{GuardedChild, kill_group};
+use super::reaper;
 
 /// Runs `command` to completion under the cap and the timeout.
 ///
@@ -84,13 +87,17 @@ pub(crate) async fn run_capped(
         let (out, err) = tokio::join!(read_capped(stdout, half), read_capped(stderr, half));
         // Before `wait`, which reaps: see "Kill, then reap" above.
         kill_group(pid);
+        let found = reaper::sweep(pid.as_slice());
         let status = guarded.child.wait().await;
         guarded.group.disarm();
-        (out, err, status)
+        (out, err, status, found)
     };
 
     match tokio::time::timeout(timeout, capture).await {
-        Ok(((stdout, out_cut), (stderr, err_cut), status)) => {
+        Ok(((stdout, out_cut), (stderr, err_cut), status, found)) => {
+            // Before returning: the caller's dependency check compares the
+            // workspace next, and nothing this command started may act after.
+            settle(found).await;
             let status = status.map_err(|error| CommandError::Io {
                 message: error.to_string(),
             })?;
@@ -103,12 +110,19 @@ pub(crate) async fn run_capped(
             })
         }
         Err(_) => {
-            kill_group(pid);
+            settle(guarded.group.stop()).await;
             Err(CommandError::TimedOut {
                 seconds: timeout.as_secs(),
             })
         }
     }
+}
+
+/// Waits, off the runtime, for the swept processes to be reaped.
+async fn settle(found: std::collections::HashSet<i32>) {
+    // A failed join only means the wait was abandoned; everything found has
+    // been signalled already.
+    let _ = tokio::task::spawn_blocking(move || reaper::settle(found, reaper::SETTLE_BUDGET)).await;
 }
 
 /// Reads a stream, keeping at most `limit` bytes but draining the rest so the

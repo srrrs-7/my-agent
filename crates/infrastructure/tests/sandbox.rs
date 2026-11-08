@@ -533,3 +533,146 @@ async fn requiring_more_than_the_platform_offers_fails_closed() {
         Ok(_) => panic!("must refuse to run with less confinement than required"),
     }
 }
+
+/// The pid in `/proc/<pid>/stat` field 6 - the session - and whether the
+/// process still exists at all (a zombie counts: it is not yet reaped).
+fn session_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(3)?.parse().ok()
+}
+
+/// A descendant that moves to a session of its own is beyond the group kill.
+/// It must still be gone - not merely signalled, reaped - by the time the
+/// call returns, because the dependency check runs right after.
+#[tokio::test]
+async fn a_descendant_that_calls_setsid_does_not_outlive_the_command() {
+    let fixture = fixture(ExecConfig::default()).await;
+    let output = fixture
+        .runner
+        .run(request(
+            "setsid sh -c 'echo $$ > detached.tmp && mv detached.tmp detached.pid; \
+             exec sleep 30' >/dev/null 2>&1 &\n\
+             while [ ! -s detached.pid ]; do sleep 0.01; done\n\
+             pid=$(cat detached.pid)\n\
+             echo \"shell=$$ pid=$pid sid=$(ps -o sid= -p $pid | tr -d ' ')\"",
+        ))
+        .await
+        .unwrap();
+    assert!(output.succeeded(), "{output:?}");
+
+    let field = |name: &str| -> i32 {
+        output
+            .stdout
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(&format!("{name}=")))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("no `{name}=` in {output:?}"))
+    };
+    let (shell, detached) = (field("shell"), field("pid"));
+    assert_eq!(
+        field("sid"),
+        detached,
+        "the probe must really have left the command's session (shell {shell}): {output:?}"
+    );
+
+    assert_eq!(
+        session_of(detached),
+        None,
+        "detached process {detached} survived the command that started it"
+    );
+}
+
+/// The case the dependency check depends on, without a timer: the detached
+/// process waits to be told to touch `Cargo.toml`, and is still waiting when
+/// the command ends. Afterwards, nobody may be left to tell.
+///
+/// Opening a FIFO for writing without blocking fails with `ENXIO` exactly
+/// when no process has it open for reading - so the open is the probe. The
+/// detached process opens it (read-write, which does not wait for a partner)
+/// before announcing itself, so "ready" means "a reader exists".
+#[tokio::test]
+async fn a_detached_process_cannot_touch_the_manifest_after_the_command_ends() {
+    let fixture = fixture(ExecConfig::default()).await;
+    let manifest = fixture.root.as_path().join("Cargo.toml");
+    std::fs::write(&manifest, "[dependencies]\n").unwrap();
+
+    let output = fixture
+        .runner
+        .run(request(
+            "mkfifo go\n\
+             setsid sh -c 'exec 3<>go; touch ready; read line <&3; \
+             echo evil = 1 >> Cargo.toml' >/dev/null 2>&1 &\n\
+             while [ ! -e ready ]; do sleep 0.01; done",
+        ))
+        .await
+        .unwrap();
+    assert!(output.succeeded(), "{output:?}");
+
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(fixture.root.as_path().join("go"));
+    match opened {
+        Err(error) => assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ENXIO),
+            "expected `no reader`, got {error}"
+        ),
+        Ok(mut writer) => {
+            use std::io::Write as _;
+            let _ = writer.write_all(b"go\n");
+            panic!("the detached process was still waiting after the command ended");
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(&manifest).unwrap(),
+        "[dependencies]\n"
+    );
+}
+
+/// Reports whether `/proc/<pid>/environ` could be opened and read.
+fn environ_probe(pid: u32) -> String {
+    format!(
+        "if cat /proc/{pid}/environ >/dev/null 2>&1; then echo environ=read; \
+         else echo environ=denied; fi"
+    )
+}
+
+/// A confined command cannot read the agent's environment - the provider
+/// keys and every `env_from` value live there, scrubbed from the child's own
+/// environment but not from ours.
+///
+/// Nothing in this test process clears `PR_SET_DUMPABLE`, so the refusal is
+/// Landlock's: a sandboxed process may only ptrace - and reading
+/// `/proc/<pid>/environ` is a ptrace-mode access check - processes inside its
+/// own domain. The control shows the same probe succeeding unconfined, as the
+/// same user, against the same pid.
+#[tokio::test]
+async fn a_confined_command_cannot_read_the_agents_environment() {
+    let agent = std::process::id();
+    let fixture = fixture(ExecConfig::default()).await;
+
+    let baseline = unsandboxed(fixture.root.clone())
+        .await
+        .run(request(&environ_probe(agent)))
+        .await
+        .unwrap();
+    assert_eq!(
+        baseline.stdout.trim(),
+        "environ=read",
+        "unconfined and dumpable, the agent's environment is readable: {baseline:?}"
+    );
+
+    let output = fixture
+        .runner
+        .run(request(&environ_probe(agent)))
+        .await
+        .unwrap();
+    assert_eq!(
+        output.stdout.trim(),
+        "environ=denied",
+        "Landlock must keep a confined child out of the agent's environment: {output:?}"
+    );
+}

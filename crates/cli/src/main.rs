@@ -26,6 +26,15 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 // `ExitCode` normally - unlike `process::exit`, destructors and stdout
 // flushing run.
 fn main() -> ExitCode {
+    // Before `.env` puts anything into the environment, so that no child -
+    // confined or not - can read the keys out of `/proc/<our pid>/environ`.
+    if let Err(error) = agent_infrastructure::exec::protect_agent_process() {
+        eprintln!(
+            "warning: cannot keep child processes out of this process's environment \
+             (PR_SET_DUMPABLE): {error}"
+        );
+    }
+
     // First, while the process has one thread - see `load_dotenv`.
     load_dotenv();
 

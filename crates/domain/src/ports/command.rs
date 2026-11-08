@@ -123,5 +123,10 @@ pub trait CommandRunner: Send + Sync {
     /// their configuration, because the two can differ.
     fn sandbox(&self) -> SandboxKind;
 
+    /// Whether a descendant that leaves the command's process group
+    /// (`setsid`, `setpgid`) is stopped when the command ends, like the rest
+    /// of it. Reported, like [`Self::sandbox`], as what is actually in force.
+    fn stops_detached_descendants(&self) -> bool;
+
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, CommandError>;
 }
