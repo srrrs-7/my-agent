@@ -27,6 +27,7 @@ use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::conversation_log::{ConversationLog, NullConversationLog};
 use agent_domain::ports::events::EventSink;
+use agent_domain::ports::file_system::FileSystem;
 use agent_domain::ports::llm::LlmProvider;
 use agent_domain::ports::notify::{Notifier, NullNotifier};
 use agent_domain::ports::prompt::PromptBuilder;
@@ -85,6 +86,9 @@ pub struct Application {
     /// What `/undo` and `/rewind` take back. The loop holds it too; `chat`
     /// clears it when the conversation starts over.
     pub checkpoints: Arc<CheckpointJournal>,
+    /// The tools' file system, for `@path` references in `chat`: what the
+    /// user attaches is read under the same rules as what the model reads.
+    pub files: Arc<dyn FileSystem>,
 }
 
 /// What differs between the callers of [`assemble`].
@@ -237,6 +241,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     );
 
     let checkpoints = Arc::new(CheckpointJournal::new(file_system.clone()));
+    let files: Arc<dyn FileSystem> = file_system.clone();
     let mut tools = build_tools(
         file_system,
         searcher,
@@ -376,6 +381,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         tool_servers,
         redactor,
         checkpoints,
+        files,
     })
 }
 

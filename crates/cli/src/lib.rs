@@ -23,6 +23,7 @@ pub mod dotenv;
 mod input;
 mod notify;
 pub mod output;
+mod references;
 mod render;
 
 /// Fresh identifier for a conversation.
