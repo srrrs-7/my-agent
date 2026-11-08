@@ -177,3 +177,13 @@ E2E テストが名前どおりのものになる — 手で組み直した配�
     - `std::env::set_var` は `crates/infrastructure/tests/sandbox.rs:447` に既存の使用がある
       （この issue の追加分では使っていない）
 
+
+- 2026-11-08 issue-agent（レビュー見送り分の棚卸しで追記）: 残り 4 点は上の「残り」に揃っており、
+  別 issue には切り出していない。次の 2 点を補足する
+  - `std::env::set_var` の残りは `crates/infrastructure/tests/sandbox.rs` の L447–448（`set_var`）と
+    L472–473（`remove_var`）。`remove_var` も同じくプロセス環境を書き換えるので一緒に置き換える
+    （子の環境は `Command::env` で渡せば足りる見込み）
+  - 達成条件の「`grep` で確認できる形」は、素朴な `grep -rn set_var crates/` だと
+    `crates/cli/src/main.rs:83`（`.env` の適用。本番コードで、テストではない）と
+    `crates/cli/tests/*_e2e.rs` の `//!` コメント（「set_var を使わない」という説明）にも当たる。
+    確認コマンドはテストのコード行に絞る形で決めて、ここに書いておくこと
