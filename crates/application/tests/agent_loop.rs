@@ -530,6 +530,13 @@ impl ConversationLog for BrokenLog {
             message: "no space left on device".into(),
         })
     }
+
+    async fn rewind(&self, _session_id: &str, _seq: u64) -> Result<(), FsError> {
+        Err(FsError::Io {
+            path: "/var/log".into(),
+            message: "no space left on device".into(),
+        })
+    }
 }
 
 /// Everything the loop appends is recorded, tool turns included.

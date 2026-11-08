@@ -37,6 +37,14 @@ pub struct Session {
     /// turn it appends, and rebuilt from the whole record by
     /// [`Self::resumed`].
     pub(crate) plan: Option<Plan>,
+    /// Notes for the model about things the user did between turns (an
+    /// `/undo`), put in front of the next user message. Each carries the
+    /// number of the user message of the turn it is about, so a rewind past
+    /// that turn drops the note along with it.
+    ///
+    /// In the user message rather than the system prompt, which stays fixed
+    /// for the session so the provider's prompt cache keeps matching.
+    pub(crate) notes: Vec<(u64, String)>,
 }
 
 impl Session {
@@ -47,6 +55,7 @@ impl Session {
             usage: TokenUsage::default(),
             system_prompt: None,
             plan: None,
+            notes: Vec::new(),
         }
     }
 
@@ -63,6 +72,35 @@ impl Session {
             plan,
             ..Self::new(id)
         }
+    }
+
+    /// Takes the conversation back to just before the user message numbered
+    /// `seq` (see [`Conversation::rewind_to`]), returning how many messages
+    /// went. The plan and any pending note are brought in line with what is
+    /// left.
+    pub fn rewind_to(&mut self, seq: u64) -> Option<usize> {
+        let dropped = self.conversation.rewind_to(seq)?;
+        self.plan = latest_plan(self.conversation.messages()).filter(|plan| !plan.is_empty());
+        self.notes.retain(|(about, _)| *about < seq);
+        Some(dropped)
+    }
+
+    pub(crate) fn add_note(&mut self, about: u64, note: String) {
+        self.notes.push((about, note));
+    }
+
+    /// `input` with every pending note in front of it, emptying the queue.
+    pub(crate) fn with_notes(&mut self, input: String) -> String {
+        if self.notes.is_empty() {
+            return input;
+        }
+        let mut text = String::new();
+        for (_, note) in self.notes.drain(..) {
+            text.push_str(&note);
+            text.push_str("\n\n");
+        }
+        text.push_str(&input);
+        text
     }
 
     pub fn turns(&self) -> usize {

@@ -33,6 +33,18 @@ pub trait FileSystem: Send + Sync {
 
     async fn exists(&self, path: &WorkspacePath) -> Result<bool, FsError>;
 
+    /// Deletes the regular file at `path`, under the same rules as
+    /// [`Self::write`]: a file that may not be written may not be deleted
+    /// either. Refuses a directory, and a symbolic link - deleting the link
+    /// and deleting what it points at are different requests, and guessing
+    /// wrong loses a file.
+    ///
+    /// Parent directories are left in place, even when this empties them.
+    ///
+    /// No default: one that did nothing would let an undo report a file as
+    /// deleted that is still there.
+    async fn remove_file(&self, path: &WorkspacePath) -> Result<(), FsError>;
+
     /// The workspace path `path` really reaches once symbolic links are
     /// resolved - `Cargo.toml` for a `deps.txt` that links to it - or `path`
     /// itself when no link is involved. For a path that does not exist yet,

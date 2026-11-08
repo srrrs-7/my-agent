@@ -57,6 +57,46 @@ struct Record<'a> {
     message: &'a Message,
 }
 
+/// The line that takes back every message numbered `rewind_to` or later.
+#[derive(Serialize)]
+struct RewindRecord<'a> {
+    v: u32,
+    session: &'a str,
+    at: String,
+    rewind_to: u64,
+}
+
+impl FileConversationLog {
+    /// Appends `batch` - whole lines - to the record of `session_id`.
+    async fn write_lines(&self, session_id: &str, batch: &str) -> Result<(), FsError> {
+        let path = path_for(&self.directory, session_id);
+        tokio::fs::create_dir_all(&self.directory)
+            .await
+            .map_err(|error| io_error(&self.directory, error))?;
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .map_err(|error| io_error(&path, error))?;
+
+        file.write_all(batch.as_bytes())
+            .await
+            .map_err(|error| io_error(&path, error))?;
+        file.flush().await.map_err(|error| io_error(&path, error))?;
+
+        Ok(())
+    }
+}
+
+fn serialise(session_id: &str, record: &impl Serialize) -> Result<String, FsError> {
+    serde_json::to_string(record).map_err(|error| FsError::Io {
+        path: session_id.to_string(),
+        message: format!("cannot serialise a log record: {error}"),
+    })
+}
+
 #[async_trait]
 impl ConversationLog for FileConversationLog {
     async fn append(&self, session_id: &str, messages: &[Message]) -> Result<(), FsError> {
@@ -76,32 +116,23 @@ impl ConversationLog for FileConversationLog {
                 at: at.clone(),
                 message,
             };
-            let line = serde_json::to_string(&record).map_err(|error| FsError::Io {
-                path: session_id.to_string(),
-                message: format!("cannot serialise a log record: {error}"),
-            })?;
-            batch.push_str(&line);
+            batch.push_str(&serialise(session_id, &record)?);
             batch.push('\n');
         }
 
-        let path = path_for(&self.directory, session_id);
-        tokio::fs::create_dir_all(&self.directory)
-            .await
-            .map_err(|error| io_error(&self.directory, error))?;
+        self.write_lines(session_id, &batch).await
+    }
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-            .map_err(|error| io_error(&path, error))?;
-
-        file.write_all(batch.as_bytes())
-            .await
-            .map_err(|error| io_error(&path, error))?;
-        file.flush().await.map_err(|error| io_error(&path, error))?;
-
-        Ok(())
+    async fn rewind(&self, session_id: &str, seq: u64) -> Result<(), FsError> {
+        let record = RewindRecord {
+            v: SCHEMA_VERSION,
+            session: session_id,
+            at: chrono::Utc::now().to_rfc3339(),
+            rewind_to: seq,
+        };
+        let mut line = serialise(session_id, &record)?;
+        line.push('\n');
+        self.write_lines(session_id, &line).await
     }
 }
 
@@ -207,6 +238,30 @@ mod tests {
             .collect();
         assert_eq!(written.len(), 1, "{written:?}");
         assert_eq!(written[0], "______escaped.jsonl");
+    }
+
+    #[tokio::test]
+    async fn a_rewind_is_appended_as_a_mark_and_leaves_earlier_lines_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = FileConversationLog::new(directory.path());
+        log.append("s1", &[Message::user("hello").with_seq(0)])
+            .await
+            .unwrap();
+        let path = directory.path().join("s1.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        log.rewind("s1", 0).await.unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "what was written stays as it was: {after}"
+        );
+        let records = lines(&path);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["rewind_to"], 0);
+        assert_eq!(records[1]["v"], SCHEMA_VERSION);
+        assert!(records[1].get("role").is_none(), "{:?}", records[1]);
     }
 
     #[tokio::test]

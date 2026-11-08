@@ -5,6 +5,7 @@
 //! and dispatch.
 
 pub mod chat;
+mod checkpoint;
 pub mod doctor;
 pub mod eval;
 pub mod run;

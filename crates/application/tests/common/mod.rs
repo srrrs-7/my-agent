@@ -135,6 +135,17 @@ impl FileSystem for MemoryFileSystem {
         Ok(self.files.lock().unwrap().contains_key(&path.display()))
     }
 
+    async fn remove_file(&self, path: &WorkspacePath) -> Result<(), FsError> {
+        self.files
+            .lock()
+            .unwrap()
+            .remove(&path.display())
+            .map(|_| ())
+            .ok_or_else(|| FsError::NotFound {
+                path: path.display(),
+            })
+    }
+
     /// No links in memory: every path is its own file.
     async fn resolve_real(&self, path: &WorkspacePath) -> Result<WorkspacePath, FsError> {
         Ok(path.clone())
@@ -290,6 +301,8 @@ pub fn delta(text: &str) -> Result<StreamEvent, LlmError> {
 #[derive(Default)]
 pub struct RecordingLog {
     pub seen: Mutex<Vec<(String, Message)>>,
+    /// Every rewind mark, as `(session, seq)`.
+    pub rewinds: Mutex<Vec<(String, u64)>>,
 }
 
 #[async_trait]
@@ -301,6 +314,14 @@ impl ConversationLog for RecordingLog {
                 .iter()
                 .map(|message| (session_id.to_string(), message.clone())),
         );
+        Ok(())
+    }
+
+    async fn rewind(&self, session_id: &str, seq: u64) -> Result<(), FsError> {
+        self.rewinds
+            .lock()
+            .unwrap()
+            .push((session_id.to_string(), seq));
         Ok(())
     }
 }

@@ -23,7 +23,12 @@ use std::path::{Path, PathBuf};
 /// A reader that meets a higher version stops there rather than guessing: the
 /// lines it already understood are worth keeping, the ones it does not are not
 /// worth inventing.
-const SCHEMA_VERSION: u32 = 1;
+///
+/// * 1 - one message per line.
+/// * 2 - adds the rewind mark (`{"rewind_to": seq}`), a line that is not a
+///   message. A reader that knew only 1 would take the messages it cancels as
+///   still said, so it has to stop there instead.
+const SCHEMA_VERSION: u32 = 2;
 
 /// Longest file stem a session id may turn into.
 const MAX_STEM_BYTES: usize = 128;

@@ -168,6 +168,32 @@ impl Conversation {
         dropped
     }
 
+    /// Takes the conversation back to just before the user message numbered
+    /// `seq`, returning how many messages went - or `None`, changing nothing,
+    /// when no user message carries that number.
+    ///
+    /// Only ever cut in front of a user message: every `tool_call` before it
+    /// has its result before it too, so what is left is a well-formed history.
+    /// An exact match is required rather than "the first message from `seq`
+    /// on" because a compaction may have folded that message into a summary
+    /// numbered after it, and cutting at the summary would throw away every
+    /// earlier turn it stands for.
+    ///
+    /// The counter is left where it is. Numbers are never handed out twice,
+    /// so a record that holds both the messages taken back and the ones that
+    /// replaced them can still tell them apart; the gap this leaves only
+    /// makes older messages look a little further away to the retention
+    /// policy, which is true in the sense that matters - more was said since.
+    pub fn rewind_to(&mut self, seq: u64) -> Option<usize> {
+        let at = self
+            .messages
+            .iter()
+            .position(|message| message.seq == Some(seq) && message.role == Role::User)?;
+        let dropped = self.messages.len() - at;
+        self.messages.truncate(at);
+        Some(dropped)
+    }
+
     /// Where a compaction may cut, keeping `keep_recent` messages verbatim, or
     /// `None` when folding what is left would not be worth a model round-trip.
     ///
@@ -609,6 +635,50 @@ mod tests {
 
         assert_eq!(conversation.distance_from_newest(0), 1);
         assert_eq!(conversation.distance_from_newest(1), 0);
+    }
+
+    #[test]
+    fn rewinding_cuts_just_before_the_user_message_and_keeps_counting() {
+        let mut conversation = with_a_tool_turn();
+
+        assert_eq!(
+            conversation.rewind_to(4),
+            Some(2),
+            "`second` and its answer"
+        );
+        assert_eq!(conversation.len(), 4);
+        assert_eq!(conversation.messages()[3].text(), "read it");
+
+        conversation.push(Message::user("again"));
+        assert_eq!(
+            conversation.messages()[4].seq,
+            Some(6),
+            "a number taken back is not handed out again"
+        );
+    }
+
+    #[test]
+    fn rewinding_to_a_message_that_is_not_a_user_message_changes_nothing() {
+        let mut conversation = with_a_tool_turn();
+        let before = conversation.clone();
+
+        assert_eq!(conversation.rewind_to(2), None, "a tool result");
+        assert_eq!(conversation.rewind_to(99), None, "no such message");
+        assert_eq!(conversation, before);
+    }
+
+    #[test]
+    fn rewinding_past_a_compaction_is_refused_rather_than_losing_the_summary() {
+        let mut conversation = with_a_tool_turn();
+        let split = conversation.compaction_split(2).unwrap();
+        conversation.replace_prefix(split, Message::user("SUMMARY"));
+
+        assert_eq!(
+            conversation.rewind_to(0),
+            None,
+            "the first user message was folded into the summary"
+        );
+        assert_eq!(conversation.messages()[0].text(), "SUMMARY");
     }
 
     #[test]

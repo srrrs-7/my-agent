@@ -192,7 +192,28 @@ struct StoredRecord {
     #[serde(default)]
     v: u32,
     #[serde(flatten)]
-    message: Message,
+    entry: StoredEntry,
+}
+
+/// What a line says: a message, or that messages before it were taken back.
+///
+/// Untagged, because a message line is a message with nothing around it (see
+/// the log's `Record`) and stays readable exactly as version 1 wrote it. The
+/// mark is tried first: it is the shape with a field no message has.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredEntry {
+    Rewind { rewind_to: u64 },
+    Message(Message),
+}
+
+impl StoredRecord {
+    fn message(&self) -> Option<&Message> {
+        match &self.entry {
+            StoredEntry::Message(message) => Some(message),
+            StoredEntry::Rewind { .. } => None,
+        }
+    }
 }
 
 /// Rebuilds a conversation from the lines of a log.
@@ -202,6 +223,11 @@ struct StoredRecord {
 /// unreadable line becomes an orphan, and the provider rejects the whole
 /// request on the next turn. Stopping keeps a prefix, and a prefix of a
 /// well-formed history is well formed.
+///
+/// A rewind mark takes back, at that point in the replay, every message
+/// numbered at or after it - the same cut the live session made, since the
+/// replay numbers the messages as the session did. A mark that names no user
+/// message is treated as damage: the record no longer agrees with itself.
 fn replay(session_id: &str, text: &str) -> Conversation {
     let mut conversation = Conversation::new();
 
@@ -210,9 +236,21 @@ fn replay(session_id: &str, text: &str) -> Conversation {
             continue;
         }
         match serde_json::from_str::<StoredRecord>(line) {
-            Ok(record) if (1..=SCHEMA_VERSION).contains(&record.v) => {
-                conversation.push(record.message);
-            }
+            Ok(record) if (1..=SCHEMA_VERSION).contains(&record.v) => match record.entry {
+                StoredEntry::Message(message) => conversation.push(message),
+                StoredEntry::Rewind { rewind_to } => {
+                    if conversation.rewind_to(rewind_to).is_none() {
+                        warn!(
+                            session = session_id,
+                            line = number + 1,
+                            rewind_to,
+                            "the session log rewinds to a message it does not have; resuming \
+                             what came before the mark"
+                        );
+                        break;
+                    }
+                }
+            },
             Ok(record) => {
                 warn!(
                     session = session_id,
@@ -269,8 +307,12 @@ async fn preview(path: &Path) -> String {
     complete
         .lines()
         .filter_map(|line| serde_json::from_str::<StoredRecord>(line).ok())
-        .find(|record| record.message.role == Role::User)
-        .map(|record| text::first_line(&record.message.text(), PREVIEW_BYTES))
+        .find_map(|record| {
+            record
+                .message()
+                .filter(|message| message.role == Role::User)
+                .map(|message| text::first_line(&message.text(), PREVIEW_BYTES))
+        })
         .unwrap_or_default()
 }
 
@@ -456,6 +498,118 @@ mod tests {
 
         assert_eq!(conversation.len(), 1);
         assert_eq!(conversation.messages()[0].text(), "first");
+    }
+
+    /// The log as `FileConversationLog` writes it during a session that was
+    /// rewound once: two turns, the second taken back, a third in its place.
+    async fn rewound(directory: &Path) {
+        let log = FileConversationLog::new(directory);
+        let mut live = Conversation::new();
+        for message in [
+            Message::user("first"),
+            Message::assistant_text("one"),
+            Message::user("second"),
+            Message::assistant_text("two"),
+        ] {
+            live.push(message);
+            log.append("s1", &live.messages()[live.len() - 1..])
+                .await
+                .unwrap();
+        }
+        live.rewind_to(2).unwrap();
+        log.rewind("s1", 2).await.unwrap();
+        for message in [Message::user("third"), Message::assistant_text("three")] {
+            live.push(message);
+            log.append("s1", &live.messages()[live.len() - 1..])
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rewound_session_resumes_without_what_was_taken_back() {
+        let directory = tempfile::tempdir().unwrap();
+        rewound(directory.path()).await;
+
+        let conversation = FileSessionStore::new(directory.path())
+            .load("s1")
+            .await
+            .unwrap();
+
+        let texts: Vec<String> = conversation.messages().iter().map(Message::text).collect();
+        assert_eq!(texts, ["first", "one", "third", "three"]);
+        assert_eq!(
+            conversation.messages()[2].seq,
+            Some(4),
+            "numbered as the live session numbered it, so a later mark still lines up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_rewind_after_a_resume_lines_up_with_the_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        rewound(directory.path()).await;
+        let store = FileSessionStore::new(directory.path());
+        let resumed = store.load("s1").await.unwrap();
+        let third = resumed.messages()[2].seq.unwrap();
+
+        FileConversationLog::new(directory.path())
+            .rewind("s1", third)
+            .await
+            .unwrap();
+
+        let texts: Vec<String> = store
+            .load("s1")
+            .await
+            .unwrap()
+            .messages()
+            .iter()
+            .map(Message::text)
+            .collect();
+        assert_eq!(texts, ["first", "one"]);
+    }
+
+    #[tokio::test]
+    async fn a_record_written_before_rewinds_existed_still_loads() {
+        // Exactly what version 1 wrote: no mark, `v: 1` on every line.
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("s1.jsonl"),
+            concat!(
+                r#"{"v":1,"session":"s1","at":"2026-08-14T00:00:00Z","role":"user","content":[{"type":"text","text":"old"}],"seq":0}"#,
+                "\n",
+                r#"{"v":1,"session":"s1","at":"2026-08-14T00:00:01Z","role":"assistant","content":[{"type":"text","text":"reply"}],"seq":1}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let store = FileSessionStore::new(directory.path());
+
+        let conversation = store.load("s1").await.unwrap();
+        assert_eq!(conversation.len(), 2);
+        assert_eq!(conversation.messages()[1].text(), "reply");
+        assert_eq!(store.list().await.unwrap()[0].preview, "old");
+    }
+
+    #[tokio::test]
+    async fn a_mark_that_names_no_user_message_ends_the_replay_there() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = FileConversationLog::new(directory.path());
+        seeded(
+            directory.path(),
+            "s1",
+            vec![Message::user("first"), Message::assistant_text("one")],
+        )
+        .await;
+        log.rewind("s1", 1).await.unwrap();
+        seeded(directory.path(), "s1", vec![Message::user("after")]).await;
+
+        let conversation = FileSessionStore::new(directory.path())
+            .load("s1")
+            .await
+            .unwrap();
+        assert_eq!(conversation.len(), 2, "{conversation:?}");
+        assert_eq!(conversation.messages()[1].text(), "one");
     }
 
     #[tokio::test]

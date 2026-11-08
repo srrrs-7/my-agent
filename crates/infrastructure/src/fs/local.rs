@@ -165,6 +165,40 @@ impl FileSystem for LocalFileSystem {
         Ok(tokio::fs::try_exists(&target).await.unwrap_or(false))
     }
 
+    async fn remove_file(&self, path: &WorkspacePath) -> Result<(), FsError> {
+        if path.is_root() {
+            return Err(FsError::NotAFile {
+                path: path.display(),
+            });
+        }
+        // Write access, for both the name and what it reaches: deleting a
+        // protected file is at least as much a change to it as writing it.
+        let target = self.guard(path, Some(FileAccess::Write))?;
+
+        // Asked of the name, not of `target`, which has every link resolved
+        // and so can never be one.
+        let named = tokio::fs::symlink_metadata(self.workspace.named(path))
+            .await
+            .map_err(|error| io_error(path, error))?;
+        if named.file_type().is_symlink() || named.is_dir() {
+            return Err(FsError::NotAFile {
+                path: path.display(),
+            });
+        }
+        let metadata = tokio::fs::symlink_metadata(&target)
+            .await
+            .map_err(|error| io_error(path, error))?;
+        if !metadata.is_file() {
+            return Err(FsError::NotAFile {
+                path: path.display(),
+            });
+        }
+
+        tokio::fs::remove_file(&target)
+            .await
+            .map_err(|error| io_error(path, error))
+    }
+
     async fn resolve_real(&self, path: &WorkspacePath) -> Result<WorkspacePath, FsError> {
         // The same resolution a write performs, so the answer names the file
         // the write would reach - not a second, possibly different, opinion.
@@ -537,6 +571,91 @@ mod tests {
             "the write must not create the link target outside the workspace"
         );
         assert!(error.to_string().contains("symbolic link"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn remove_file_deletes_a_file_and_leaves_its_directory() {
+        let fixture = fixture();
+        put(&fixture, "sub/a.txt", "a");
+
+        let path = fixture.root.resolve("sub/a.txt").unwrap();
+        fixture.fs.remove_file(&path).await.unwrap();
+
+        assert!(!fixture.root.as_path().join("sub/a.txt").exists());
+        assert!(fixture.root.as_path().join("sub").is_dir());
+        assert!(matches!(
+            fixture.fs.remove_file(&path).await.unwrap_err(),
+            FsError::NotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_file_refuses_a_directory() {
+        let fixture = fixture();
+        put(&fixture, "sub/a.txt", "a");
+
+        let path = fixture.root.resolve("sub").unwrap();
+        let error = fixture.fs.remove_file(&path).await.unwrap_err();
+        assert!(matches!(error, FsError::NotAFile { .. }), "got {error:?}");
+        assert!(fixture.root.as_path().join("sub/a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn remove_file_refuses_a_protected_file() {
+        let fixture = fixture();
+        put(&fixture, ".env", "AGENT_API_KEY=sk-secret");
+        put(&fixture, ".git/config", "[core]\n");
+
+        for target in [".env", ".git/config"] {
+            let path = fixture.root.resolve(target).unwrap();
+            let error = fixture.fs.remove_file(&path).await.unwrap_err();
+            assert!(denied(&error, FileAccess::Write), "`{target}`: {error:?}");
+            assert!(fixture.root.as_path().join(target).exists(), "{target}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_file_refuses_a_link_and_leaves_what_it_points_at() {
+        let fixture = fixture();
+        put(&fixture, "real.txt", "keep me");
+        link(&fixture, "real.txt", "alias.txt");
+        put(&fixture, ".env", "AGENT_API_KEY=sk-secret");
+        link(&fixture, ".env", "notes.txt");
+
+        let alias = fixture.root.resolve("alias.txt").unwrap();
+        let error = fixture.fs.remove_file(&alias).await.unwrap_err();
+        assert!(matches!(error, FsError::NotAFile { .. }), "got {error:?}");
+        assert!(fixture.root.as_path().join("alias.txt").is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.as_path().join("real.txt")).unwrap(),
+            "keep me"
+        );
+
+        let notes = fixture.root.resolve("notes.txt").unwrap();
+        let error = fixture.fs.remove_file(&notes).await.unwrap_err();
+        assert!(
+            denied(&error, FileAccess::Write),
+            "a link to a protected file is refused by the policy first: {error:?}"
+        );
+        assert!(fixture.root.as_path().join(".env").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_file_refuses_a_file_reached_through_a_link_outside_the_workspace() {
+        let fixture = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("victim.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), fixture.root.as_path().join("escape")).unwrap();
+
+        let path = fixture.root.resolve("escape/victim.txt").unwrap();
+        let error = fixture.fs.remove_file(&path).await.unwrap_err();
+        assert!(
+            matches!(error, FsError::OutsideWorkspace { .. }),
+            "got {error:?}"
+        );
+        assert!(outside.path().join("victim.txt").exists());
     }
 
     #[cfg(unix)]

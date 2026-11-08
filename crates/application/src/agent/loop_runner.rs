@@ -51,6 +51,7 @@ use super::dispatch::{DispatchConfig, ToolDispatcher};
 use super::interrupt::Interrupt;
 use super::plan;
 use super::session::Session;
+use crate::checkpoint::{self, CheckpointError, CheckpointJournal, RestoreReport, RewindReport};
 use crate::error::AppError;
 use crate::tools::registry::ToolRegistry;
 
@@ -111,6 +112,9 @@ pub struct AgentLoop {
     context: Arc<dyn ContextProvider>,
     prompt: Arc<dyn PromptBuilder>,
     log: Arc<dyn ConversationLog>,
+    /// Where the writes of each turn are recorded for `/undo` and `/rewind`.
+    /// `None` leaves both unavailable; see [`Self::with_checkpoints`].
+    checkpoints: Option<Arc<CheckpointJournal>>,
     config: AgentLoopConfig,
 }
 
@@ -154,8 +158,39 @@ impl AgentLoop {
             context,
             prompt,
             log,
+            checkpoints: None,
             config,
         }
+    }
+
+    /// Opens a turn in `journal` each time a user message is pushed, so the
+    /// writes [`CheckpointingTool`](crate::checkpoint::CheckpointingTool)
+    /// records there are grouped by the turn that made them.
+    ///
+    /// A builder rather than a field of [`AgentDependencies`]: it is not a
+    /// port, and a loop without it is complete - it just cannot undo.
+    #[must_use]
+    pub fn with_checkpoints(mut self, journal: Arc<CheckpointJournal>) -> Self {
+        self.checkpoints = Some(journal);
+        self
+    }
+
+    /// Takes back the files the newest turn that wrote any changed, leaving
+    /// the conversation as it is; the model is told on its next turn.
+    pub async fn undo(&self, session: &mut Session) -> Result<RestoreReport, CheckpointError> {
+        let journal = self.checkpoints.as_ref().ok_or(CheckpointError::Disabled)?;
+        checkpoint::undo(journal, session).await
+    }
+
+    /// Takes the files and the conversation back to before the `turns`-th
+    /// newest turn, and marks the log so a resume does the same.
+    pub async fn rewind(
+        &self,
+        session: &mut Session,
+        turns: usize,
+    ) -> Result<RewindReport, CheckpointError> {
+        let journal = self.checkpoints.as_ref().ok_or(CheckpointError::Disabled)?;
+        checkpoint::rewind(journal, self.log.as_ref(), session, turns).await
     }
 
     /// Runs one user turn to completion, mutating `session` in place so a REPL
@@ -188,8 +223,15 @@ impl AgentLoop {
         // smallest thing that can be called a run.
         let limit = self.config.max_iterations.max(1);
 
+        let user_input = session.with_notes(user_input.into());
         session.conversation.push(Message::user(user_input));
         self.record(session, 1).await;
+        if let (Some(journal), Some(seq)) = (
+            &self.checkpoints,
+            session.conversation.messages().last().and_then(|m| m.seq),
+        ) {
+            journal.begin_turn(seq);
+        }
         self.events.emit(AgentEvent::RunStarted {
             session_id: session.id.clone(),
             provider: self.llm.id(),

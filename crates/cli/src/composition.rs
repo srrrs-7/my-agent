@@ -12,6 +12,7 @@ use agent_application::agent::{
     AgentDependencies, AgentLoop, AgentLoopConfig, AppendingPromptBuilder, DefaultPromptBuilder,
     FixedPromptBuilder,
 };
+use agent_application::checkpoint::{CheckpointJournal, CheckpointingTool};
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::exec::RunCommandTool;
 use agent_application::tools::file::{
@@ -21,6 +22,7 @@ use agent_application::tools::plan::TodoWriteTool;
 use agent_application::tools::server::server_tools;
 use agent_application::tools::web::WebFetchTool;
 use agent_domain::model::llm::{GenerationParams, ModelId};
+use agent_domain::model::tool::ToolSafety;
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::conversation_log::{ConversationLog, NullConversationLog};
@@ -75,6 +77,9 @@ pub struct Application {
     /// anything else the process writes out that may echo a secret (an eval
     /// report quoting a check's output).
     pub redactor: Arc<Redactor>,
+    /// What `/undo` and `/rewind` take back. The loop holds it too; `chat`
+    /// clears it when the conversation starts over.
+    pub checkpoints: Arc<CheckpointJournal>,
 }
 
 /// What differs between the callers of [`assemble`].
@@ -213,6 +218,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
             .with_dependency_changes_allowed(settings.allow_dependency_changes),
     );
 
+    let checkpoints = Arc::new(CheckpointJournal::new(file_system.clone()));
     let mut tools = build_tools(
         file_system,
         searcher,
@@ -271,6 +277,9 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     )
     .await?;
 
+    // After every tool is registered, so no command or server tool is
+    // missing from what `/undo` says it did not take back.
+    let tools = checkpoint_writes(tools, &checkpoints);
     // After every tool is registered, so none can be missed. Unconditional:
     // AGENT_ALLOW_DEPENDENCY_CHANGES skips the question, not the report.
     let tools = watch_destructive(tools, &workspace, &events);
@@ -323,7 +332,8 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
             parallel_read_only_tools: settings.agent_loop.parallel_read_only_tools,
             stream: settings.agent_loop.stream,
         },
-    );
+    )
+    .with_checkpoints(checkpoints.clone());
 
     Ok(Application {
         settings,
@@ -336,6 +346,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         notifications,
         tool_servers,
         redactor,
+        checkpoints,
     })
 }
 
@@ -516,6 +527,21 @@ fn build_tools(
         ))))
         .with(timed(Arc::new(GlobTool::new(searcher, workspace))))
         .with(timed(Arc::new(TodoWriteTool::new())))
+}
+
+/// The tools `/undo` has to know about: the two that write files, whose
+/// writes it takes back, and every destructive one, whose calls it lists as
+/// not taken back. Outside the timeout, so a write it cuts off is still
+/// recorded.
+fn checkpoint_writes(tools: ToolRegistry, journal: &Arc<CheckpointJournal>) -> ToolRegistry {
+    tools.map(|definition, tool| {
+        let writes_files = matches!(definition.name.as_str(), "write_file" | "edit_file");
+        if writes_files || definition.safety == ToolSafety::Destructive {
+            CheckpointingTool::wrap(tool, journal.clone())
+        } else {
+            tool
+        }
+    })
 }
 
 /// Every destructive tool, wrapped so that a change it makes to dependency

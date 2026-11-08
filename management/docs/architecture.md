@@ -427,6 +427,7 @@ domain の値オブジェクト `Plan` が持ち、違反は直さず拒否し�
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/notify_e2e.rs`） | 合成ルート → `run` / `chat` → 終了処理。Webhook 通知の到達・中身・終了コード |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/plan_e2e.rs`） | `todo_write` の登録・承認なしでの実行・stderr への表示・`--resume` での復元・`/reset` |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/dependency_gate_e2e.rs`） | 非対話の `auto` で `Cargo.toml` の編集が拒否されファイルが変わらない、`AGENT_ALLOW_DEPENDENCY_CHANGES` で通る |
+| 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/checkpoint_e2e.rs`） | `/undo` でファイルが戻る・手で編集されたファイルは上書きしない・`/rewind` 後の `--resume` で巻き戻した後の会話から始まる |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/interrupt_e2e.rs`） | SIGINT で `run` が 130、`chat` はターンだけ止まりプロンプトに戻る、プロンプト待ちの Ctrl-C は 0 |
 | infrastructure（実プロセス） | `/bin/sh` 製の MCP サーバ（`crates/infrastructure/tests/mcp_sandbox.rs`） | 既定でワークスペースに書けない・自分のディレクトリには書ける・許可外へ接続できない・drop で孫まで止まる・initialize 失敗で起動失敗 |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/mcp_e2e.rs`） | MCP ツールの登録と `destructive` 分類、伏せ字・タイムアウト・依存の検知・承認の各装飾、終了時に孫が残らない、設定の位置による起動失敗 |
@@ -435,4 +436,4 @@ domain の値オブジェクト `Plan` が持ち、違反は直さず拒否し�
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 890 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 925 本）。

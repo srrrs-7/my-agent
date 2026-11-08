@@ -1,6 +1,7 @@
 //! Entities and value objects.
 
 pub mod access;
+pub mod checkpoint;
 pub mod context;
 pub mod conversation;
 pub mod dependency;

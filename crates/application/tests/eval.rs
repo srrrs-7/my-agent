@@ -79,6 +79,17 @@ impl FileSystem for MemoryFileSystem {
         Ok(self.files.lock().unwrap().contains_key(&path.display()))
     }
 
+    async fn remove_file(&self, path: &WorkspacePath) -> Result<(), FsError> {
+        self.files
+            .lock()
+            .unwrap()
+            .remove(&path.display())
+            .map(|_| ())
+            .ok_or_else(|| FsError::NotFound {
+                path: path.display(),
+            })
+    }
+
     /// No links in memory: every path is its own file.
     async fn resolve_real(&self, path: &WorkspacePath) -> Result<WorkspacePath, FsError> {
         Ok(path.clone())

@@ -9,8 +9,8 @@ use agent_application::agent::Session;
 use anyhow::Result;
 
 use crate::args::Resume;
-use crate::commands::tools;
 use crate::commands::turn::run_turn;
+use crate::commands::{checkpoint, tools};
 use crate::composition::Application;
 use crate::ctrl_c::{CtrlC, Sigint, TurnEnd};
 use crate::input::prompt_line;
@@ -21,6 +21,8 @@ use crate::session_id;
 const HELP: &str = "  /reset  start a new conversation\n  \
                       /usage  tokens used so far\n  \
                       /plan   the model's current work plan\n  \
+                      /undo   put back the files the last turn changed (the conversation stays)\n  \
+                      /rewind [n]  take files and conversation back to before the last n turns\n  \
                       /tools  list the tools the model can call\n  \
                       /exit   quit\n  \
                       Ctrl-C  stop the running turn (at the prompt: quit)";
@@ -30,6 +32,9 @@ enum Input {
     Skip,
     Quit,
     Meta(&'static str),
+    Undo,
+    /// `/rewind [n]`, or why its argument was not understood.
+    Rewind(Result<usize, String>),
     Prompt,
 }
 
@@ -73,6 +78,18 @@ async fn repl(app: &Application, resume: Resume) -> Result<ExitCode> {
             Input::Quit => break,
             Input::Meta(command) => {
                 run_meta(app, &mut session, command);
+                continue;
+            }
+            Input::Undo => {
+                checkpoint::undo(app, &mut session).await;
+                continue;
+            }
+            Input::Rewind(Ok(turns)) => {
+                checkpoint::rewind(app, &mut session, turns).await;
+                continue;
+            }
+            Input::Rewind(Err(message)) => {
+                eprintln!("  {message}");
                 continue;
             }
             Input::Prompt => {}
@@ -157,7 +174,26 @@ fn classify(line: &str) -> Input {
         "/usage" => Input::Meta("usage"),
         "/plan" => Input::Meta("plan"),
         "/tools" => Input::Meta("tools"),
-        _ => Input::Prompt,
+        "/undo" => Input::Undo,
+        _ => match line.strip_prefix("/rewind") {
+            Some(rest) if rest.is_empty() || rest.starts_with(' ') => {
+                Input::Rewind(rewind_turns(rest.trim()))
+            }
+            _ => Input::Prompt,
+        },
+    }
+}
+
+fn rewind_turns(argument: &str) -> Result<usize, String> {
+    if argument.is_empty() {
+        return Ok(1);
+    }
+    match argument.parse::<usize>() {
+        Ok(turns) if turns > 0 => Ok(turns),
+        _ => Err(format!(
+            "`/rewind` takes a number of turns, 1 or more (got `{}`)",
+            agent_domain::text::printable(argument)
+        )),
     }
 }
 
@@ -166,6 +202,8 @@ fn run_meta(app: &Application, session: &mut Session, command: &str) {
         "help" => eprintln!("{HELP}"),
         "reset" => {
             *session = Session::new(session_id());
+            // Its turns belong to the conversation that just ended.
+            app.checkpoints.clear();
             eprintln!("  conversation cleared");
         }
         "usage" => eprintln!(
@@ -207,6 +245,19 @@ mod tests {
         assert!(matches!(classify("/reset"), Input::Meta("reset")));
         assert!(matches!(classify("/tools"), Input::Meta("tools")));
         assert!(matches!(classify("/plan"), Input::Meta("plan")));
+        assert!(matches!(classify("/undo"), Input::Undo));
+    }
+
+    #[test]
+    fn rewind_takes_an_optional_positive_count() {
+        assert!(matches!(classify("/rewind"), Input::Rewind(Ok(1))));
+        assert!(matches!(classify("/rewind 3"), Input::Rewind(Ok(3))));
+        assert!(matches!(classify("/rewind 0"), Input::Rewind(Err(_))));
+        assert!(matches!(classify("/rewind two"), Input::Rewind(Err(_))));
+        assert!(
+            matches!(classify("/rewinding the tape"), Input::Prompt),
+            "only the command itself, not a word that starts like it"
+        );
     }
 
     #[test]

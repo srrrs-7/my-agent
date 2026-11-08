@@ -10,6 +10,7 @@
 //! trivially testable.
 
 pub mod agent;
+pub mod checkpoint;
 pub mod error;
 pub mod eval;
 pub mod supply_chain;

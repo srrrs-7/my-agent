@@ -32,6 +32,19 @@ pub trait ConversationLog: Send + Sync {
     /// fails. A session that stops working because its logging broke is worse
     /// than one that is missing a line of its log.
     async fn append(&self, session_id: &str, messages: &[Message]) -> Result<(), FsError>;
+
+    /// Records that the conversation of `session_id` was taken back to just
+    /// before the message numbered `seq` (see
+    /// [`Conversation::rewind_to`](crate::model::conversation::Conversation::rewind_to)).
+    ///
+    /// Appended like a message, never by editing what is already written: the
+    /// messages taken back stay in the record, and a reader replaying it drops
+    /// those numbered `seq` or later when it reaches the mark. Errors are
+    /// treated as for [`Self::append`].
+    ///
+    /// No default: one that wrote nothing would bring back, on the next
+    /// resume, every message the user asked to take back.
+    async fn rewind(&self, session_id: &str, seq: u64) -> Result<(), FsError>;
 }
 
 /// Writes nothing.
@@ -46,6 +59,10 @@ pub struct NullConversationLog;
 #[async_trait]
 impl ConversationLog for NullConversationLog {
     async fn append(&self, _session_id: &str, _messages: &[Message]) -> Result<(), FsError> {
+        Ok(())
+    }
+
+    async fn rewind(&self, _session_id: &str, _seq: u64) -> Result<(), FsError> {
         Ok(())
     }
 }

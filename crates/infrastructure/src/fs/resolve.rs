@@ -43,6 +43,12 @@ impl ResolvedWorkspace {
         &self.real_root
     }
 
+    /// Where `path` sits under the root as configured, nothing resolved -
+    /// for asking about the name itself, such as whether it is a link.
+    pub(crate) fn named(&self, path: &WorkspacePath) -> PathBuf {
+        self.root.absolute(path)
+    }
+
     /// The lexical check alone: the name `requested` was asked for by.
     ///
     /// Run before anything is resolved: `.env -> config/app.env` is refused
