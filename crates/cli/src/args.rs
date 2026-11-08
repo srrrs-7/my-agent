@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -59,6 +59,13 @@ pub enum Command {
         /// The prompt. Quoting is optional; all words are joined.
         #[arg(required = true, trailing_var_arg = true)]
         prompt: Vec<String>,
+
+        /// What stdout carries. `text` is the answer as prose; `json` is one
+        /// JSON object when the turn ends; `stream-json` is one JSON object
+        /// per line, an event each, ending in the same result object. In the
+        /// JSON formats stdout holds JSON only - progress stays on stderr.
+        #[arg(long, value_enum, value_name = "FORMAT", default_value_t = OutputFormat::Text)]
+        output_format: OutputFormat,
     },
 
     /// Interactive session that keeps the conversation history.
@@ -120,10 +127,23 @@ pub struct EvalArgs {
     #[arg(long)]
     pub allow_mcp: bool,
 
-    /// Offer web_fetch when AGENT_WEB_FETCH enables it. Off by default: every
-    /// call is approved in eval, and a fetched URL is a message sent out.
+    /// Offer web_fetch and web_search when AGENT_WEB_FETCH / AGENT_WEB_SEARCH
+    /// enable them. Off by default: every call is approved in eval, and a
+    /// fetched URL or a search query is a message sent out.
     #[arg(long)]
     pub allow_web: bool,
+}
+
+/// What `agent run` writes on stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum OutputFormat {
+    /// The answer as prose, streamed as it arrives.
+    #[default]
+    Text,
+    /// One JSON object, printed when the turn ends.
+    Json,
+    /// One JSON object per line: every event, then the result.
+    StreamJson,
 }
 
 /// Which conversation `agent chat` should start from.
@@ -153,8 +173,12 @@ impl Cli {
     /// `command` so it does not shadow `clap::CommandFactory::command`.
     pub fn resolve_command(&self) -> Command {
         match &self.command {
-            Some(Command::Run { prompt }) => Command::Run {
+            Some(Command::Run {
+                prompt,
+                output_format,
+            }) => Command::Run {
                 prompt: prompt.clone(),
+                output_format: *output_format,
             },
             Some(Command::Chat { resume }) => Command::Chat {
                 resume: resume.clone(),
@@ -195,9 +219,34 @@ mod tests {
     fn joins_a_multi_word_prompt() {
         let cli = Cli::parse_from(["agent", "run", "list", "the", "files"]);
         match cli.resolve_command() {
-            Command::Run { prompt } => assert_eq!(prompt.join(" "), "list the files"),
+            Command::Run {
+                prompt,
+                output_format,
+            } => {
+                assert_eq!(prompt.join(" "), "list the files");
+                assert_eq!(output_format, OutputFormat::Text, "prose stays the default");
+            }
             other => panic!("expected run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_takes_an_output_format() {
+        for (flag, expected) in [
+            ("text", OutputFormat::Text),
+            ("json", OutputFormat::Json),
+            ("stream-json", OutputFormat::StreamJson),
+        ] {
+            match Cli::parse_from(["agent", "run", "--output-format", flag, "hi"]).resolve_command()
+            {
+                Command::Run { output_format, .. } => assert_eq!(output_format, expected),
+                other => panic!("expected run, got {other:?}"),
+            }
+        }
+        assert!(
+            Cli::try_parse_from(["agent", "run", "--output-format", "yaml", "hi"]).is_err(),
+            "an unknown format must be refused, not fall back to prose"
+        );
     }
 
     #[test]

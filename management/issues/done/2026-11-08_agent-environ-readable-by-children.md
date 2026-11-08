@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: medium
 importance: high
 priority: P1
+started: 2026-11-08
+completed: 2026-11-08
 scope: [infrastructure, cli, docs]
 ---
 
@@ -42,14 +44,14 @@ scope: [infrastructure, cli, docs]
 
 ## 達成条件
 
-- [ ] **まず検証する**: `AGENT_SHELL_SANDBOX=confined` の `run_command` と MCP サーバのそれぞれから
+- [x] **まず検証する**: `AGENT_SHELL_SANDBOX=confined` の `run_command` と MCP サーバのそれぞれから
       エージェントの `/proc/<pid>/environ` を読めるかを、実プロセスのテストで確かめ、結果を
       この issue のメモに記録する
-- [ ] 読めない（既に塞がっている）場合: 読めないことを assert するテストを残し、README の
+- [x] 読めない（既に塞がっている）場合: 読めないことを assert するテストを残し、README の
       記述を事実に合わせる
-- [ ] 読める場合: 塞いだうえで、読めないことを同じテストで固定する
-- [ ] `AGENT_SHELL_SANDBOX=none`（封じ込めなし）で読めるかどうかも README に書かれている
-- [ ] `make check` が緑
+- [x] 読める場合: 塞いだうえで、読めないことを同じテストで固定する
+- [x] `AGENT_SHELL_SANDBOX=none`（封じ込めなし）で読めるかどうかも README に書かれている
+- [x] `make check` が緑
 
 ## 優先度の根拠
 

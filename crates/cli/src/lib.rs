@@ -22,6 +22,7 @@ mod ctrl_c;
 pub mod dotenv;
 mod input;
 mod notify;
+pub mod output;
 mod render;
 
 /// Fresh identifier for a conversation.

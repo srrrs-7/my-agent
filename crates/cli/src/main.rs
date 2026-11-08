@@ -12,6 +12,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use agent_cli::args::{Cli, Command};
+use agent_cli::output::JsonLinesSink;
 use agent_cli::{commands, composition, dotenv};
 
 /// How long exit waits for blocking work still running on the runtime.
@@ -118,13 +119,27 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
     // Without a TTY there is nobody to answer an approval prompt, so the gate
     // has to deny rather than block forever.
     let interactive = std::io::stdin().is_terminal();
+
+    // The JSON formats narrate to their own sink, which has to be in place
+    // before the agent is built - and must report a failure to build it.
+    if let Some(Command::Run {
+        prompt,
+        output_format,
+    }) = &cli.command
+    {
+        if let Some(output) = JsonLinesSink::stdout(*output_format, cli.verbose, cli.no_color) {
+            let prompt = prompt.join(" ");
+            return commands::run::execute_structured(&cli, interactive, output, prompt).await;
+        }
+    }
+
     let app = composition::build(&cli, interactive).await?;
 
     let command = cli.resolve_command();
     let resume = command.resume();
 
     Ok(match command {
-        Command::Run { prompt } => commands::run::execute(&app, prompt.join(" ")).await?,
+        Command::Run { prompt, .. } => commands::run::execute(&app, prompt.join(" ")).await?,
         Command::Chat { .. } => commands::chat::execute(&app, resume).await?,
         Command::Sessions { delete } => {
             match delete {

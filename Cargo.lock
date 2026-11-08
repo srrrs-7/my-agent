@@ -28,6 +28,7 @@ dependencies = [
  "async-trait",
  "clap",
  "dotenvy",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

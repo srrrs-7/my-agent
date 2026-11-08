@@ -46,6 +46,8 @@
 | `ConversationLog` | `FileConversationLog`, `NullConversationLog`（会話の記録。追記のみ） |
 | `SessionStore` | `FileSessionStore`（同じ記録の読み出し・一覧・削除） |
 | `Notifier` | `WebhookNotifier`（ntfy / Slack / json・既定無効）, `NullNotifier`。発火は cli のみ（承認ゲートと run / chat） |
+| `RemoteApprover` | `NtfyRemoteApprover`（返信トピックを外向きに購読・起動時に匿名アクセス不可を実証）, `NullRemoteApprover`。競合は `CliApprovalGate` の中 |
+| `WebSearcher` | `BraveSearcher`（既定無効・Network 区分で毎回承認） |
 
 `LlmProvider` が合成パターンになっている点が重要です。ルータもフェイルオーバーもリトライもそれ自体が
 `LlmProvider` なので、呼び出し側は積み方の変化を認識しません。積み順は外側から
@@ -113,6 +115,17 @@ Arc<dyn LlmProvider>
 - ツール活動・警告・承認プロンプト → **stderr**
 
 `agent run "..." > answer.md` が期待どおり動くのはこの分離のためです。壊さないでください。
+
+**`agent run --output-format json|stream-json` では stdout は JSON だけ**です（`cli/src/output/`）。
+散文もストリーミングの断片も stdout に出しません — 回答は結果オブジェクトの `final_text` に入ります。
+stderr はそのまま（`TerminalRenderer` から散文のイベントだけを除いて転送）。
+JSON の形は cli 側の DTO（`output/dto.rs`）が決め、**`AgentEvent` やドメイン型に `Serialize` を付けません**。
+ドメインの改名が公開スキーマを黙って変えないためです。全行に `"v":1` が付きます。
+起動失敗・プロバイダの失敗・中断を含め、どの終わり方でも最後に `"type":"result"` の 1 行を出します。
+
+JSON 内の文字列（モデルの散文・ツール引数・要約）は**値を変えず**に渡します。`printable` は掛けず、
+代わりに `is_unprintable` な文字を `\uXXXX` でエスケープして書きます（パース後の値は同一、
+生のバイトは端末を書き換えない）。
 
 stderr に出す文字列のうち、モデルやサーバ（MCP サーバ・LLM プロバイダ・ファイルの中身）が決めたもの
 — ツール引数、結果の要約、計画の項目、ファイル名、拒否理由など — は、**出口で一度だけ**

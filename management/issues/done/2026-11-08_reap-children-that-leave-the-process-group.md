@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: medium
 importance: high
 priority: P1
+started: 2026-11-08
+completed: 2026-11-08
 scope: [infrastructure, cli, docs]
 ---
 
@@ -46,17 +48,17 @@ scope: [infrastructure, cli, docs]
 
 ## 達成条件
 
-- [ ] `setsid` で抜けた孫が `run_command` の完了時点で生存していないことを、実プロセスを起動する
+- [x] `setsid` で抜けた孫が `run_command` の完了時点で生存していないことを、実プロセスを起動する
       テストで固定する（`crates/infrastructure/tests/sandbox.rs`）
-- [ ] `setsid sh -c 'sleep N; echo x >> Cargo.toml' &` を実行するコマンドの後、N 秒待っても
+- [x] `setsid sh -c 'sleep N; echo x >> Cargo.toml' &` を実行するコマンドの後、N 秒待っても
       `Cargo.toml` が変わらないことを固定する（依存ファイル検知の前提）。sleep を使わずに
       書けるならそれを優先する（`testing.md` の禁止事項）
-- [ ] MCP サーバの子孫が `setsid` で抜けても、サーバ停止時に止まることを固定する
+- [x] MCP サーバの子孫が `setsid` で抜けても、サーバ停止時に止まることを固定する
       （`crates/infrastructure/tests/mcp_sandbox.rs`）
-- [ ] 機構が得られない環境での振る舞いが決まっており、`agent doctor` に表示される
-- [ ] README §5 の「残余リスク」から該当項目が消えるか、残る範囲（例: エージェント自身が
+- [x] 機構が得られない環境での振る舞いが決まっており、`agent doctor` に表示される
+- [x] README §5 の「残余リスク」から該当項目が消えるか、残る範囲（例: エージェント自身が
       SIGKILL された場合）だけに書き換わっている
-- [ ] `make check` が緑
+- [x] `make check` が緑
 
 ## 優先度の根拠
 

@@ -71,6 +71,9 @@ const UNCHECKED: &str =
 const MAX_SUMMARY_BYTES: usize = 160;
 /// Longest string argument shown inside that summary.
 const MAX_ARGUMENT_BYTES: usize = 60;
+/// Network calls (a URL, a search query) are messages that leave the machine,
+/// so the human approving one sees the whole message, not its first 60 bytes.
+const MAX_NETWORK_SUMMARY_BYTES: usize = 1024;
 
 /// Destructive calls get a far larger budget, because they are approved *on
 /// the strength of their arguments*. A shell line the human cannot read to the
@@ -396,6 +399,7 @@ impl ToolDispatcher {
 fn summarize(call: &ToolCall, safety: ToolSafety) -> String {
     let (summary_budget, argument_budget) = match safety {
         ToolSafety::Destructive => (MAX_DESTRUCTIVE_SUMMARY_BYTES, MAX_DESTRUCTIVE_SUMMARY_BYTES),
+        ToolSafety::Network => (MAX_NETWORK_SUMMARY_BYTES, MAX_NETWORK_SUMMARY_BYTES),
         _ => (MAX_SUMMARY_BYTES, MAX_ARGUMENT_BYTES),
     };
 

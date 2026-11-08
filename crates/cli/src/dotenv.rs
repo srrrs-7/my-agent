@@ -52,6 +52,11 @@ pub const DENIED: &[&str] = &[
     // would choose whose account every query is sent under.
     "AGENT_WEB_SEARCH_API_KEY",
     "AGENT_NOTIFY_WEBHOOK_URL",
+    // Who may answer an approval from a phone: a token or reply topic from
+    // `.env` could hand that to whoever planted it.
+    "AGENT_NOTIFY_NTFY_TOKEN",
+    "AGENT_NOTIFY_NTFY_REPLY_TOPIC",
+    "AGENT_NOTIFY_NTFY_REPLY_TOKEN",
     // What the model is told to do, from files outside the workspace.
     "AGENT_GLOBAL_INSTRUCTIONS",
     "AGENT_SYSTEM_PROMPT_FILE",
