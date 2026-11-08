@@ -5,6 +5,7 @@ pub mod local;
 pub(crate) mod resolve;
 pub mod scratch;
 pub mod search;
+pub(crate) mod walk;
 
 pub use context::WorkspaceContextProvider;
 pub use local::LocalFileSystem;

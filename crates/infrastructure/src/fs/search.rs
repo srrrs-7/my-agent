@@ -24,11 +24,11 @@ use agent_domain::model::access::FileAccess;
 use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery};
 use async_trait::async_trait;
-use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use regex::RegexBuilder;
 
 use super::resolve::ResolvedWorkspace;
+use super::walk::workspace_walker;
 
 /// Files larger than this are skipped: a match inside a multi-megabyte blob is
 /// not useful to the model and reading it is pure latency.
@@ -82,14 +82,7 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
         real_base,
     } = walk_start(root, &query.root)?;
 
-    let mut builder = WalkBuilder::new(&base);
-    builder
-        .hidden(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        // Apply ignore rules even when the workspace is not a git checkout.
-        .require_git(false)
-        .follow_links(false);
+    let mut builder = workspace_walker(&base);
 
     if let Some(glob) = &query.include_glob {
         let mut overrides = OverrideBuilder::new(&base);
@@ -207,16 +200,12 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
             .map_err(|error| FsError::InvalidPattern(format!("glob: {error}")))?
     };
 
-    let mut builder = WalkBuilder::new(&base);
+    let mut builder = workspace_walker(&base);
     builder
         // Hidden entries are walked only when the pattern names one: `*.yml`
         // should not surface every file under `.github/` and `.cargo/`, but
         // `.github/**/*.yml` has to be able to match at all.
         .hidden(!names_a_hidden_entry(pattern))
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
-        .follow_links(false)
         // Git's object store is never what a path search is looking for, and
         // walking it is most of the cost once hidden entries are included.
         .filter_entry(|entry| entry.file_name() != ".git");
