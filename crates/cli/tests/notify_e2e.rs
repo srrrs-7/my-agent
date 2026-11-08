@@ -58,6 +58,9 @@ impl Agent {
         let workspace = tempfile::tempdir().expect("a temporary workspace");
         let env = [
             ("AGENT_WORKSPACE", workspace.path().to_str().unwrap()),
+            // The mock speaks the OpenAI protocol; with an explicit address
+            // `openai` needs no key.
+            ("AGENT_PROVIDER", "openai"),
             ("AGENT_BASE_URL", llm.base_url()),
             ("AGENT_MODEL", "mock"),
             // The mock replies with whole JSON bodies, not event streams.

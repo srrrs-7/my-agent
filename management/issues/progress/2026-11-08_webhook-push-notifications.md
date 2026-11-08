@@ -52,9 +52,10 @@ ntfy / Slack / 汎用 JSON の送信形式を選べる。URL を設定しなけ�
 - [x] `agent run` で、プロセス終了前に完了通知の送信が（タイムアウト付きで）終わる
 - [x] ntfy / Slack / 汎用 JSON それぞれで実際に送出されるリクエストを、
       `agent-test-support` のモックサーバで固定するテストがある
-- [ ] Webhook URL は秘密情報として扱われ、`agent doctor` やログでマスクされる
-- [ ] `.env.example` と `README.md` に設定と、本文が外部サーバに出ることの注意が書かれている
-- [ ] `make check` が緑
+- [x] Webhook URL は秘密情報として扱われ、`agent doctor` やログでマスクされる
+- [x] `README.md`（§3・§8）に設定と、本文が外部サーバに出ることの注意が書かれている
+      （`.env.example` は最小構成化により必須 3 項目のみ。2026-11-08 方針変更）
+- [x] `make check` が緑
 
 ## 優先度の根拠
 

@@ -67,7 +67,7 @@ make ask Q="..."
 
 | 変更 | 一緒に見るもの |
 |---|---|
-| 環境変数の追加・変更 | `.env.example`, `README.md` §8 |
+| 環境変数の追加・変更 | `README.md` §8（`.env.example` は必須項目が変わるときだけ） |
 | 層構成・設計判断の変更 | `management/docs/architecture.md`, `.claude/rules/architecture.md` |
 | ツールの追加・削除 | `README.md` §4 の表 |
 | テスト数の増減 | `README.md` §7, `management/docs/architecture.md` §5 |

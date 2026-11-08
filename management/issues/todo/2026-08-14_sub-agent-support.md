@@ -33,7 +33,7 @@ scope: [domain, application, cli, docs]
   §3・§4（ツール失敗の扱い・全呼び出しへの応答）は子ループにもそのまま適用
 - **承認**: 子のツール実行も**同じ** `ApprovalGate` を通すこと。子経由で承認を迂回できたら
   ゲートの意味がない
-- **設定・ドキュメント**: `AGENT_MAX_SUBAGENT_DEPTH` 等、`.env.example`、`README.md` §4
+- **設定・ドキュメント**: `AGENT_MAX_SUBAGENT_DEPTH` 等（既定値を持たせ、`README.md` §8 の変数表に記載）、`README.md` §4
 - **利用者への影響**: 新ツール追加。既存の動作は変わらない
 
 ## 達成条件

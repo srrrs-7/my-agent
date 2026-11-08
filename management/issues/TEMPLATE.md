@@ -23,7 +23,7 @@ scope: [<domain | application | infrastructure | cli | test-support | docs | ops
 
 - **クレート**: <crates/... 触る範囲。無ければ「なし」>
 - **不変条件**: <.claude/rules/invariants.md のどれに触れるか。無ければ「なし」>
-- **設定・ドキュメント**: <.env.example / README.md §n / management/docs/... >
+- **設定・ドキュメント**: <README.md §n（新しい設定は §8 の変数表）/ management/docs/... 。`.env.example` は必須項目が変わるときだけ>
 - **利用者への影響**: <破壊的変更の有無。既存の .env や CLI 引数が動かなくなるか>
 
 ## 達成条件

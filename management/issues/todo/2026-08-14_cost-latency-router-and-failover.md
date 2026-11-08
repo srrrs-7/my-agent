@@ -31,7 +31,7 @@ scope: [infrastructure, docs]
   `RouteDecision` で表現力が足りるかだけ要確認
 - **不変条件**: なし
 - **設定・ドキュメント**: `AGENT_ROUTER` の値追加（`failover` / `cost` など）、
-  プロバイダ別メタデータ（コスト・優先順位）の環境変数、`.env.example`、README §6・§8
+  プロバイダ別メタデータ（コスト・優先順位）の環境変数（既定値を持たせる）、README §6・§8
 - **利用者への影響**: なし（既存の `static` / `model-prefix` はそのまま。追加のみ）
 
 ## 達成条件

@@ -32,7 +32,7 @@ scope: [ops, docs]
 - **クレート**: なし（想定）。実行して初めて分かる不具合が出た場合のみ
   `infrastructure/src/llm/openai.rs` の写像に手が入る可能性がある
 - **不変条件**: なし
-- **設定・ドキュメント**: `.env.example`（動作確認済みモデルの例）、`README.md` §2
+- **設定・ドキュメント**: `README.md` §2（動作確認済みモデルの例）。`.env.example` の `AGENT_MODEL` の例も、確認済みのものに揃える
 - **利用者への影響**: なし（確認作業。破壊的変更は伴わない）
 
 ## 達成条件
@@ -43,7 +43,7 @@ scope: [ops, docs]
 - [ ] `make ask Q="README.md の 1 行目を教えて"` が `read_file` を呼んで正しく答える
 - [ ] 書き込み系（`write_file` / `edit_file`）の承認プロンプトが出て、`n` で拒否したとき
       モデルがその旨を認識した応答を返す
-- [ ] 動作を確認したモデル名を `README.md` §2 と `.env.example` に記載する
+- [ ] 動作を確認したモデル名を `README.md` §2 に記載する（`.env.example` は必須 3 項目のまま。`AGENT_MODEL` の例だけ確認済みのものに揃える）
 - [ ] 途中で見つかった実装の不具合は別 issue に切り出す（この issue では直さない）
 - [ ] `make check` が緑
 

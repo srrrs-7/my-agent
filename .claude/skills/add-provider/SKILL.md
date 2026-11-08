@@ -9,7 +9,7 @@ argument-hint: [vendor-name]
 $ARGUMENTS
 
 **まず確認**: そのベンダは OpenAI 互換の `/chat/completions` を話しますか。
-話すなら**コードは不要**です。`AGENT_BASE_URL` と `AGENT_MODEL` を設定するだけで動きます
+話すなら**コードは不要**です。`AGENT_PROVIDER=openai` に `AGENT_BASE_URL` と `AGENT_MODEL` を設定するだけで動きます
 （Ollama, vLLM, LM Studio, llama.cpp, OpenRouter, Groq, Together はこれに該当）。
 
 独自プロトコルの場合だけ以下に進みます。参考実装: `crates/infrastructure/src/llm/anthropic.rs`。
@@ -44,9 +44,12 @@ impl LlmProvider for XxxProvider {
 
 ## 2. 設定を追加する
 
-1. `crates/infrastructure/src/config/kinds.rs` の `ProviderKind` に variant を足し、
-   `as_str` / `FromStr` / `default_base_url` / `default_api_key_env` を全て埋める
-   （`FromStr` は表記ゆれを許容し、エラーメッセージに受理可能な値を列挙する）
+1. `crates/infrastructure/src/config/kinds.rs` の `ProviderKind`（プロトコル）と
+   `ProviderPreset`（設定に書く名前 = プロトコル + 既定の接続先）に variant を足し、
+   `as_str` / `FromStr` / `kind` / `default_base_url` / `vendor_api_key_env` /
+   `requires_api_key` / `model_hint` を全て埋める
+   （`FromStr` は表記ゆれを許容し、エラーメッセージに受理可能な値を列挙する。
+   `vendor_api_key_env` は**そのベンダ自身のキー**だけを返す。別ベンダのキーを流用しない）
 2. `crates/infrastructure/src/llm/factory.rs` の `build_client` に分岐を追加
 3. `crates/infrastructure/src/llm/mod.rs` で `pub use`
 
@@ -66,8 +69,9 @@ API キー必須のベンダなら、`provider_from_env` で**設定読み込み
 
 ## 4. ドキュメントを更新する
 
-- `.env.example` — 接続例をコメントで追加
-- `README.md` §2（接続例）と §8（変数表）
+- `README.md` §2（接続例）と §8（変数表。`AGENT_PROVIDER` の取りうる値と既定の接続先）
+- `.env.example` は必須 3 項目（`AGENT_PROVIDER` / `AGENT_API_KEY` / `AGENT_MODEL`）だけの雛形です。
+  先頭のコメント `# openai | ollama | anthropic` に値を足す以外は触りません
 
 ## 5. 確認する
 

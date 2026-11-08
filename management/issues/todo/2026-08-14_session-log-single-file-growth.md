@@ -45,7 +45,7 @@ scope: [domain, infrastructure, docs]
   - `cli` … 設定が増えるなら結線
 - **不変条件**: **§4 すべての `tool_call` に結果を返す** — 途中から読み始める案・
   古い行を落とす案のいずれも、切り口が `tool_call` と `tool_result` の間に落ちうる
-- **設定・ドキュメント**: `.env.example`、`README.md` §3 / §4 / §8、
+- **設定・ドキュメント**: `README.md` §3 / §4 / §8（新しい設定は §8 の変数表）、
   `management/docs/architecture.md` §3.2.3
 - **利用者への影響**: 案によっては**過去の記録が消える**。`session-log-rotation` で
   入れた「消えるときは分かる」の扱いと揃える

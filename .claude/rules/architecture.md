@@ -89,10 +89,16 @@ Arc<dyn LlmProvider>
 ## 設定
 
 `Settings::from_source(&dyn EnvSource)` が本体、`from_env()` は薄いラッパです。
-新しい設定項目を足すときは 3 箇所を同時に更新します。
+新しい設定項目を足すときは 2 箇所を同時に更新します。
 
 1. `infrastructure/src/config/` — 読み取りと既定値
-2. `.env.example` — コメント付きで記載
-3. `README.md` §8 — 変数表
+2. `README.md` §8 — 変数表。**全変数の説明・注意書きの唯一の置き場**です
+
+`.env.example` は必須項目（`AGENT_PROVIDER` / `AGENT_API_KEY` / `AGENT_MODEL`）だけを載せる
+最小の雛形です。**必須項目が変わるときだけ**更新します。任意の設定を足しても触りません。
+
+必須項目を増やさないでください。新しい設定には既定値を持たせます。接続先の既定値は
+プロバイダ名から決まります（`config/kinds.rs` の `ProviderPreset`。`ProviderKind` は wire
+プロトコルで、`ollama` と `openai` を区別しません）。
 
 `make exec CMD="grep -rho 'AGENT_[A-Z_]*' crates/ | sort -u"` で実装との差分を確認できます。

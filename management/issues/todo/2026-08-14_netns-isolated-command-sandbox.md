@@ -43,7 +43,7 @@ scope: [infrastructure, docs]
 
 - **クレート**: `crates/infrastructure/src/exec/`（`linux.rs` と並ぶ新モジュール）
 - **不変条件**: `invariants.md` §2 の子プロセス節（「黙って弱くならない」を維持すること）
-- **設定・ドキュメント**: `.env.example` の `AGENT_SHELL_SANDBOX`、README §5 の表、
+- **設定・ドキュメント**: `README.md` §8 の `AGENT_SHELL_SANDBOX`、README §5 の表、
   `management/docs/architecture.md` §3.2.1
 - **利用者への影響**: 破壊的変更なし。既定は `confined` のまま
 

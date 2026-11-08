@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use agent_domain::model::llm::{ModelId, ProviderId};
 
-use super::kinds::ProviderKind;
+use super::kinds::ProviderPreset;
 use super::{ConfigError, ProviderSettings};
 
 /// Read-only view of a set of environment variables.
@@ -170,36 +170,54 @@ pub(super) fn provider_from_env(
         Some(alias) => (ProviderId::new(alias), Keys::for_alias(alias)),
     };
 
-    let kind: ProviderKind = reader.parsed(&keys.kind, ProviderKind::OpenAiCompatible)?;
+    // Required, with no default. Each preset sends the conversation to a
+    // different place - a local container or a vendor's API - and that choice
+    // is too consequential to make on the user's behalf.
+    let preset: ProviderPreset = reader.optional(&keys.kind)?.ok_or_else(|| {
+        ConfigError::missing(
+            &keys.kind,
+            format!(
+                "set it to `anthropic | openai | ollama`, e.g. `{}=anthropic`",
+                keys.kind
+            ),
+        )
+    })?;
+    let kind = preset.kind();
 
-    let base_url = reader
-        .string(&keys.base_url)
-        .unwrap_or_else(|| kind.default_base_url().to_string())
+    let explicit_base_url = reader.string(&keys.base_url);
+    let endpoint_overridden = explicit_base_url.is_some();
+    let base_url = explicit_base_url
+        .unwrap_or_else(|| preset.default_base_url().to_string())
         .trim_end_matches('/')
         .to_string();
 
-    let api_key = reader
-        .string(&keys.api_key)
-        .or_else(|| reader.string(kind.default_api_key_env()));
+    let api_key = reader.string(&keys.api_key).or_else(|| {
+        preset
+            .vendor_api_key_env()
+            .and_then(|key| reader.string(key))
+    });
 
     let model = reader
         .string(&keys.model)
         .map(ModelId::new)
-        .ok_or_else(|| {
-            ConfigError::missing(
-                &keys.model,
-                format!(
-                    "pick a model served by {base_url}, e.g. `qwen3:8b` for Ollama or \
-                 `claude-sonnet-5` for Anthropic"
-                ),
-            )
-        })?;
+        .ok_or_else(|| ConfigError::missing(&keys.model, preset.model_hint(&base_url)))?;
 
-    if kind == ProviderKind::Anthropic && api_key.is_none() {
-        return Err(ConfigError::missing(
-            &keys.api_key,
-            "the Anthropic API requires an API key".to_string(),
-        ));
+    if api_key.is_none() && preset.requires_api_key(endpoint_overridden) {
+        // Only presets that require a key reach here, and each of those has a
+        // vendor variable; the empty fallback keeps the hint total regardless.
+        let vendor_key = preset.vendor_api_key_env().unwrap_or_default();
+        let hint = match preset {
+            ProviderPreset::Anthropic => {
+                format!("the Anthropic API requires an API key (`{vendor_key}` is also read)")
+            }
+            _ => format!(
+                "{base_url} requires an API key (`{vendor_key}` is also read). For a compatible \
+                 server that takes none, set `{}` to its address; for a local Ollama, \
+                 set `{}=ollama`",
+                keys.base_url, keys.kind
+            ),
+        };
+        return Err(ConfigError::missing(&keys.api_key, hint));
     }
 
     Ok(ProviderSettings {
@@ -217,6 +235,7 @@ pub(super) fn provider_from_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::kinds::ProviderKind;
 
     fn read(pairs: &[(&str, &str)]) -> MapEnv {
         MapEnv::new(pairs)
@@ -246,15 +265,15 @@ mod tests {
 
     #[test]
     fn single_provider_uses_the_unaliased_keys() {
-        let env = read(&[("AGENT_MODEL", "qwen3:8b")]);
+        let env = read(&[("AGENT_PROVIDER", "ollama"), ("AGENT_MODEL", "qwen3:8b")]);
         let provider = provider_from_env(&Reader::new(&env), None).unwrap();
 
         assert_eq!(provider.id.as_str(), "default");
         assert_eq!(provider.kind, ProviderKind::OpenAiCompatible);
         assert_eq!(provider.model.as_str(), "qwen3:8b");
         assert_eq!(
-            provider.base_url, "http://localhost:11434/v1",
-            "Ollama by default"
+            provider.base_url, "http://ollama:11434/v1",
+            "the compose Ollama service by default"
         );
         assert_eq!(provider.max_tokens_field, "max_tokens");
     }
@@ -276,6 +295,7 @@ mod tests {
     #[test]
     fn trailing_slashes_are_stripped_from_the_base_url() {
         let env = read(&[
+            ("AGENT_PROVIDER", "ollama"),
             ("AGENT_MODEL", "m"),
             ("AGENT_BASE_URL", "http://host:1234/v1/"),
         ]);
@@ -286,6 +306,7 @@ mod tests {
     #[test]
     fn falls_back_to_the_vendor_api_key_variable() {
         let env = read(&[
+            ("AGENT_PROVIDER", "openai"),
             ("AGENT_MODEL", "gpt-4.1"),
             ("OPENAI_API_KEY", "sk-fallback"),
         ]);
@@ -296,6 +317,7 @@ mod tests {
     #[test]
     fn an_explicit_key_wins_over_the_vendor_variable() {
         let env = read(&[
+            ("AGENT_PROVIDER", "openai"),
             ("AGENT_MODEL", "gpt-4.1"),
             ("AGENT_API_KEY", "sk-explicit"),
             ("OPENAI_API_KEY", "sk-fallback"),
@@ -306,7 +328,7 @@ mod tests {
 
     #[test]
     fn a_missing_model_is_reported_with_a_hint() {
-        let env = read(&[]);
+        let env = read(&[("AGENT_PROVIDER", "ollama")]);
         let error = provider_from_env(&Reader::new(&env), None).unwrap_err();
         assert!(error.to_string().contains("AGENT_MODEL"), "{error}");
         assert!(
@@ -323,5 +345,238 @@ mod tests {
         ]);
         let error = provider_from_env(&Reader::new(&env), None).unwrap_err();
         assert!(error.to_string().contains("AGENT_API_KEY"), "{error}");
+    }
+
+    #[test]
+    fn an_unset_provider_fails_at_startup_and_names_the_variable() {
+        let error = provider_from_env(&Reader::new(&read(&[("AGENT_MODEL", "m")])), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("AGENT_PROVIDER is not set"),
+            "names the variable to set: {error}"
+        );
+        for name in ["anthropic", "openai", "ollama"] {
+            assert!(error.contains(name), "lists `{name}` as a choice: {error}");
+        }
+
+        let error = provider_from_env(
+            &Reader::new(&read(&[("AGENT_PROVIDER_LOCAL_MODEL", "m")])),
+            Some("local"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("AGENT_PROVIDER_LOCAL_KIND is not set"),
+            "an alias needs its kind just the same: {error}"
+        );
+    }
+
+    #[test]
+    fn ollama_never_borrows_the_openai_key() {
+        let env = read(&[
+            ("AGENT_PROVIDER", "ollama"),
+            ("AGENT_MODEL", "qwen3:8b"),
+            ("OPENAI_API_KEY", "sk-real-openai-key"),
+        ]);
+        let provider = provider_from_env(&Reader::new(&env), None).unwrap();
+        assert_eq!(
+            provider.api_key, None,
+            "an OpenAI key must not be sent to the Ollama address"
+        );
+
+        let env = read(&[
+            ("AGENT_PROVIDER_LOCAL_KIND", "ollama"),
+            ("AGENT_PROVIDER_LOCAL_MODEL", "qwen3:8b"),
+            ("OPENAI_API_KEY", "sk-real-openai-key"),
+        ]);
+        let provider = provider_from_env(&Reader::new(&env), Some("local")).unwrap();
+        assert_eq!(provider.api_key, None, "nor through an alias");
+    }
+
+    #[test]
+    fn ollama_sends_a_key_only_when_given_explicitly() {
+        let env = read(&[
+            ("AGENT_PROVIDER", "ollama"),
+            ("AGENT_MODEL", "qwen3:8b"),
+            ("AGENT_API_KEY", "proxy-token"),
+            ("OPENAI_API_KEY", "sk-real-openai-key"),
+        ]);
+        let provider = provider_from_env(&Reader::new(&env), None).unwrap();
+        assert_eq!(provider.api_key.as_deref(), Some("proxy-token"));
+
+        let env = read(&[
+            ("AGENT_PROVIDER_LOCAL_KIND", "ollama"),
+            ("AGENT_PROVIDER_LOCAL_MODEL", "qwen3:8b"),
+            ("AGENT_PROVIDER_LOCAL_API_KEY", "proxy-token"),
+        ]);
+        let provider = provider_from_env(&Reader::new(&env), Some("local")).unwrap();
+        assert_eq!(provider.api_key.as_deref(), Some("proxy-token"));
+    }
+
+    fn provider(pairs: &[(&str, &str)], alias: Option<&str>) -> ProviderSettings {
+        provider_from_env(&Reader::new(&read(pairs)), alias)
+            .unwrap_or_else(|error| panic!("{pairs:?} should configure a provider: {error}"))
+    }
+
+    fn rejection(pairs: &[(&str, &str)], alias: Option<&str>) -> String {
+        match provider_from_env(&Reader::new(&read(pairs)), alias) {
+            Ok(provider) => panic!("{pairs:?} should be rejected, got {provider:?}"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn anthropic_needs_only_provider_key_and_model() {
+        let provider = provider(
+            &[
+                ("AGENT_PROVIDER", "anthropic"),
+                ("AGENT_API_KEY", "sk-ant-x"),
+                ("AGENT_MODEL", "claude-sonnet-5-5"),
+            ],
+            None,
+        );
+        assert_eq!(provider.kind, ProviderKind::Anthropic);
+        assert_eq!(provider.base_url, "https://api.anthropic.com");
+        assert_eq!(provider.api_key.as_deref(), Some("sk-ant-x"));
+    }
+
+    #[test]
+    fn openai_needs_only_provider_key_and_model() {
+        let provider = provider(
+            &[
+                ("AGENT_PROVIDER", "openai"),
+                ("AGENT_API_KEY", "sk-x"),
+                ("AGENT_MODEL", "some-openai-model"),
+            ],
+            None,
+        );
+        assert_eq!(provider.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(
+            provider.base_url, "https://api.openai.com/v1",
+            "`openai` means the OpenAI API, not a local port"
+        );
+    }
+
+    #[test]
+    fn ollama_needs_only_provider_and_model() {
+        let provider = provider(
+            &[("AGENT_PROVIDER", "ollama"), ("AGENT_MODEL", "qwen3:8b")],
+            None,
+        );
+        assert_eq!(provider.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(provider.base_url, "http://ollama:11434/v1");
+        assert_eq!(provider.api_key, None);
+    }
+
+    #[test]
+    fn openai_without_a_key_fails_at_startup_and_names_the_key() {
+        let error = rejection(&[("AGENT_PROVIDER", "openai"), ("AGENT_MODEL", "m")], None);
+        assert!(
+            error.starts_with("AGENT_API_KEY is not set"),
+            "names the variable to set: {error}"
+        );
+        assert!(
+            error.contains("AGENT_BASE_URL"),
+            "says how to reach a keyless server instead: {error}"
+        );
+    }
+
+    #[test]
+    fn a_compatible_server_at_an_explicit_address_needs_no_key() {
+        let provider = provider(
+            &[
+                ("AGENT_PROVIDER", "openai"),
+                ("AGENT_BASE_URL", "http://vllm:8000/v1"),
+                ("AGENT_MODEL", "m"),
+            ],
+            None,
+        );
+        assert_eq!(provider.base_url, "http://vllm:8000/v1");
+        assert_eq!(provider.api_key, None);
+    }
+
+    #[test]
+    fn an_explicit_base_url_always_wins() {
+        for name in ["openai", "ollama", "anthropic"] {
+            let provider = provider(
+                &[
+                    ("AGENT_PROVIDER", name),
+                    ("AGENT_BASE_URL", "http://proxy:9000/v1"),
+                    ("AGENT_API_KEY", "k"),
+                    ("AGENT_MODEL", "m"),
+                ],
+                None,
+            );
+            assert_eq!(provider.base_url, "http://proxy:9000/v1", "for `{name}`");
+        }
+    }
+
+    #[test]
+    fn aliases_resolve_endpoints_and_keys_by_the_same_rules() {
+        let openai = provider(
+            &[
+                ("AGENT_PROVIDER_GPT_KIND", "openai"),
+                ("AGENT_PROVIDER_GPT_API_KEY", "sk-x"),
+                ("AGENT_PROVIDER_GPT_MODEL", "m"),
+            ],
+            Some("gpt"),
+        );
+        assert_eq!(openai.base_url, "https://api.openai.com/v1");
+
+        let local = provider(
+            &[
+                ("AGENT_PROVIDER_LOCAL_KIND", "ollama"),
+                ("AGENT_PROVIDER_LOCAL_MODEL", "qwen3:8b"),
+            ],
+            Some("local"),
+        );
+        assert_eq!(local.base_url, "http://ollama:11434/v1");
+        assert_eq!(local.api_key, None);
+
+        let custom = provider(
+            &[
+                ("AGENT_PROVIDER_GPT_KIND", "openai"),
+                ("AGENT_PROVIDER_GPT_BASE_URL", "http://vllm:8000/v1"),
+                ("AGENT_PROVIDER_GPT_MODEL", "m"),
+            ],
+            Some("gpt"),
+        );
+        assert_eq!(custom.base_url, "http://vllm:8000/v1");
+
+        let error = rejection(
+            &[
+                ("AGENT_PROVIDER_GPT_KIND", "openai"),
+                ("AGENT_PROVIDER_GPT_MODEL", "m"),
+            ],
+            Some("gpt"),
+        );
+        assert!(
+            error.starts_with("AGENT_PROVIDER_GPT_API_KEY is not set"),
+            "names the aliased variable: {error}"
+        );
+        assert!(error.contains("AGENT_PROVIDER_GPT_BASE_URL"), "{error}");
+    }
+
+    #[test]
+    fn the_missing_model_hint_fits_the_provider() {
+        let anthropic = rejection(
+            &[("AGENT_PROVIDER", "anthropic"), ("AGENT_API_KEY", "k")],
+            None,
+        );
+        assert!(anthropic.contains("claude-sonnet-5-5"), "{anthropic}");
+
+        let ollama = rejection(&[("AGENT_PROVIDER", "ollama")], None);
+        assert!(ollama.contains("qwen3:8b"), "{ollama}");
+
+        let openai = rejection(
+            &[("AGENT_PROVIDER", "openai"), ("AGENT_API_KEY", "k")],
+            None,
+        );
+        assert!(openai.contains("OpenAI model ID"), "{openai}");
+        assert!(
+            !openai.contains("qwen") && !openai.contains("claude"),
+            "no example from another vendor: {openai}"
+        );
     }
 }

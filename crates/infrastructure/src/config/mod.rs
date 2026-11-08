@@ -644,6 +644,12 @@ mod tests {
         if env.get("AGENT_WORKSPACE").is_none() {
             env.set("AGENT_WORKSPACE", "/workspace");
         }
+        // Required in the single-provider form. Supplied here so each test
+        // states only what it is about; the multi-provider form names its
+        // kinds explicitly.
+        if env.get("AGENT_PROVIDERS").is_none() && env.get("AGENT_PROVIDER").is_none() {
+            env.set("AGENT_PROVIDER", "ollama");
+        }
         Settings::from_source(&env)
     }
 
@@ -800,6 +806,7 @@ mod tests {
     fn several_providers_default_to_the_model_prefix_router() {
         let settings = settings(&[
             ("AGENT_PROVIDERS", "local, cloud"),
+            ("AGENT_PROVIDER_LOCAL_KIND", "ollama"),
             ("AGENT_PROVIDER_LOCAL_MODEL", "qwen3:8b"),
             ("AGENT_PROVIDER_CLOUD_KIND", "anthropic"),
             ("AGENT_PROVIDER_CLOUD_MODEL", "claude-sonnet-5"),
@@ -824,6 +831,7 @@ mod tests {
     fn an_explicit_default_provider_must_exist() {
         let error = settings(&[
             ("AGENT_PROVIDERS", "local"),
+            ("AGENT_PROVIDER_LOCAL_KIND", "ollama"),
             ("AGENT_PROVIDER_LOCAL_MODEL", "qwen3:8b"),
             ("AGENT_DEFAULT_PROVIDER", "cloud"),
         ])

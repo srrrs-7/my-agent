@@ -43,11 +43,31 @@ npm の Shai-Hulud 型サプライチェーン攻撃と同じ経路が Rust に�
 
 ```bash
 make setup     # .env を作成し、開発イメージをビルド
-$EDITOR .env   # 接続先 LLM を設定
+$EDITOR .env   # 接続先 LLM を設定（下の 3 つ）
 make doctor    # 設定の確認 + 疎通チェック
 ```
 
 `make` は `docker compose` / `docker-compose` を自動判別します。
+
+設定が必須なのは **`AGENT_PROVIDER` / `AGENT_API_KEY` / `AGENT_MODEL` の 3 つだけ**です。
+接続先（`AGENT_BASE_URL`）は `AGENT_PROVIDER` から決まり、それ以外の設定にはすべて既定値があります
+（一覧は §8）。プロバイダとモデルには既定値がないので、必ず指定してください
+（`AGENT_PROVIDER` が未設定なら、取りうる値を示して起動時に失敗します）。
+
+```bash
+# Anthropic
+AGENT_PROVIDER=anthropic
+AGENT_API_KEY=sk-ant-...
+AGENT_MODEL=claude-sonnet-5-5
+
+# OpenAI
+AGENT_PROVIDER=openai
+AGENT_API_KEY=sk-...
+AGENT_MODEL=<OpenAI のモデル ID>
+```
+
+`AGENT_API_KEY` が無ければ `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` を読みます。
+Anthropic と OpenAI はキーが無いと起動時に失敗します（最初のリクエストで 401 になるのを待たない）。
 
 ### ローカル LLM（Ollama）で動かす
 
@@ -55,31 +75,38 @@ make doctor    # 設定の確認 + 疎通チェック
 make ollama-up                      # compose で ollama を起動
 make ollama-pull MODEL=qwen3:8b     # モデルを取得
 # .env:
-#   AGENT_PROVIDER=openai
-#   AGENT_BASE_URL=http://ollama:11434/v1
+#   AGENT_PROVIDER=ollama
 #   AGENT_MODEL=qwen3:8b
 ```
 
+キーは不要です。接続先は compose の ollama サービス（`http://ollama:11434/v1`）になります。
+`ollama` では `OPENAI_API_KEY` を読みません（OpenAI のキーを Ollama の宛先に送らないため）。
+認証付きのプロキシ越しなどでキーが要る場合だけ、`AGENT_API_KEY` を明示してください。
 ホスト側で起動済みの Ollama / LM Studio を使う場合は
-`AGENT_BASE_URL=http://host.docker.internal:11434/v1` を指定します。
+`AGENT_BASE_URL=http://host.docker.internal:11434/v1` を足します。
 
-### クラウド LLM で動かす
+### その他の OpenAI 互換サーバ（OpenRouter / Groq / Together / vLLM ...）
 
 ```bash
-# OpenAI 互換（OpenAI / OpenRouter / Groq / Together / vLLM ...）
 AGENT_PROVIDER=openai
-AGENT_BASE_URL=https://api.openai.com/v1
-AGENT_MODEL=gpt-4.1
-AGENT_API_KEY=sk-...
-
-# Anthropic
-AGENT_PROVIDER=anthropic
-AGENT_MODEL=claude-sonnet-5
-AGENT_API_KEY=sk-ant-...
+AGENT_BASE_URL=https://openrouter.ai/api/v1
+AGENT_MODEL=...
+AGENT_API_KEY=...        # キーを取らないサーバ（vLLM など）なら省略可
 ```
 
 `openai` は OpenAI の `/chat/completions` プロトコルを話す**すべて**の実装を指します。
 Ollama もこれに含まれるため、ローカルとクラウドで実装は共通です。
+`AGENT_BASE_URL` を明示すると、どのプロバイダでも常にそちらが優先されます。
+
+> **既定の接続先が変わりました。** 以前は `AGENT_PROVIDER=openai` で `AGENT_BASE_URL` を省くと
+> `http://localhost:11434/v1`（Ollama）に繋ぎに行きましたが、今は OpenAI 本体
+> （`https://api.openai.com/v1`）に繋ぎます。コンテナ内の `localhost` はコンテナ自身なので
+> 元々どこにも繋がらなかったはずですが、Ollama を使うつもりだった場合は
+> `AGENT_PROVIDER=ollama` に変えてください。
+>
+> **`AGENT_PROVIDER` は必須になりました。** 以前は未設定だと Ollama 扱いでしたが、今は起動時に
+> 失敗します。`AGENT_MODEL` だけで Ollama を使っていた場合は `AGENT_PROVIDER=ollama` を足してください
+> （複数プロバイダ形式の `AGENT_PROVIDER_<別名>_KIND` も同様です）。
 
 ---
 
@@ -449,7 +476,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 390 本、外部ネットワークもモデルも不要です。
+テストは 402 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -463,18 +490,34 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 
 ## 8. 設定リファレンス
 
-すべて `.env.example` にコメント付きで載っています。以下が全変数です。
+以下が全変数です。必須は `AGENT_PROVIDER` / `AGENT_API_KEY` / `AGENT_MODEL` の 3 つだけで
+（Ollama ならキーも不要）、`.env.example` にはこの 3 つしか載せていません。
+それ以外はすべて任意で、表の既定値で動きます。
+
+どの変数も `.env` に書いても、通常の環境変数として渡しても同じです（`.env` は compose 用の便宜です）。
+値が空の行（`AGENT_API_KEY=`）は未設定として扱います。
 
 ### 接続先
 
 | 変数 | 既定値 | 意味 |
 |---|---|---|
-| `AGENT_WORKSPACE` | カレントディレクトリ | サンドボックスのルート |
-| `AGENT_PROVIDER` | `openai` | `openai` \| `anthropic` |
-| `AGENT_BASE_URL` | `http://localhost:11434/v1` | エンドポイント。**この既定値はコンテナ外で直接実行した場合のもの**です。コンテナ内では `localhost` はコンテナ自身を指すため、compose の Ollama なら `http://ollama:11434/v1`、ホスト側の Ollama なら `http://host.docker.internal:11434/v1` を指定します（`make env` が作る `.env` には前者が入っています） |
-| `AGENT_MODEL` | （必須） | モデル名 |
-| `AGENT_API_KEY` | — | 無ければ `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` |
+| `AGENT_PROVIDER` | （必須） | `openai` \| `ollama` \| `anthropic`（別名: `openai-compatible` / `compatible` → `openai`、`claude` → `anthropic`）。接続先の既定値を決める。未設定なら起動失敗 |
+| `AGENT_API_KEY` | — | 無ければ `OPENAI_API_KEY`（`openai`）/ `ANTHROPIC_API_KEY`（`anthropic`）。`ollama` はベンダの変数を読まず、明示したときだけ送る。`anthropic` と、`AGENT_BASE_URL` を省いた `openai` では**必須**（無ければ起動失敗） |
+| `AGENT_MODEL` | （必須） | モデル名。プロバイダごとの既定値は持たない |
+| `AGENT_BASE_URL` | プロバイダで決まる（下表） | エンドポイント。明示すれば常にこちらが優先 |
 | `AGENT_OPENAI_MAX_TOKENS_FIELD` | `max_tokens` | 新しい OpenAI モデル向けに `max_completion_tokens` へ変更可 |
+| `AGENT_WORKSPACE` | カレントディレクトリ（compose 内は `/workspace`） | サンドボックスのルート |
+
+`AGENT_BASE_URL` を省いたときの接続先:
+
+| `AGENT_PROVIDER` | 既定の `AGENT_BASE_URL` |
+|---|---|
+| `openai` | `https://api.openai.com/v1` |
+| `ollama` | `http://ollama:11434/v1`（compose の ollama サービス。`make ollama-up`） |
+| `anthropic` | `https://api.anthropic.com` |
+
+ホスト側の Ollama / LM Studio は `http://host.docker.internal:11434/v1`、コンテナを使わず
+直接実行するなら `http://localhost:11434/v1` を明示します（コンテナ内の `localhost` はコンテナ自身です）。
 
 ### 複数プロバイダとルーティング（§6 参照）
 
@@ -482,17 +525,18 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 |---|---|---|
 | `AGENT_PROVIDERS` | — | 別名のカンマ区切り。設定すると単一プロバイダ設定より優先 |
 | `AGENT_DEFAULT_PROVIDER` | 最初の別名 | 既定の委譲先 |
-| `AGENT_PROVIDER_<別名>_KIND` | `openai` | 別名ごとの種別 |
-| `AGENT_PROVIDER_<別名>_BASE_URL` | 種別の既定値 | 別名ごとのエンドポイント |
+| `AGENT_PROVIDER_<別名>_KIND` | （必須） | 別名ごとのプロバイダ。値と接続先の既定値は `AGENT_PROVIDER` と同じ。未設定なら起動失敗 |
+| `AGENT_PROVIDER_<別名>_BASE_URL` | プロバイダで決まる | 別名ごとのエンドポイント |
 | `AGENT_PROVIDER_<別名>_MODEL` | （必須） | 別名ごとのモデル |
-| `AGENT_PROVIDER_<別名>_API_KEY` | — | 別名ごとの API キー |
+| `AGENT_PROVIDER_<別名>_API_KEY` | — | 別名ごとの API キー。フォールバックと必須の規則は `AGENT_API_KEY` と同じ |
+| `AGENT_PROVIDER_<別名>_MAX_TOKENS_FIELD` | `max_tokens` | 別名ごとの `AGENT_OPENAI_MAX_TOKENS_FIELD` |
 | `AGENT_ROUTER` | 単一なら `static`、複数なら `model-prefix` | `static` \| `model-prefix` |
 
 ### ループの安全弁（§4 参照）
 
 | 変数 | 既定値 | 意味 |
 |---|---|---|
-| `AGENT_APPROVAL` | `read-only` | `auto` \| `read-only` \| `ask` |
+| `AGENT_APPROVAL` | `read-only` | `auto`（確認なし。コンテナ内でのみ使う）\| `read-only`（読み取り系は確認なし、変更系は確認）\| `ask`（毎回確認） |
 | `AGENT_MAX_ITERATIONS` | `25` | 1 ターンあたりのモデル往復上限 |
 | `AGENT_MAX_TOOL_OUTPUT_BYTES` | `32768` | 履歴に入るツール出力の上限 |
 | `AGENT_MAX_HISTORY_BYTES` | `262144` | 履歴の予算。超過分は圧縮、それでも溢れれば古い順に破棄 |
@@ -511,7 +555,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_WEB_FETCH_MAX_BYTES` | `1048576` | 取得サイズ上限 |
 | `AGENT_WEB_FETCH_TIMEOUT_SECS` | `30` | 取得の上限時間 |
 | `AGENT_SHELL` | `false` | `run_command` ツールの有効化（§4・§5 参照） |
-| `AGENT_SHELL_SANDBOX` | `confined` | 必須とする封じ込め。`confined` \| `isolated` \| `none`。満たせない環境では**起動失敗**（黙って弱くならない） |
+| `AGENT_SHELL_SANDBOX` | `confined` | 必須とする封じ込め。`confined`（その OS で使える封じ込め。Linux 6.7+ は Landlock）\| `isolated`（プロキシ以外に到達できない層。**まだどの OS にも実装がなく、常に起動失敗**）\| `none`（封じ込めなし。使い捨てのコンテナ内でのみ）。満たせない環境では**起動失敗**（黙って弱くならない） |
 | `AGENT_SHELL_NETWORK_ALLOW` | —（**通信不可**） | コマンドが到達できるドメインのカンマ区切り。空なら egress プロキシを起動せず全拒否 |
 | `AGENT_SHELL_WRITABLE` | — | ワークスペース外で書き込みを許可するパスのカンマ区切り（外部のビルドキャッシュ用） |
 | `AGENT_PARALLEL_READ_TOOLS` | `true` | 読み取り系ツールの並列実行 |
@@ -521,7 +565,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | 変数 | 既定値 | 意味 |
 |---|---|---|
 | `AGENT_NOTIFY_WEBHOOK_URL` | —（**無効**） | 通知の送信先。秘密情報として扱い、表示は `scheme://host/…` のみ。不正な URL は起動失敗 |
-| `AGENT_NOTIFY_FORMAT` | `json`（ホストが `ntfy.sh` なら `ntfy`） | `ntfy` \| `slack` \| `json`。明示した値が推定より優先 |
+| `AGENT_NOTIFY_FORMAT` | `json`（ホストが `ntfy.sh` なら `ntfy`） | `ntfy`（サーバのルートへ `{"topic","title","message","tags"}`）\| `slack`（incoming webhook へ `{"text"}`）\| `json`（`{"session_id","kind","title","message","tool"?,"elapsed_secs"?}`）。明示した値が推定より優先 |
 | `AGENT_NOTIFY_EVENTS` | `approval,completed,failed` | 送る種別のカンマ区切り |
 | `AGENT_NOTIFY_MIN_SECS` | `30` | これより短いターン完了は送らない。承認待ち・失敗には効かない |
 | `AGENT_NOTIFY_EXCERPT_CHARS` | `100` | ターン完了の本文に載せる回答の文字数。`0` で載せない。**外部サーバに出る** |
@@ -532,15 +576,15 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 |---|---|---|
 | `AGENT_SYSTEM_PROMPT_FILE` | — | 既定のシステムプロンプトをこのファイルの内容で**差し替え**る。起動時に読まれ、欠落・空なら明確なエラーで落ちる（黙って既定に戻らない） |
 | `AGENT_APPEND_SYSTEM_PROMPT` | — | 既定プロンプトの**末尾に追記**（プロジェクト指示ファイルよりさらに後ろ）。差し替えと併用時は差し替えた文面に追記 |
-| `AGENT_STREAM` | `true` | 応答の逐次表示（SSE）。サーバが `stream` を拒否する場合や一括表示に戻したい場合は `false` |
+| `AGENT_STREAM` | `true` | 応答の逐次表示（SSE）。サーバが `stream` / `stream_options` を拒否する場合、一括表示に戻したい場合、リクエスト全体の再試行を有効にしたい場合は `false` |
 | `AGENT_MAX_TOKENS` | `4096` | 生成トークン上限 |
 | `AGENT_TEMPERATURE` | `0.2` | |
 | `AGENT_REQUEST_TIMEOUT_SECS` | `180` | HTTP リクエストの上限時間 |
 | `AGENT_MAX_RETRIES` | `3` | 一時障害の再試行回数 |
-| `RUST_LOG` | `warn` | tracing フィルタ |
-| `RUST_BACKTRACE` | `0` | |
+| `RUST_LOG` | `warn` | tracing フィルタ（例: `info`、`agent_application=debug,warn`） |
+| `RUST_BACKTRACE` | `0` | `1` でエラー時にバックトレース（テストの調査用） |
+| `OLLAMA_PORT` | `11434` | compose の ollama をホストに公開するポート（ホスト側の compose 設定） |
 
 ---
 
 今後の計画は [`management/issues/`](management/issues/) で管理しています。
-# OtaS

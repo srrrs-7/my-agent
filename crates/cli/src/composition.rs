@@ -459,6 +459,7 @@ mod tests {
 
         let env = MapEnv::new(&[
             ("AGENT_WORKSPACE", "/workspace"),
+            ("AGENT_PROVIDER", "ollama"),
             ("AGENT_MODEL", "m"),
             ("AGENT_SYSTEM_PROMPT_FILE", "/from-env.md"),
             ("AGENT_APPEND_SYSTEM_PROMPT", "from env"),
