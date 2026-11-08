@@ -108,6 +108,8 @@ impl Fixture {
             request_timeout: Duration::from_secs(5),
             max_retries: 2,
             prompt_cache: PromptCache::default(),
+            thinking: Default::default(),
+            effort: None,
             routing: Default::default(),
         };
 

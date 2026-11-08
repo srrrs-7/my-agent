@@ -145,6 +145,7 @@ impl ContextProvider for FakeContext {
             today: "2026-08-13".into(),
             is_git_repository: true,
             project_instructions: None,
+            nested_instructions: Vec::new(),
             directory_overview: vec!["src/".into()],
         })
     }
@@ -2073,7 +2074,7 @@ fn mentions_interrupted_marker(messages: &[Message]) -> bool {
         message.content.iter().any(|block| match block {
             ContentBlock::Text { text } => text.contains("[interrupted]"),
             ContentBlock::ToolResult(result) => result.content.contains("[interrupted]"),
-            ContentBlock::ToolCall(_) => false,
+            ContentBlock::ToolCall(_) | ContentBlock::Opaque { .. } => false,
         })
     })
 }

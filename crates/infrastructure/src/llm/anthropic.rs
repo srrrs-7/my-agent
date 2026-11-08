@@ -32,6 +32,23 @@
 //! A prefix shorter than the model's minimum (512 to 4096 tokens, depending on
 //! the model) is silently not cached - no error, just zeros in the cache
 //! counts. Neither feature needs a beta header.
+//!
+//! ## Thinking and effort
+//!
+//! [`Thinking::Adaptive`] sends `"thinking": {"type": "adaptive"}` and an
+//! [`Effort`] sends `"output_config": {"effort": ...}`. Both are left out
+//! unless configured, so the default request is the one sent before they
+//! existed. `Off` therefore means "say nothing", never `{"type": "disabled"}`:
+//! some current models cannot turn thinking off and answer that with a 400.
+//! `budget_tokens` is not sent at all - current models reject it.
+//!
+//! A response may then carry `thinking` blocks (whose text is empty when the
+//! model does not display its reasoning) and `redacted_thinking` blocks. They
+//! are kept as [`ContentBlock::Opaque`] and sent back exactly as received in
+//! every later request of the conversation: the API verifies their signature,
+//! the model needs them to continue its reasoning across a tool call, and they
+//! are part of the cached prefix. Both settings are per process, so they
+//! cannot change mid-conversation - which would invalidate the cache.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -113,6 +130,95 @@ impl FromStr for PromptCache {
     }
 }
 
+/// Whether to ask for extended thinking (`AGENT_THINKING`).
+///
+/// There is deliberately no "disabled": on a model that thinks by default
+/// `Off` leaves that default alone, because sending `{"type": "disabled"}` is
+/// a 400 on the models that cannot stop thinking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Thinking {
+    /// The `thinking` field is not sent.
+    #[default]
+    Off,
+    /// The model decides when and how much to think.
+    Adaptive,
+}
+
+impl Thinking {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Adaptive => "adaptive",
+        }
+    }
+}
+
+impl FromStr for Thinking {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "none" | "0" => Ok(Self::Off),
+            "adaptive" | "on" | "true" => Ok(Self::Adaptive),
+            other => Err(format!(
+                "unknown thinking setting `{other}` (expected off|adaptive)"
+            )),
+        }
+    }
+}
+
+/// How much the model should spend on a response (`AGENT_EFFORT`), sent as
+/// `output_config.effort`. Unset means the field is left out and the model's
+/// own default applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+impl FromStr for Effort {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
+            "max" => Ok(Self::Max),
+            other => Err(format!(
+                "unknown effort `{other}` (expected low|medium|high|xhigh|max)"
+            )),
+        }
+    }
+}
+
+/// The settings that shape every request body, apart from the request itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RequestOptions {
+    prompt_cache: PromptCache,
+    thinking: Thinking,
+    effort: Option<Effort>,
+}
+
+/// The [`ContentBlock::Opaque`] dialect this adapter writes and reads back.
+const DIALECT: &str = "anthropic";
+
 pub struct AnthropicProvider {
     id: ProviderId,
     client: reqwest::Client,
@@ -120,7 +226,7 @@ pub struct AnthropicProvider {
     api_key: String,
     default_model: ModelId,
     timeout: Duration,
-    prompt_cache: PromptCache,
+    options: RequestOptions,
 }
 
 impl AnthropicProvider {
@@ -138,13 +244,25 @@ impl AnthropicProvider {
             api_key,
             default_model,
             timeout,
-            prompt_cache: PromptCache::default(),
+            options: RequestOptions::default(),
         })
     }
 
     #[must_use]
     pub fn with_prompt_cache(mut self, prompt_cache: PromptCache) -> Self {
-        self.prompt_cache = prompt_cache;
+        self.options.prompt_cache = prompt_cache;
+        self
+    }
+
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: Thinking) -> Self {
+        self.options.thinking = thinking;
+        self
+    }
+
+    #[must_use]
+    pub fn with_effort(mut self, effort: Option<Effort>) -> Self {
+        self.options.effort = effort;
         self
     }
 
@@ -179,7 +297,7 @@ impl LlmProvider for AnthropicProvider {
             .clone()
             .unwrap_or_else(|| self.default_model.clone());
 
-        let body = wire_request(&request, &model, self.prompt_cache);
+        let body = wire_request(&request, &model, self.options);
 
         let builder = self
             .client
@@ -204,7 +322,22 @@ impl AnthropicProvider {
         requested_model: ModelId,
     ) -> Result<ChatResponse, LlmError> {
         let mut content = Vec::new();
-        for block in response.content {
+        for raw in response.content {
+            // Kept as the JSON that arrived rather than parsed into fields:
+            // the signature covers the exact block, and a field this adapter
+            // does not know about yet must survive the round trip as well.
+            if matches!(
+                raw.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            ) {
+                content.push(ContentBlock::Opaque {
+                    dialect: DIALECT.to_string(),
+                    data: raw,
+                });
+                continue;
+            }
+            let block: WireResponseBlock = serde_json::from_value(raw)
+                .map_err(|error| LlmError::InvalidResponse(format!("content block: {error}")))?;
             match block {
                 WireResponseBlock::Text { text } if !text.trim().is_empty() => {
                     content.push(ContentBlock::text(text));
@@ -254,10 +387,19 @@ impl AnthropicProvider {
 fn wire_request<'a>(
     request: &ChatRequest,
     model: &'a ModelId,
-    prompt_cache: PromptCache,
+    options: RequestOptions,
 ) -> WireRequest<'a> {
-    let marker = prompt_cache.marker();
+    let marker = options.prompt_cache.marker();
     let (system, messages) = split_system(request, marker);
+    let thinking = match options.thinking {
+        Thinking::Off => None,
+        Thinking::Adaptive => Some(WireThinking { kind: "adaptive" }),
+    };
+    // Thinking does not combine with a sampling temperature: models that
+    // accept both reject a non-default value once thinking is on. The
+    // setting is a non-thinking knob, so it is dropped rather than failing
+    // every request of the session.
+    let sampling = thinking.is_none();
 
     WireRequest {
         model: model.as_str(),
@@ -269,10 +411,14 @@ fn wire_request<'a>(
             .iter()
             .map(WireTool::from_definition)
             .collect(),
-        temperature: request.params.temperature,
-        top_p: request.params.top_p,
+        temperature: request.params.temperature.filter(|_| sampling),
+        top_p: request.params.top_p.filter(|_| sampling),
         stop_sequences: request.params.stop_sequences.clone(),
         cache_control: marker.filter(|_| resends_its_tail(request.metadata.task_kind)),
+        thinking,
+        output_config: options.effort.map(|effort| WireOutputConfig {
+            effort: effort.as_str(),
+        }),
     }
 }
 
@@ -361,6 +507,11 @@ fn to_blocks(message: &Message) -> Vec<WireBlock> {
                 content: result.content.clone(),
                 is_error: result.is_error,
             }),
+            ContentBlock::Opaque { dialect, data } if dialect == DIALECT => {
+                Some(WireBlock::Verbatim(data.clone()))
+            }
+            // Another vendor's private content means nothing to this API.
+            ContentBlock::Opaque { .. } => None,
         })
         .collect()
 }
@@ -386,6 +537,21 @@ struct WireRequest<'a> {
     /// carry; the system marker uses another.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<WireThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<WireOutputConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct WireThinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct WireOutputConfig {
+    effort: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -439,6 +605,10 @@ enum WireBlock {
         content: String,
         is_error: bool,
     },
+    /// A block received from the API and returned as it came (thinking).
+    /// It carries its own `type`.
+    #[serde(untagged)]
+    Verbatim(Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -462,8 +632,10 @@ impl WireTool {
 struct WireResponse {
     #[serde(default)]
     model: Option<String>,
+    /// Raw, so that thinking blocks can be kept exactly as they arrived;
+    /// everything else is parsed into [`WireResponseBlock`] one by one.
     #[serde(default)]
-    content: Vec<WireResponseBlock>,
+    content: Vec<Value>,
     #[serde(default)]
     stop_reason: Option<String>,
     #[serde(default)]
@@ -635,7 +807,7 @@ mod tests {
     fn unknown_block_types_are_skipped() {
         let response: WireResponse = serde_json::from_value(json!({
             "content": [
-                {"type": "thinking", "thinking": "..."},
+                {"type": "something_new", "payload": "..."},
                 {"type": "text", "text": "done"}
             ],
             "stop_reason": "end_turn"
@@ -644,6 +816,171 @@ mod tests {
 
         let decoded = provider().decode(response, ModelId::new("m")).unwrap();
         assert_eq!(decoded.message.text(), "done");
+        assert_eq!(decoded.message.content.len(), 1);
+    }
+
+    // --- thinking and effort ---------------------------------------------------
+
+    /// A minimal request whose whole body can be compared.
+    fn plain() -> ChatRequest {
+        let mut request = ChatRequest::new(vec![Message::user("hi")]);
+        request.params.temperature = Some(0.5); // exact in f32, so the JSON compares equal
+        request.params.max_tokens = Some(1000);
+        request
+    }
+
+    fn options(thinking: Thinking, effort: Option<Effort>) -> RequestOptions {
+        RequestOptions {
+            prompt_cache: PromptCache::Off,
+            thinking,
+            effort,
+        }
+    }
+
+    #[test]
+    fn with_thinking_off_and_no_effort_the_request_is_unchanged() {
+        let body = body_with(&plain(), options(Thinking::Off, None));
+
+        assert_eq!(
+            body,
+            json!({
+                "model": "m",
+                "max_tokens": 1000,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                "temperature": 0.5
+            }),
+            "off sends no `thinking` field at all - never `disabled`"
+        );
+    }
+
+    #[test]
+    fn adaptive_thinking_is_requested_and_the_temperature_is_dropped() {
+        let body = body_with(&plain(), options(Thinking::Adaptive, None));
+
+        assert_eq!(
+            body,
+            json!({
+                "model": "m",
+                "max_tokens": 1000,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                "thinking": {"type": "adaptive"}
+            })
+        );
+    }
+
+    #[test]
+    fn effort_is_sent_inside_output_config_with_or_without_thinking() {
+        let alone = body_with(&plain(), options(Thinking::Off, Some(Effort::XHigh)));
+        assert_eq!(alone["output_config"], json!({"effort": "xhigh"}));
+        assert!(alone.get("effort").is_none(), "never top-level: {alone}");
+        assert!(alone.get("thinking").is_none(), "{alone}");
+
+        let both = body_with(&plain(), options(Thinking::Adaptive, Some(Effort::Low)));
+        assert_eq!(
+            both,
+            json!({
+                "model": "m",
+                "max_tokens": 1000,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "low"}
+            })
+        );
+        assert!(!both.to_string().contains("budget_tokens"));
+    }
+
+    #[test]
+    fn thinking_blocks_are_sent_back_exactly_as_they_arrived() {
+        let thinking = json!({
+            "type": "thinking",
+            "thinking": "",
+            "signature": "EqQBCkYIARgCKkA=",
+            "a_field_added_later": {"kept": true}
+        });
+        let redacted = json!({"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix/LafPsn4a"});
+        let response: WireResponse = serde_json::from_value(json!({
+            "content": [
+                thinking.clone(),
+                redacted.clone(),
+                {"type": "text", "text": "Let me look."},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.rs"}}
+            ],
+            "stop_reason": "tool_use"
+        }))
+        .unwrap();
+        let decoded = provider().decode(response, ModelId::new("m")).unwrap();
+
+        assert_eq!(
+            decoded.message.text(),
+            "Let me look.",
+            "reasoning is not text"
+        );
+        let call = decoded.message.tool_calls().next().unwrap().clone();
+        let next = ChatRequest::new(vec![
+            Message::user("read it"),
+            decoded.message,
+            Message::tool_results(vec![ToolResult::ok(&call, "contents")]),
+        ]);
+        let body = body_with(&next, options(Thinking::Adaptive, None));
+
+        assert_eq!(
+            body["messages"][1],
+            json!({
+                "role": "assistant",
+                "content": [
+                    thinking,
+                    redacted,
+                    {"type": "text", "text": "Let me look."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.rs"}}
+                ]
+            }),
+            "same blocks, same order, same bytes"
+        );
+    }
+
+    #[test]
+    fn another_vendors_opaque_content_is_left_out() {
+        let request = ChatRequest::new(vec![
+            Message::user("hi"),
+            Message::assistant(vec![
+                ContentBlock::Opaque {
+                    dialect: "someone-else".into(),
+                    data: json!({"type": "reasoning", "id": "rs_1"}),
+                },
+                ContentBlock::text("answer"),
+            ]),
+        ]);
+
+        let body = body_with(&request, options(Thinking::Off, None));
+
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([{"type": "text", "text": "answer"}])
+        );
+    }
+
+    #[test]
+    fn thinking_and_effort_settings_parse_and_name_the_alternatives() {
+        assert_eq!(Thinking::default(), Thinking::Off);
+        assert_eq!(
+            " Adaptive ".parse::<Thinking>().unwrap(),
+            Thinking::Adaptive
+        );
+        assert_eq!("off".parse::<Thinking>().unwrap(), Thinking::Off);
+        let error = "disabled".parse::<Thinking>().unwrap_err();
+        assert!(error.contains("off|adaptive"), "{error}");
+
+        for effort in [
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::XHigh,
+            Effort::Max,
+        ] {
+            assert_eq!(effort.as_str().parse::<Effort>().unwrap(), effort);
+        }
+        let error = "extreme".parse::<Effort>().unwrap_err();
+        assert!(error.contains("low|medium|high|xhigh|max"), "{error}");
     }
 
     // --- prompt caching ------------------------------------------------------
@@ -659,7 +996,17 @@ mod tests {
 
     /// The JSON body an agent-loop turn would put on the wire.
     fn body(request: &ChatRequest, prompt_cache: PromptCache) -> Value {
-        serde_json::to_value(wire_request(request, &ModelId::new("m"), prompt_cache)).unwrap()
+        body_with(
+            request,
+            RequestOptions {
+                prompt_cache,
+                ..RequestOptions::default()
+            },
+        )
+    }
+
+    fn body_with(request: &ChatRequest, options: RequestOptions) -> Value {
+        serde_json::to_value(wire_request(request, &ModelId::new("m"), options)).unwrap()
     }
 
     fn loop_turn() -> ChatRequest {

@@ -30,7 +30,7 @@ use agent_domain::ports::notify::NotificationKind;
 use thiserror::Error;
 
 use crate::exec::SandboxRequirement;
-use crate::llm::PromptCache;
+use crate::llm::{Effort, PromptCache, Thinking};
 use crate::notify::{NotifyFormat, WebhookUrl};
 
 pub use env::{EnvSource, MapEnv, SystemEnv};
@@ -107,6 +107,11 @@ pub struct LlmSettings {
     /// Prompt-cache breakpoints for Anthropic providers. OpenAI-compatible
     /// servers that cache do so on their own, so there is nothing to send them.
     pub prompt_cache: PromptCache,
+    /// Extended thinking for Anthropic providers. Off leaves the field out of
+    /// the request entirely.
+    pub thinking: Thinking,
+    /// `output_config.effort` for Anthropic providers; `None` sends nothing.
+    pub effort: Option<Effort>,
     /// Per-task destinations and the failover chain.
     pub routing: RoutingSettings,
 }
@@ -144,6 +149,35 @@ pub struct PromptSettings {
     /// Append these instructions to the end of the prompt (after the project
     /// instruction file; combined with `replace_file`, appends to that text).
     pub append: Option<String>,
+    /// The operator's own instruction file, merged in front of the
+    /// workspace's (`AGENT_GLOBAL_INSTRUCTIONS`). Always absolute: there is
+    /// no directory a relative path could sensibly be read against, since
+    /// the same file is meant for every workspace.
+    pub global_instructions: Option<PathBuf>,
+}
+
+const GLOBAL_INSTRUCTIONS_KEY: &str = "AGENT_GLOBAL_INSTRUCTIONS";
+
+impl PromptSettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        let global_instructions = match reader.string(GLOBAL_INSTRUCTIONS_KEY) {
+            None => None,
+            Some(raw) if Path::new(&raw).is_absolute() => Some(PathBuf::from(raw)),
+            Some(raw) => {
+                return Err(ConfigError::invalid(
+                    GLOBAL_INSTRUCTIONS_KEY,
+                    raw,
+                    "must be an absolute path (`~` is not expanded), e.g. \
+                     /home/me/.config/agent/AGENTS.md",
+                ));
+            }
+        };
+        Ok(Self {
+            replace_file: reader.string("AGENT_SYSTEM_PROMPT_FILE").map(PathBuf::from),
+            append: reader.string("AGENT_APPEND_SYSTEM_PROMPT"),
+            global_instructions,
+        })
+    }
 }
 
 /// Outbound web access for the `web_fetch` tool.
@@ -415,10 +449,7 @@ impl Settings {
                         .map(|days| Duration::from_secs(days as u64 * 24 * 60 * 60)),
                 },
             },
-            prompt: PromptSettings {
-                replace_file: reader.string("AGENT_SYSTEM_PROMPT_FILE").map(PathBuf::from),
-                append: reader.string("AGENT_APPEND_SYSTEM_PROMPT"),
-            },
+            prompt: PromptSettings::read(&reader)?,
             web_fetch: WebFetchSettings {
                 enabled: reader.parsed("AGENT_WEB_FETCH", false)?,
                 allowed_domains: reader.list("AGENT_WEB_FETCH_ALLOW"),
@@ -618,6 +649,8 @@ impl LlmSettings {
             request_timeout: Duration::from_secs(reader.parsed("AGENT_REQUEST_TIMEOUT_SECS", 180)?),
             max_retries: reader.parsed("AGENT_MAX_RETRIES", 3)?,
             prompt_cache: reader.parsed("AGENT_PROMPT_CACHE", PromptCache::default())?,
+            thinking: reader.parsed("AGENT_THINKING", Thinking::default())?,
+            effort: reader.optional("AGENT_EFFORT")?,
             routing,
         })
     }
@@ -793,6 +826,14 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         },
     );
     description.insert(
+        "global instructions".into(),
+        settings
+            .prompt
+            .global_instructions
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |path| path.display().to_string()),
+    );
+    description.insert(
         "history".into(),
         format!(
             "{} bytes; {}",
@@ -815,6 +856,17 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
             PromptCache::Off => "disabled".to_string(),
             ttl => format!("{} (anthropic providers)", ttl.as_str()),
         },
+    );
+    description.insert(
+        "thinking".into(),
+        format!(
+            "{}; effort {} (anthropic providers)",
+            settings.llm.thinking.as_str(),
+            settings
+                .llm
+                .effort
+                .map_or("not sent", |effort| effort.as_str())
+        ),
     );
     description.insert(
         "default provider".into(),
@@ -1098,6 +1150,40 @@ mod tests {
     }
 
     #[test]
+    fn thinking_is_off_and_effort_unsent_unless_configured() {
+        let default = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert_eq!(default.llm.thinking, Thinking::Off);
+        assert_eq!(default.llm.effort, None);
+        assert_eq!(
+            describe(&default)["thinking"],
+            "off; effort not sent (anthropic providers)"
+        );
+
+        let set = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_THINKING", "adaptive"),
+            ("AGENT_EFFORT", "xhigh"),
+        ])
+        .unwrap();
+        assert_eq!(set.llm.thinking, Thinking::Adaptive);
+        assert_eq!(set.llm.effort, Some(Effort::XHigh));
+        assert_eq!(
+            describe(&set)["thinking"],
+            "adaptive; effort xhigh (anthropic providers)"
+        );
+
+        for (key, value, alternatives) in [
+            ("AGENT_THINKING", "disabled", "off|adaptive"),
+            ("AGENT_EFFORT", "extreme", "low|medium|high|xhigh|max"),
+        ] {
+            let error = settings(&[("AGENT_MODEL", "m"), (key, value)])
+                .expect_err("an unknown value must abort startup");
+            assert!(error.to_string().contains(key), "{error}");
+            assert!(error.to_string().contains(alternatives), "{error}");
+        }
+    }
+
+    #[test]
     fn loop_limits_come_from_the_environment() {
         let settings = settings(&[
             ("AGENT_MODEL", "m"),
@@ -1147,6 +1233,45 @@ mod tests {
         assert_eq!(settings.prompt.replace_file, None);
         assert_eq!(settings.prompt.append, None);
         assert_eq!(describe(&settings)["system prompt"], "built-in");
+        assert_eq!(settings.prompt.global_instructions, None);
+        assert_eq!(describe(&settings)["global instructions"], "none");
+    }
+
+    #[test]
+    fn global_instructions_are_read_from_an_absolute_path() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            (
+                "AGENT_GLOBAL_INSTRUCTIONS",
+                "/home/me/.config/agent/AGENTS.md",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.prompt.global_instructions,
+            Some(PathBuf::from("/home/me/.config/agent/AGENTS.md"))
+        );
+        assert_eq!(
+            describe(&settings)["global instructions"],
+            "/home/me/.config/agent/AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn a_relative_global_instructions_path_aborts_startup_and_says_why() {
+        for relative in ["AGENTS.md", "~/.config/agent/AGENTS.md"] {
+            let error = settings(&[
+                ("AGENT_MODEL", "m"),
+                ("AGENT_GLOBAL_INSTRUCTIONS", relative),
+            ])
+            .err()
+            .unwrap_or_else(|| panic!("`{relative}` must be refused"));
+            let message = error.to_string();
+            assert!(
+                message.contains("AGENT_GLOBAL_INSTRUCTIONS") && message.contains("absolute"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

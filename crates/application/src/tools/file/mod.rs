@@ -5,12 +5,14 @@
 //! model inside the sandbox.
 
 mod edit;
+mod glob;
 mod list;
 mod read;
 mod search;
 mod write;
 
 pub use edit::EditFileTool;
+pub use glob::GlobTool;
 pub use list::ListDirectoryTool;
 pub use read::ReadFileTool;
 pub use search::SearchFilesTool;

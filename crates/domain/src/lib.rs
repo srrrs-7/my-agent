@@ -54,7 +54,7 @@ pub use ports::{
     llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent},
     notify::{Notification, NotificationEvent, NotificationKind, Notifier, NullNotifier},
     prompt::PromptBuilder,
-    search::{FileSearcher, SearchHit, SearchQuery},
+    search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery},
     session_store::{SessionStore, SessionSummary},
     tool::Tool,
     web::{FetchedContent, WebFetcher},

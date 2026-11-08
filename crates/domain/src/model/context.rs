@@ -15,8 +15,15 @@ pub struct ContextSnapshot {
     /// ISO-8601 date, so the model does not guess "today".
     pub today: String,
     pub is_git_repository: bool,
-    /// Contents of a project instruction file (`AGENTS.md`, `CLAUDE.md`, ...).
+    /// Instruction text, merged from the general to the specific (the
+    /// operator's global file, then the workspace root's `AGENTS.md`,
+    /// `CLAUDE.md`, ...), so that later text wins a disagreement.
     pub project_instructions: Option<String>,
+    /// Workspace-relative paths of instruction files in subdirectories. Only
+    /// listed: the model reads one when its work takes it into that
+    /// directory, rather than every one being loaded up front.
+    #[serde(default)]
+    pub nested_instructions: Vec<String>,
     /// A shallow listing of the workspace so the model can orient itself
     /// without spending a turn on `list_directory`.
     pub directory_overview: Vec<String>,

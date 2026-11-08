@@ -249,6 +249,7 @@ AGENT_NOTIFY_FORMAT=ntfy
 | `read_file` | read-only | 行番号付きで読む。`offset` / `limit` でページング |
 | `list_directory` | read-only | 1 階層のリスト |
 | `search_files` | read-only | 正規表現検索（`.gitignore` 準拠・バイナリ除外） |
+| `glob` | read-only | パスのパターン（`src/**/*.rs`）でファイルを探す。更新が新しい順・既定 100 件で打ち切り（打ち切ったことと総数を表示）。`.gitignore` 準拠 |
 | `write_file` | mutating | 全文書き込み（親ディレクトリ自動作成） |
 | `edit_file` | mutating | 完全一致の部分置換。一致 0 件／複数件はエラー |
 | `todo_write` | read-only | 作業計画（手順と pending / in_progress / completed）を丸ごと書き換える。ワークスペースには触れない |
@@ -296,8 +297,22 @@ AGENT_NOTIFY_FORMAT=ntfy
 
 - ワークスペースの絶対パス、OS、当日日付、git リポジトリかどうか
 - 深さ 2・最大 60 件の**ディレクトリ概要**（最初の 1 ターンを探索に使わせないため）
-- **プロジェクト指示ファイル** — `AGENTS.md` → `CLAUDE.md` → `.agent/instructions.md` →
-  `.github/copilot-instructions.md` の順で最初に見つかったもの
+- **指示ファイル** — 一般的なものから具体的なものの順に連結します（後ろほど優先）
+  1. 操作者のグローバル指示（`AGENT_GLOBAL_INSTRUCTIONS` に絶対パスで指定。未設定なら無し）
+  2. ワークスペース直下の指示ファイル — `AGENTS.md` → `CLAUDE.md` → `.agent/instructions.md` →
+     `.github/copilot-instructions.md` の順で最初に見つかった 1 つ
+  3. サブディレクトリの指示ファイルは**中身を読み込まず、パスだけを一覧**します（深さ 3 まで・
+     最大 20 件。`.gitignore` 対象と隠しディレクトリは除外。ディレクトリごとに上と同じ順で 1 つ）。
+     モデルはそのディレクトリで作業する前に `read_file` で読みます。モノレポの全 `AGENTS.md` を
+     最初から積むとタスクに無関係な部分でプロンプトが埋まり、またプロンプトはセッション中
+     固定なので、作業の進行に合わせて差し込むこともできないためです
+
+  1 と 2 は合わせて 16 KiB までで、超えた分は切り詰めたことと元の大きさを本文中に明記します
+  （両方あるときグローバル側は半分まで）。ワークスペース内の指示ファイルは `read_file` と同じ
+  アクセス検査（§5）を通り、拒否されたファイルは読み込みも一覧もしません。ディレクトリ内で
+  最初の候補が拒否された場合、次の候補には進みません（拒否されるファイルを手前に置いて
+  読み込むファイルを選ばせないため）。グローバル指示は操作者自身が指定したファイルなので、
+  ワークスペースの外にあってよく、アクセス検査の対象外です
 - ツール一覧と作業ルール
 
 システムプロンプトは**セッションの最初の 1 回だけ**組み立て、以後のターンでは同じものを送ります。
@@ -444,6 +459,8 @@ jq -r 'select(.role=="tool") | .content[].content' .agent/sessions/*.jsonl
 - **`.env` は書き込みも拒否します。** 書き換えられると、モデルが `AGENT_BASE_URL` を
   自分の用意したサーバに向け、次回の起動で API キーがそこへ送られます
 - `search_files` は拒否対象の中身を返しません（`include` で明示しても同じです）。
+  `glob` は拒否対象をパスとしても一覧に出しません（`**/.env*` と明示しても同じです）。
+  どちらもシンボリックリンクは辿らず、一致としても返しません。
   `list_directory` は名前だけなので表示します
 - 起動時に読む指示ファイル（`AGENTS.md` など）も同じ検査を通します。リポジトリが
   `AGENTS.md -> .env` を置いても、システムプロンプトには入りません
@@ -673,7 +690,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 632 本、外部ネットワークもモデルも不要です。
+テストは 663 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -780,15 +797,22 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 |---|---|---|
 | `AGENT_SYSTEM_PROMPT_FILE` | — | 既定のシステムプロンプトをこのファイルの内容で**差し替え**る。起動時に読まれ、欠落・空なら明確なエラーで落ちる（黙って既定に戻らない） |
 | `AGENT_APPEND_SYSTEM_PROMPT` | — | 既定プロンプトの**末尾に追記**（プロジェクト指示ファイルよりさらに後ろ）。差し替えと併用時は差し替えた文面に追記 |
+| `AGENT_GLOBAL_INSTRUCTIONS` | — | 操作者のグローバル指示ファイル（**絶対パス**。`~` は展開しない）。ワークスペースの指示ファイルより前に連結される（§4）。指定したのに読めなければ起動失敗。セッション開始時に 1 回読む |
 | `AGENT_STREAM` | `true` | 応答の逐次表示（SSE）。サーバが `stream` / `stream_options` を拒否する場合、一括表示に戻したい場合、リクエスト全体の再試行を有効にしたい場合は `false` |
 | `AGENT_MAX_TOKENS` | `4096` | 生成トークン上限 |
 | `AGENT_TEMPERATURE` | `0.2` | |
 | `AGENT_REQUEST_TIMEOUT_SECS` | `180` | HTTP リクエストの上限時間 |
 | `AGENT_MAX_RETRIES` | `3` | 一時障害の再試行回数 |
 | `AGENT_PROMPT_CACHE` | `5m` | Anthropic のプロンプトキャッシュ。`5m` \| `1h` \| `off`。ツール定義＋システムプロンプトの末尾と会話の末尾（自動キャッシュ）に印を付け、毎ターン同じ前置きを全額で読み直させない。プロンプトの間に 5 分以上空くことが多いなら `1h`（書き込み単価は 2 倍）、`cache_control` を拒否するゲートウェイ経由なら `off`。OpenAI 互換サーバ側のキャッシュは自動なので影響しない。効果は `-v` と `/usage` の `cache: N read, M written` で確認できる |
+| `AGENT_THINKING` | `off` | Anthropic の拡張思考。`off`（`thinking` フィールドを**送らない**。`disabled` は送らないので、思考を止められないモデルではモデル既定のまま）\| `adaptive`（`"thinking": {"type": "adaptive"}`。思考するかと量をモデルが決める）。`adaptive` では `AGENT_TEMPERATURE` を送らない（思考と温度指定は併用できない）。思考は `AGENT_MAX_TOKENS` を消費するので、上げておくとよい。応答中の `thinking` / `redacted_thinking` ブロックは表示せず、同じ会話の後続リクエストにそのまま送り返す（署名検証・推論の継続・キャッシュのため）。`budget_tokens` は使わない。OpenAI 互換サーバには影響しない |
+| `AGENT_EFFORT` | —（送らない） | Anthropic の `output_config.effort`。`low` \| `medium` \| `high` \| `xhigh` \| `max`。未設定ならフィールド自体を送らず、モデルの既定に従う |
 | `RUST_LOG` | `warn` | tracing フィルタ（例: `info`、`agent_application=debug,warn`） |
 | `RUST_BACKTRACE` | `0` | `1` でエラー時にバックトレース（テストの調査用） |
 | `OLLAMA_PORT` | `11434` | compose の ollama をホストに公開するポート（ホスト側の compose 設定） |
+
+`AGENT_THINKING` と `AGENT_EFFORT` は会話の途中で変えるとプロンプトキャッシュが無効になります。
+どちらもプロセス単位の設定（起動時に読むだけ）なので、1 つのセッション内で変わることはありません。
+`--resume` で再開するときに値を変えると、再開後の最初のリクエストはキャッシュを読めません。
 
 ---
 

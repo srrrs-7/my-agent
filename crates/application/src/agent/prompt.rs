@@ -22,9 +22,11 @@ use agent_domain::model::tool::ToolDefinition;
 use agent_domain::ports::prompt::PromptBuilder;
 use agent_domain::text;
 
-/// Cap on the project instruction file so a huge `AGENTS.md` cannot crowd out
-/// the conversation.
-const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+/// Cap on the project instructions so a huge `AGENTS.md` cannot crowd out the
+/// conversation. A backstop: the real context provider already merges within
+/// a smaller budget and says where it cut, so this only binds for one that
+/// does not.
+const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 20 * 1024;
 
 /// The built-in prompt policy: environment, workspace overview, tool list,
 /// working rules, project instructions.
@@ -170,11 +172,28 @@ pub fn build_system_prompt(context: &ContextSnapshot, tools: &[ToolDefinition]) 
         if !trimmed.is_empty() {
             prompt.push_str(
                 "\n# Project instructions\n\
-                 The following comes from the project's own instruction file. It takes precedence\n\
-                 over the general guidance above whenever the two disagree.\n\n",
+                 The following comes from instruction files, the most general first. It takes\n\
+                 precedence over the general guidance above, and a later file over an earlier one,\n\
+                 whenever they disagree.\n\n",
             );
-            prompt.push_str(text::truncate(trimmed, MAX_PROJECT_INSTRUCTIONS_BYTES));
+            let clipped = text::truncate(trimmed, MAX_PROJECT_INSTRUCTIONS_BYTES);
+            prompt.push_str(clipped);
             prompt.push('\n');
+            if clipped.len() < trimmed.len() {
+                prompt.push_str("\n[the instructions were truncated here]\n");
+            }
+        }
+    }
+
+    if !context.nested_instructions.is_empty() {
+        prompt.push_str(
+            "\n# Instructions in subdirectories\n\
+             These subdirectories have their own instruction file. Before working inside one,\n\
+             read its file with `read_file`; for that directory it adds to, and takes precedence\n\
+             over, the project instructions above.\n\n",
+        );
+        for path in &context.nested_instructions {
+            let _ = writeln!(prompt, "- {path}");
         }
     }
 
@@ -194,8 +213,23 @@ mod tests {
             today: "2026-08-13".into(),
             is_git_repository: true,
             project_instructions: Some("Always run `make check` before finishing.".into()),
+            nested_instructions: Vec::new(),
             directory_overview: vec!["crates/".into(), "Makefile".into()],
         }
+    }
+
+    #[test]
+    fn nested_instruction_files_are_listed_after_the_project_instructions() {
+        let mut context = snapshot();
+        context.nested_instructions = vec!["crates/domain/AGENTS.md".into()];
+        let prompt = build_system_prompt(&context, &[]);
+
+        let listed = prompt
+            .find("- crates/domain/AGENTS.md")
+            .expect("nested file listed");
+        assert!(prompt.contains("# Instructions in subdirectories"));
+        assert!(prompt.contains("read its file with `read_file`"));
+        assert!(listed > prompt.find("make check").unwrap());
     }
 
     #[test]
@@ -225,6 +259,7 @@ mod tests {
         context.directory_overview.clear();
         let prompt = build_system_prompt(&context, &[]);
         assert!(!prompt.contains("# Project instructions"));
+        assert!(!prompt.contains("# Instructions in subdirectories"));
         assert!(!prompt.contains("# Workspace overview"));
         assert!(!prompt.contains("# Tools"));
     }
@@ -237,6 +272,10 @@ mod tests {
         let prompt = build_system_prompt(&context, &[]);
         assert!(prompt.contains("# Project instructions"));
         assert!(prompt.len() < MAX_PROJECT_INSTRUCTIONS_BYTES * 3);
+        assert!(
+            prompt.contains("[the instructions were truncated here]"),
+            "a clip is announced, not silent"
+        );
     }
 
     #[test]

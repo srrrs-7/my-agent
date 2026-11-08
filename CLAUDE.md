@@ -84,7 +84,7 @@ crates/test-support   (agent-test-support)   統合テスト用モック LLM サ
 
 **`crates/cli` は bin only で、`composition.rs` にはテストがありません。**
 `tests/end_to_end.rs` は `agent_cli` を import せず配線を自前で組み直しているため
-（本物は 5 ツール + `TimeoutTool`、E2E は 2 ツール素のまま）、composition の間違い —
+（本物は 7 ツール + 装飾子 3 種、`tests/end_to_end.rs` は 2 ツール素のまま。実バイナリを起動する `*_e2e.rs` は配線の一部を踏む）、composition の間違い —
 ツールの登録漏れ、ポートの取り違え、設定分岐 — は**どのテストからも見えません**。
 ここを触ったら手で確かめてください。足場を作る issue は
 `management/issues/todo/2026-08-14_composition-root-test-harness.md`（P1）。

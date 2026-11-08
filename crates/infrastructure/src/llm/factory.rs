@@ -131,7 +131,9 @@ fn build_client(
                     provider.model.clone(),
                     settings.request_timeout,
                 )?
-                .with_prompt_cache(settings.prompt_cache),
+                .with_prompt_cache(settings.prompt_cache)
+                .with_thinking(settings.thinking)
+                .with_effort(settings.effort),
             ))
         }
     }

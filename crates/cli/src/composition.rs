@@ -15,7 +15,7 @@ use agent_application::agent::{
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::exec::RunCommandTool;
 use agent_application::tools::file::{
-    EditFileTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
+    EditFileTool, GlobTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
 };
 use agent_application::tools::plan::TodoWriteTool;
 use agent_application::tools::web::WebFetchTool;
@@ -100,7 +100,22 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             .context("cannot open the workspace")?,
     );
     let searcher = Arc::new(IgnoreAwareSearcher::new(workspace.clone()));
-    let context = Arc::new(WorkspaceContextProvider::new(workspace.clone()));
+    // Checked here rather than when the prompt is built: an operator who set
+    // the variable expects the file in every session, and a typo found only
+    // as a log line would quietly run without it - the same reason a missing
+    // AGENT_SYSTEM_PROMPT_FILE aborts startup.
+    if let Some(path) = &settings.prompt.global_instructions {
+        anyhow::ensure!(
+            path.is_file(),
+            "AGENT_GLOBAL_INSTRUCTIONS points at `{}`, which is not a readable file. Fix the \
+             path or unset the variable",
+            path.display()
+        );
+    }
+    let context = Arc::new(
+        WorkspaceContextProvider::new(workspace.clone())
+            .with_global_instructions(settings.prompt.global_instructions.clone()),
+    );
     let provider = build_provider(&settings.llm).context("cannot build the LLM provider")?;
 
     // No URL means `NullNotifier`, not a flag: nothing above this line has a
@@ -334,7 +349,11 @@ fn build_tools(
                 file_system,
                 workspace.clone(),
             ))))
-            .with(timed(Arc::new(SearchFilesTool::new(searcher, workspace))))
+            .with(timed(Arc::new(SearchFilesTool::new(
+                searcher.clone(),
+                workspace.clone(),
+            ))))
+            .with(timed(Arc::new(GlobTool::new(searcher, workspace))))
             .with(timed(Arc::new(TodoWriteTool::new()))),
     )
 }
@@ -449,6 +468,7 @@ mod tests {
             today: "2026-08-14".into(),
             is_git_repository: true,
             project_instructions: Some("Project rules here.".into()),
+            nested_instructions: Vec::new(),
             directory_overview: vec!["crates/".into()],
         }
     }
@@ -468,6 +488,7 @@ mod tests {
         let error = build_prompt_builder(&PromptSettings {
             replace_file: Some("/nonexistent/prompt.md".into()),
             append: None,
+            global_instructions: None,
         })
         .err()
         .expect("startup must fail");
@@ -485,6 +506,7 @@ mod tests {
         let error = build_prompt_builder(&PromptSettings {
             replace_file: Some(file.path().to_path_buf()),
             append: None,
+            global_instructions: None,
         })
         .err()
         .expect("startup must fail");
@@ -499,6 +521,7 @@ mod tests {
         let builder = build_prompt_builder(&PromptSettings {
             replace_file: Some(file.path().to_path_buf()),
             append: Some("Reply in Japanese.".into()),
+            global_instructions: None,
         })
         .unwrap();
 
