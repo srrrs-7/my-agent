@@ -14,6 +14,7 @@ publish = false
 agent-domain = { path = "crates/domain" }
 agent-application = { path = "crates/application" }
 agent-infrastructure = { path = "crates/infrastructure" }
+agent-sdk = { path = "crates/sdk" }
 agent-test-support = { path = "crates/test-support" }
 
 # --- shared external crates ---

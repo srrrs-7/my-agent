@@ -20,6 +20,7 @@ path = "src/main.rs"
 agent-domain = { workspace = true }
 agent-application = { workspace = true }
 agent-infrastructure = { workspace = true }
+agent-sdk = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

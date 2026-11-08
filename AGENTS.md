@@ -9,14 +9,17 @@ two consistent - if a rule below changes, check `.claude/rules/` as well.
 
 ## What this repository is
 
-A Rust CLI coding agent built with clean architecture. Four crates under
+A Rust CLI coding agent built with clean architecture. Five crates under
 `crates/`, dependencies point inwards only:
 
 - `domain` — entities, value objects, ports (traits). std + serde only.
 - `application` — the agent loop, tool implementations, prompt assembly.
   **Must not depend on `infrastructure`, and must not depend on tokio.**
 - `infrastructure` — LLM HTTP clients, sandboxed filesystem, config, telemetry.
-- `cli` — argument parsing, rendering, and the single composition root.
+- `sdk` — the single composition root (`unstable::assemble`), and a small
+  stable API for embedding the agent (`Agent`, `Session`, the event DTOs).
+- `cli` — argument parsing, rendering, the terminal's approval prompt and the
+  REPL: a thin layer over `sdk`.
 
 ## Rules for changes
 

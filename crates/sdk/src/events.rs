@@ -1,14 +1,23 @@
-//! The JSON shapes `agent run --output-format json|stream-json` prints.
+//! The published JSON shapes of what the agent does: one [`EventDto`] per
+//! [`AgentEvent`], and the [`ResultDto`] a turn ends with.
 //!
-//! These are the published schema, so they are their own types rather than
-//! `Serialize` on [`AgentEvent`] or any other domain type: a field renamed in
-//! the domain must not silently change what a script parses. Every mapping
-//! below is an exhaustive `match`, so a new event variant does not compile
-//! until someone decides what it looks like on the wire.
+//! This is the stable view of an event. [`AgentEvent`] itself is a domain
+//! type whose fields move with the domain; an [`EventSink`](crate::EventSink)
+//! that wants something to keep, compare or send on converts each event with
+//! `EventDto::from(&event)` and serialises that. `agent run --output-format
+//! json|stream-json` prints exactly these shapes, each wrapped in
+//! [`Versioned`].
+//!
+//! They are their own types rather than `Serialize` on [`AgentEvent`] or any
+//! other domain type: a field renamed in the domain must not silently change
+//! what a script parses. Every mapping below is an exhaustive `match`, so a
+//! new event variant does not compile until someone decides what it looks
+//! like on the wire.
 //!
 //! Strings from the model and from tools (prose, tool arguments, summaries,
-//! plan items) are carried unchanged - JSON escaping is what makes them safe
-//! to print, see [`super::write_line`].
+//! plan items) are carried unchanged. JSON escaping keeps them on one line;
+//! a writer that prints straight to a terminal escapes the characters a
+//! terminal would act on as well, as the `agent` binary does.
 
 use std::time::Duration;
 
@@ -64,6 +73,7 @@ impl From<&TokenUsage> for UsageDto {
 /// always, `limit` / `stop_reason` / `error` only for the reason they explain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ReasonDto {
     Completed,
     MaxIterations {
@@ -115,6 +125,7 @@ pub struct ResultDto {
 /// One `stream-json` line per [`AgentEvent`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EventDto<'a> {
     RunStarted {
         session_id: &'a str,

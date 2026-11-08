@@ -8,7 +8,7 @@
 
 use agent_application::agent::{AgentOutcome, Interrupt, Session, UserInput};
 use agent_application::error::AppError;
-use agent_domain::ports::events::FinishReason;
+use agent_sdk::unstable::stop_reason;
 
 use crate::composition::Application;
 use crate::ctrl_c::{CtrlC, Sigint, TurnEnd, drive};
@@ -45,17 +45,4 @@ pub(crate) async fn run_turn(
         }
     }
     end
-}
-
-/// How a turn ended, as the stop hooks are told it.
-pub(crate) fn stop_reason(result: &Result<AgentOutcome, AppError>) -> &'static str {
-    match result {
-        Ok(outcome) => match outcome.reason {
-            FinishReason::Completed => "completed",
-            FinishReason::MaxIterations { .. } => "max_iterations",
-            FinishReason::Stopped { .. } => "stopped",
-            FinishReason::Interrupted => "interrupted",
-        },
-        Err(_) => "error",
-    }
 }

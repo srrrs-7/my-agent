@@ -4,13 +4,20 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ agent-cli                    プレゼンテーション + 合成ルート  │
+│ agent-cli                    プレゼンテーション               │
 │   args.rs        clap 定義                                    │
 │   render.rs      AgentEvent → 端末出力                        │
 │   approval.rs    対話的な承認ゲート                           │
-│   composition.rs 具象型とポートを結線する唯一の場所           │
-│                  assemble() を run / chat / eval / テストが共有│
+│   composition.rs 端末固有の注入（承認ゲート・通知）だけ       │
 │   lib.rs / main.rs  lib の上に薄い bin（tests/ から呼べる）   │
+└──────────────────────────────┬───────────────────────────────┘
+┌──────────────────────────────▼───────────────────────────────┐
+│ agent-sdk                    合成ルート + 埋め込み用の安定 API│
+│   unstable.rs    具象型とポートを結線する唯一の場所           │
+│                  assemble() を run / chat / eval / Agent /    │
+│                  テストが共有                                 │
+│   agent.rs       Agent / Session / Interrupt / Outcome        │
+│   events.rs      イベントと結果の JSON DTO（公開スキーマ）    │
 └───────────────┬──────────────────────────┬───────────────────┘
                 │                          │
 ┌───────────────▼──────────────┐ ┌─────────▼───────────────────┐
@@ -383,7 +390,7 @@ stderr と承認プロンプトに出す文字列（ツール引数・結果の�
 | タスク定義・検査 `verify`・集計・指紋（FNV-1a） | `application/src/eval/` | 何を成功とみなし、どう数えるかはユースケース。I/O は `FileSystem` / `CommandRunner` ポート越し |
 | 計測 `MetricsSink` | 同上 | ループが既に出している `AgentEvent` を数えるだけの `EventSink`。第 2 の報告経路を作らない |
 | フィクスチャの複製 `ScratchDir` | `infrastructure/src/fs/scratch.rs` | std のみ。シンボリックリンクは拒否、drop で削除（`--keep` で残す） |
-| 試行ごとの組み立て・時間計測・出力 | `cli/src/commands/eval.rs` | エージェントは `composition::assemble` で組む。測っているものが `agent run` の配線そのものであるため |
+| 試行ごとの組み立て・時間計測・出力 | `cli/src/commands/eval.rs` | エージェントは `composition::assemble`（= `agent_sdk::unstable::assemble`）で組む。測っているものが `agent run` の配線そのものであるため |
 
 決めたこと:
 
@@ -460,6 +467,7 @@ domain の値オブジェクト `Plan` が持ち、違反は直さず拒否し�
 | infrastructure | ペイロード写像の単体テスト | `finish_reason:"stop"` + `tool_calls` の解釈 |
 | infrastructure | 生 TCP のモックサーバ | ステータス写像、実際に送出される JSON |
 | 全体 | E2E（`crates/cli/tests/end_to_end.rs`） | HTTP → ループ → 実ファイル書き込み |
+| SDK | 公開 API だけの統合テスト（`crates/sdk/tests/sdk.rs`） | モック LLM に対する `run`・承認コールバックの拒否が `tool_result` で返る・イベント DTO・`Interrupt` 後もセッションが続く |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/notify_e2e.rs`） | 合成ルート → `run` / `chat` → 終了処理。Webhook 通知の到達・中身・終了コード |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/plan_e2e.rs`） | `todo_write` の登録・承認なしでの実行・stderr への表示・`--resume` での復元・`/reset` |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/dependency_gate_e2e.rs`） | 非対話の `auto` で `Cargo.toml` の編集が拒否されファイルが変わらない、`AGENT_ALLOW_DEPENDENCY_CHANGES` で通る |
@@ -474,4 +482,4 @@ domain の値オブジェクト `Plan` が持ち、違反は直さず拒否し�
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 1237 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 1244 本）。

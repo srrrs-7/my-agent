@@ -6,9 +6,13 @@ CLAUDE.md に列挙した前提の、根拠と検証方法。**変更が必要�
 ## 1. 依存は内向きのみ
 
 ```
-cli → application → domain
-cli → infrastructure → domain
+cli → sdk → application → domain
+      sdk → infrastructure → domain
 ```
+
+合成ルートは `agent-sdk` にあり、cli はその上の薄い層です（cli は端末固有の承認ゲート・描画・通知を
+注入するために application / infrastructure も直接使います）。sdk は tokio に依存しません
+（ランタイムは呼び出し側が用意します）。
 
 `application` の `Cargo.toml` に `agent-infrastructure` は**現れません**。
 ユースケースが HTTP やファイルシステムに直接触ることが構造的に不可能になります。
@@ -18,7 +22,7 @@ cli → infrastructure → domain
 この制約があるおかげで `crates/application/tests/agent_loop.rs` はランタイム抜きでループ全体を検証できます。
 
 **新しい能力が必要になったら** — `domain/src/ports/` に trait を足し、`infrastructure` で実装し、
-`cli/src/composition.rs` で結線します。ショートカットはありません。
+`sdk/src/unstable.rs`（合成ルート）で結線します。ショートカットはありません。
 
 検証:
 ```bash

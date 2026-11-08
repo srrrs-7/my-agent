@@ -3,11 +3,16 @@
 //! Layer map (dependencies point inwards only):
 //!
 //! ```text
-//!   agent-cli ............ this crate: argv, rendering, composition root
-//!     -> agent-application  the loop, the tools, prompt assembly
-//!     -> agent-infrastructure  HTTP clients, filesystem, config
-//!          -> agent-domain     entities, value objects, ports
+//!   agent-cli ............ this crate: argv, rendering, the terminal's
+//!     |                    approval prompt and notifications, the REPL
+//!     -> agent-sdk ........ the composition root (`agent_sdk::unstable`)
+//!          -> agent-application  the loop, the tools, prompt assembly
+//!          -> agent-infrastructure  HTTP clients, filesystem, config
+//!               -> agent-domain     entities, value objects, ports
 //! ```
+//!
+//! The agent is wired by the SDK; [`composition`] injects what belongs to a
+//! terminal and nothing else.
 //!
 //! A library with a thin binary (`main.rs`) on top, so that the tests under
 //! `tests/` can build the agent through the real composition root instead of

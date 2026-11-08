@@ -3,7 +3,9 @@
 //! `end_to_end.rs` wires the loop by hand, so it cannot see a tool that was
 //! never registered, a decorator left off, or an approval setting wired to
 //! the wrong place. These tests call [`composition::assemble`] - the function
-//! every subcommand goes through - with settings injected through `MapEnv`
+//! every subcommand goes through, which is `agent_sdk::unstable::assemble`
+//! with the terminal's approval gate injected, so what they see is the SDK's
+//! wiring under the binary's gate - with settings injected through `MapEnv`
 //! (never the process environment) and a temporary workspace, and check what
 //! came out. The model, where one is needed, is a loopback mock.
 

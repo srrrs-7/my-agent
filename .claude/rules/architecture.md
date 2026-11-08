@@ -10,7 +10,8 @@
 | `agent-domain` | エンティティ、値オブジェクト、ポート(trait)、エラー語彙、共有カーネル(`text`) | std, serde, serde_json, thiserror, async-trait, futures-core(Stream trait のみ) |
 | `agent-application` | ユースケース: ループ、ディスパッチャ、プロンプト組み立て、ツール実装 | domain, async-trait, futures, serde, tracing |
 | `agent-infrastructure` | アダプタ: LLM の HTTP クライアント、FS、検索、設定、テレメトリ | domain, reqwest, tokio, futures, bytes, ignore, regex, chrono |
-| `agent-cli` | 引数解析、描画、承認 UI、合成ルート | 全て |
+| `agent-sdk` | 合成ルート（`unstable::assemble`。DI はここだけ）と埋め込み用の安定 API（`Agent` / `Session` / `Interrupt` / `Outcome` / `events` DTO） | domain, application, infrastructure, anyhow, async-trait, futures, serde, serde_json, tracing, uuid |
+| `agent-cli` | 引数解析、描画、承認 UI（`CliApprovalGate`）、通知、Ctrl-C、REPL、`.env`。sdk の上の薄い層 | 全て |
 | `agent-test-support` | テストダブル | tokio, serde_json |
 
 `agent-application` に `tokio` を足さないでください（`invariants.md` §1）。
@@ -20,7 +21,9 @@
 | 追加するもの | 置き場所 |
 |---|---|
 | 新しい概念・不変条件を持つ値 | `domain/src/model/` |
-| 外界との新しい境界 | `domain/src/ports/` + `infrastructure` に実装 + `composition.rs` に結線 |
+| 外界との新しい境界 | `domain/src/ports/` + `infrastructure` に実装 + `sdk/src/unstable.rs`（合成ルート）に結線 |
+| 端末に固有の注入（承認の問い方・描画・通知） | `cli/src/composition.rs`。sdk の `Wiring::asks` / `events` 経由で渡す |
+| 埋め込み向けの公開 API | `sdk/src/`（`unstable` 以外）。公開 enum は `#[non_exhaustive]`、ドメイン型をそのまま安定 API にしない |
 | モデルに公開する新しい能力 | `application/src/tools/` （`/add-tool` スキル参照） |
 | 新しい LLM ベンダ | `infrastructure/src/llm/` （`/add-provider` スキル参照） |
 | 横断的関心事（タイムアウト・リトライ・計測） | `infrastructure` の装飾子。ポートを実装して内側をラップする |
@@ -91,7 +94,7 @@ Arc<dyn LlmProvider>
 - ファイルを書くツールは、`execute` と同じ計算（共通の関数）で予定を返す。承認された内容と書かれる内容がずれないように
 - 書かないツール（読み取り・コマンド・ネットワーク）は空の `Vec` を返す
 - **装飾子は必ず内側に転送する**。空を返すと、その装飾子越しの書き込みが依存の承認を素通りする
-  （`composition.rs` のテストが Redacting(Timeout(write_file)) で固定）
+  （`sdk/src/unstable.rs` のテストが Redacting(Timeout(write_file)) で固定）
 
 ディスパッチャは Phase 2 の各 invoke 直前に `preview` を呼び、依存ファイル（`ManifestKind::classify`）の
 中身が変わるなら `ApprovalGate::authorize_dependency_change` を呼びます。差分の説明は
@@ -120,7 +123,8 @@ Arc<dyn LlmProvider>
 **`agent run --output-format json|stream-json` では stdout は JSON だけ**です（`cli/src/output/`）。
 散文もストリーミングの断片も stdout に出しません — 回答は結果オブジェクトの `final_text` に入ります。
 stderr はそのまま（`TerminalRenderer` から散文のイベントだけを除いて転送）。
-JSON の形は cli 側の DTO（`output/dto.rs`）が決め、**`AgentEvent` やドメイン型に `Serialize` を付けません**。
+JSON の形は SDK の DTO（`sdk/src/events.rs`、cli からは `output::dto` として再公開）が決め、
+**`AgentEvent` やドメイン型に `Serialize` を付けません**。この DTO は SDK の安定スキーマでもあります。
 ドメインの改名が公開スキーマを黙って変えないためです。全行に `"v":1` が付きます。
 起動失敗・プロバイダの失敗・中断を含め、どの終わり方でも最後に `"type":"result"` の 1 行を出します。
 

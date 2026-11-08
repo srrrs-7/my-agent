@@ -21,7 +21,7 @@ color: blue
 
 - **依存は内向きのみ。** `application` に `infrastructure` も `tokio` も足さない。
   新しい能力が必要なら `domain/src/ports/` に trait を足し、`infrastructure` で実装し、
-  `cli/src/composition.rs` で結線する
+  合成ルート `sdk/src/unstable.rs`（cli 固有の注入は `cli/src/composition.rs`）で結線する
 - **ファイルアクセスは `WorkspacePath` 経由。** 生の文字列からパスを組み立てない
 - **ツール失敗は `tool_result` として返す。** ループを止めるのはプロバイダが壊れているときだけ
 - **エラーメッセージは読み手で書き分ける。** LLM 向けなら「次に何をすべきか」を書く

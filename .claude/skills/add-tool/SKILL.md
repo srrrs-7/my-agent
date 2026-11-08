@@ -58,7 +58,7 @@ impl Tool for XxxTool {
 ## 3. 登録する
 
 1. `crates/application/src/tools/<category>/mod.rs` で `pub use`
-2. `crates/cli/src/composition.rs` の `ToolRegistry` に追加する。
+2. `crates/sdk/src/unstable.rs`（合成ルート。`assemble` の `build_tools`）の `ToolRegistry` に追加する。
    **`TimeoutTool::wrap(..., timeout)` で包むのを忘れない**（1 回の暴走がループを止めないため）
 
 ## 4. テストする

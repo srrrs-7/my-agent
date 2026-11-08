@@ -452,6 +452,50 @@ make run ARGS="run --output-format json 'テストを直して'" | jq -r .final_
 | `nested` | `parent_call_id`（そのサブエージェントを起動した `spawn_agent` の `call_id`）, `event`（サブエージェントのイベント。上の表と同じ形で `v` なし）。中の `assistant_message` はサブエージェントの親への回答で、ターンの回答ではない |
 | `result` | 上の結果オブジェクト。必ず最後の 1 行 |
 
+### Rust から使う（SDK）
+
+`agent-sdk` crate が、`agent` バイナリと**同じ配線**（ツール・装飾子・サンドボックス・承認の積み重ね）を
+ライブラリとして公開しています。バイナリ自体がこの上の薄い層です。
+
+```rust
+use std::sync::Arc;
+use agent_sdk::{Agent, Config, Interrupt, approval};
+
+let config = Config::from_env()?               // AGENT_* を読む（.env は読まない）
+    .with_workspace("/path/to/project");
+let agent = Agent::builder(config)
+    .approval(approval::from_fn(|request| {    // AGENT_APPROVAL が事前に答えない呼び出しだけが来る
+        approval::ApprovalDecision::Deny { reason: "not here".into() }
+    }))
+    .events(Arc::new(my_sink))                 // EventSink。events::EventDto::from(&event) が安定な形
+    .build()
+    .await?;
+
+let outcome = agent.run("README を要約して").await?;      // 1 ターン
+let mut chat = agent.session();                         // 履歴を持つ会話（agent chat 相当）
+let interrupt = Interrupt::new();                       // 別スレッドから fire() で止める
+let outcome = chat.send_until("続けて", &interrupt).await?;
+```
+
+| 公開するもの | 中身 |
+|---|---|
+| `Agent` / `AgentBuilder` | 組み立てと `run` / `run_until` / `session` |
+| `Session` | `send` / `send_until`。セッションログ（`.agent/sessions/`）にも記録される |
+| `Outcome` / `Reason` | 回答・終わり方・反復回数・トークン使用量・セッション ID |
+| `Interrupt` | 実行中のターンを、履歴を壊さない地点で止める |
+| `Config` | `from_env()` / `from_vars(...)`（`AGENT_*` を任意の場所から渡す） |
+| `ApprovalGate` / `approval::from_fn` | 承認のコールバック。拒否は `tool_result` としてモデルに返り、ターンは続く |
+| `EventSink` / `events` | 進捗の受け口と、その JSON の形（`--output-format stream-json` と同じスキーマ、`"v":1`） |
+
+- 承認ゲートを渡さないと、`AGENT_APPROVAL` が事前に許可しない呼び出し（既定では読み取り以外）はすべて拒否されます
+- 権限ルール・フック・プランモードはバイナリと同じく、渡したゲートの**外側**に積まれます
+- セッションログの保持期間の刈り込みは行いません（ホスト側の判断）。`.env` も読みません
+- 公開 enum と `Outcome` は `#[non_exhaustive]` です。`match` にはワイルドカードの腕を置いてください
+- `agent_sdk::unstable` はバイナリとテストのための合成ルートそのもので、互換性は保証しません
+
+最小の例は `crates/sdk/examples/ask.rs` です（`make cargo CMD="run -p agent-sdk --example ask -- 質問"`。
+実行には LLM が要ります）。
+
 ### ツール承認（human-in-the-loop）
 
 `AGENT_APPROVAL` で制御します。
@@ -1312,7 +1356,8 @@ crates/
   domain/          エンティティ・値オブジェクト・ポート（trait）。std + serde のみ
   application/     ユースケース: エージェントループ、ツールディスパッチ、ツール実装
   infrastructure/  アダプタ: LLM の HTTP クライアント、ファイルシステム、設定、ログ
-  cli/             プレゼンテーション + 合成ルート（DI はここだけ）
+  sdk/             合成ルート（DI はここだけ）+ 埋め込み用の安定 API（agent-sdk）
+  cli/             プレゼンテーション: 引数・描画・端末の承認・通知・REPL（sdk の上の薄い層）
   test-support/    統合テスト用のモック LLM サーバ（dev-dependency のみ）
 ```
 
@@ -1423,15 +1468,18 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 1237 本、外部ネットワークもモデルも不要です。
+テストは 1244 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
 - LLM クライアント … 生 TCP のモックサーバで実 HTTP を検証
 - E2E … HTTP → provider → routing → retry → loop → tools → 実ファイルシステム
   （`crates/cli/tests/end_to_end.rs`。配線はテスト側で組み直した最小構成）
-- 合成ルート … 本物の `composition::assemble` を `MapEnv` の設定で呼び、登録ツール・装飾子・
-  承認ゲート・会話ログ・サンドボックス不成立時の起動失敗を固定（`crates/cli/tests/composition.rs`）
+- 合成ルート … 本物の `composition::assemble`（= `agent_sdk::unstable::assemble` + 端末の承認ゲート）を
+  `MapEnv` の設定で呼び、登録ツール・装飾子・承認ゲート・会話ログ・サンドボックス不成立時の起動失敗を固定
+  （`crates/cli/tests/composition.rs`）
+- SDK … 公開 API だけでモック LLM に対して `run`・承認コールバック・イベント DTO・`Interrupt` を確かめる
+  （`crates/sdk/tests/sdk.rs`）
 - 実バイナリ … `agent` を子プロセスとして起動し、モック LLM とモック Webhook だけを相手に
   合成ルートと終了処理まで通す（`crates/cli/tests/notify_e2e.rs`）。Ctrl-C は実際に SIGINT を送って
   終了コードと会話の保持を確かめる（`crates/cli/tests/interrupt_e2e.rs`）

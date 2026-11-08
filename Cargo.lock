@@ -23,6 +23,7 @@ dependencies = [
  "agent-application",
  "agent-domain",
  "agent-infrastructure",
+ "agent-sdk",
  "agent-test-support",
  "anyhow",
  "async-trait",
@@ -70,6 +71,25 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "agent-application",
+ "agent-domain",
+ "agent-infrastructure",
+ "agent-test-support",
+ "anyhow",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

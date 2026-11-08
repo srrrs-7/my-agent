@@ -63,10 +63,11 @@ LLM 接続先が要るので、先に `make env` で `.env` を作ってくだ�
 ## アーキテクチャの全体像
 
 ```
-crates/cli            (agent-cli)            プレゼンテーション + 合成ルート（DI はここだけ）
-  ├→ crates/application    (agent-application)    ループ、ディスパッチャ、ツール実装
-  └→ crates/infrastructure (agent-infrastructure) LLM クライアント、FS、設定、ログ
-        └→ crates/domain   (agent-domain)         エンティティ・値オブジェクト・ポート(trait)
+crates/cli            (agent-cli)            プレゼンテーション（端末の承認・描画・通知・REPL）
+  └→ crates/sdk           (agent-sdk)            合成ルート（DI はここだけ）+ 埋め込み用の安定 API
+       ├→ crates/application    (agent-application)    ループ、ディスパッチャ、ツール実装
+       └→ crates/infrastructure (agent-infrastructure) LLM クライアント、FS、設定、ログ
+             └→ crates/domain   (agent-domain)         エンティティ・値オブジェクト・ポート(trait)
 crates/test-support   (agent-test-support)   統合テスト用モック LLM サーバ（dev のみ）
 ```
 
@@ -80,11 +81,13 @@ crates/test-support   (agent-test-support)   統合テスト用モック LLM サ
 | `crates/application/src/agent/loop_runner.rs` | エージェントループ本体 |
 | `crates/application/src/agent/dispatch.rs` | ツール実行の不変条件（順序・並列・承認） |
 | `crates/domain/src/model/conversation.rs` | 履歴を短くするときの規則。対を壊さない境界と、何を残すかの重み付け |
-| `crates/cli/src/composition.rs` | 具象と抽象が結線される唯一の場所 |
+| `crates/sdk/src/unstable.rs` | 具象と抽象が結線される唯一の場所（合成ルート） |
 
-**`crates/cli` は lib + 薄い bin です。** すべてのサブコマンドの配線は
-`composition::assemble(settings, wiring)` を通ります（`build` は環境と CLI 引数から
-`Settings` を作ってこれを呼ぶだけ）。`crates/cli/tests/composition.rs` がこれを
+**合成ルートは `agent-sdk` にあり、`crates/cli` はその上の薄い層です。** 配線の本体は
+`agent_sdk::unstable::assemble` で、cli の `composition::assemble(settings, wiring)` は
+そこに端末固有のもの（`CliApprovalGate`・通知・リモート承認）を注入するだけです
+（`build` は環境と CLI 引数から `Settings` を作ってこれを呼ぶだけ）。埋め込み用の
+`agent_sdk::Agent` も同じ関数を通ります。`crates/cli/tests/composition.rs` がこれを
 `MapEnv` で設定を注入して直接呼び、登録ツールの集合・設定による条件付き登録・
 装飾子（伏せ字・タイムアウト・依存監視）・承認ゲート・会話ログ・サンドボックス不成立時の
 起動失敗を固定しています。実バイナリを起動する `*_e2e.rs` も同じ配線を通ります。

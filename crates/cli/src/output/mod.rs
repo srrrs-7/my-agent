@@ -8,9 +8,10 @@
 //!
 //! `json` holds everything back and prints one result object when the turn
 //! ends; `stream-json` prints one event per line as it happens, then the same
-//! result object. The shapes are in [`dto`].
+//! result object. The shapes are in [`dto`], which is `agent_sdk::events`:
+//! the schema is published by the SDK, and this module only writes it.
 
-pub mod dto;
+pub use agent_sdk::events as dto;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
