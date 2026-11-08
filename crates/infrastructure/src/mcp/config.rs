@@ -16,6 +16,12 @@
 //!
 //! Unknown fields are errors rather than ignored, so a misspelt
 //! `workspace_acess` cannot silently fall back to a default.
+//!
+//! Secrets do not belong in the file. Reads are not confined, so anything
+//! written here can be read by every server and every `run_command` child
+//! that knows where to look. A server's credentials are named in `env_from`
+//! instead and copied from the agent's own environment at startup; there they
+//! are withheld from every other child by value.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -63,10 +69,21 @@ pub struct ServerConfig {
     #[serde(default)]
     pub args: Vec<String>,
     /// Set in the server's environment after everything secret-looking from
-    /// this process's own environment has been removed. These values are
-    /// treated as secrets: hidden from tool output wherever they appear.
+    /// this process's own environment has been removed. Written in the file,
+    /// so readable by every server and child: for values that are not
+    /// secret. Still hidden from tool output, in case one is.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Names of variables copied from the agent's own environment into the
+    /// server's, at startup - the way to hand a server a secret. Missing one
+    /// fails startup. The values are hidden from tool output and withheld
+    /// from every other child.
+    #[serde(default)]
+    pub env_from: Vec<String>,
+    /// What `env_from` resolved to. Filled by [`McpConfig::load`] (or
+    /// [`McpConfig::resolve_env`]), never read from the file.
+    #[serde(skip)]
+    pub inherited: BTreeMap<String, String>,
     /// Domain suffixes the server may reach through its egress proxy. Empty
     /// means no network at all.
     #[serde(default)]
@@ -75,7 +92,7 @@ pub struct ServerConfig {
     pub workspace_access: WorkspaceAccess,
 }
 
-/// Values in `env` are secrets by assumption, so they never reach a log.
+/// Environment values may be secrets, so they never reach a log.
 impl fmt::Debug for ServerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -83,6 +100,7 @@ impl fmt::Debug for ServerConfig {
             .field("command", &self.command)
             .field("args", &self.args)
             .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("env_from", &self.env_from)
             .field("allow_hosts", &self.allow_hosts)
             .field("workspace_access", &self.workspace_access)
             .finish()
@@ -117,13 +135,24 @@ pub enum McpConfigError {
          workspace"
     )]
     InsideWorkspace { what: String, path: String },
+
+    #[error(
+        "MCP server `{server}`: `env_from` names `{name}`, which is not set in the agent's \
+         environment. Set it (for example in `.env`), or remove it from `env_from`"
+    )]
+    MissingVariable { server: String, name: String },
 }
 
 impl McpConfig {
     /// Reads, parses and checks the file at `path` against the canonical
     /// `workspace` - including that neither the file nor any program it
-    /// starts lives inside it.
-    pub fn load(path: &Path, workspace: &Path) -> Result<Self, McpConfigError> {
+    /// starts lives inside it - and resolves every `env_from` against
+    /// `environment` (the agent's own variables).
+    pub fn load(
+        path: &Path,
+        workspace: &Path,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, McpConfigError> {
         let unreadable = |error: std::io::Error| McpConfigError::Unreadable {
             path: path.display().to_string(),
             message: error.to_string(),
@@ -144,7 +173,32 @@ impl McpConfig {
         for (name, server) in &mut config.servers {
             server.resolve(name, workspace)?;
         }
+        config.resolve_env(environment)?;
         Ok(config)
+    }
+
+    /// Copies every server's `env_from` variables out of `environment`.
+    /// A name that is not there fails, naming it: a server started without
+    /// its credential would fail later, and less clearly.
+    pub fn resolve_env(
+        &mut self,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<(), McpConfigError> {
+        for (server_name, server) in &mut self.servers {
+            server.inherited = server
+                .env_from
+                .iter()
+                .map(|name| {
+                    environment(name)
+                        .map(|value| (name.clone(), value))
+                        .ok_or_else(|| McpConfigError::MissingVariable {
+                            server: server_name.clone(),
+                            name: name.clone(),
+                        })
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        Ok(())
     }
 
     /// The format and the limits, with nothing read from disk.
@@ -167,13 +221,29 @@ impl McpConfig {
         Ok(config)
     }
 
-    /// Every value handed to a server through `env`, for the redactor. A
-    /// server can echo what it was given, and the operator put it there
-    /// precisely because it is a credential.
+    /// Every value handed to a server, through `env` or `env_from`, for the
+    /// redactor. A server can echo what it was given, and the operator may
+    /// well have put it there because it is a credential.
     pub fn secret_values(&self) -> Vec<String> {
         self.servers
             .values()
-            .flat_map(|server| server.env.values().cloned())
+            .flat_map(|server| server.env.values().chain(server.inherited.values()))
+            .cloned()
+            .collect()
+    }
+
+    /// The values `env_from` resolved to, to be withheld from every child by
+    /// value (see `ExecConfig::withheld`): the variable they came from is in
+    /// the agent's environment, and other servers and `run_command` inherit
+    /// it unless removed.
+    ///
+    /// Literal `env` values are not included. They are documented as not
+    /// secret, and withholding an ordinary value such as a path would take
+    /// unrelated variables - `PATH` among them - with it.
+    pub fn inherited_values(&self) -> Vec<String> {
+        self.servers
+            .values()
+            .flat_map(|server| server.inherited.values().cloned())
             .collect()
     }
 }
@@ -212,6 +282,7 @@ impl ServerConfig {
         for (field, count, limit) in [
             ("args", self.args.len(), MAX_ARGS),
             ("env", self.env.len(), MAX_ENV),
+            ("env_from", self.env_from.len(), MAX_ENV),
             ("allow_hosts", self.allow_hosts.len(), MAX_ALLOW_HOSTS),
         ] {
             if count > limit {
@@ -227,6 +298,18 @@ impl ServerConfig {
             if key.is_empty() || key.contains('=') || key.contains('\0') || value.contains('\0') {
                 return Err(invalid(format!(
                     "`{key}` is not a usable environment variable name and value"
+                )));
+            }
+        }
+        for name in &self.env_from {
+            if name.is_empty() || name.contains('=') || name.contains('\0') {
+                return Err(invalid(format!(
+                    "`{name}` in `env_from` is not a usable environment variable name"
+                )));
+            }
+            if self.env.contains_key(name) {
+                return Err(invalid(format!(
+                    "`{name}` is in both `env` and `env_from`; keep one (`env_from` for a secret)"
                 )));
             }
         }
@@ -307,6 +390,11 @@ mod tests {
     /// `/bin/sh` exists everywhere this is built and is never in a workspace.
     const SH_SERVER: &str = r#"{"servers": {"files": {"command": "/bin/sh"}}}"#;
 
+    /// An agent environment with nothing in it.
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
     #[test]
     fn a_minimal_server_gets_the_safe_defaults() {
         let config = McpConfig::parse(SH_SERVER).unwrap();
@@ -314,6 +402,80 @@ mod tests {
         assert_eq!(server.workspace_access, WorkspaceAccess::None);
         assert!(server.allow_hosts.is_empty());
         assert!(server.env.is_empty());
+        assert!(server.env_from.is_empty());
+    }
+
+    #[test]
+    fn env_from_copies_the_agents_value_and_marks_it_secret() {
+        let mut config = McpConfig::parse(
+            r#"{"servers": {"files": {"command": "/bin/sh", "env": {"MODE": "fast"},
+                "env_from": ["ISSUES_TOKEN"]}}}"#,
+        )
+        .unwrap();
+        config
+            .resolve_env(&|name| (name == "ISSUES_TOKEN").then(|| "from-the-agent-env".into()))
+            .unwrap();
+
+        let server = &config.servers["files"];
+        assert_eq!(
+            server.inherited,
+            BTreeMap::from([("ISSUES_TOKEN".into(), "from-the-agent-env".into())])
+        );
+        assert_eq!(config.inherited_values(), ["from-the-agent-env"]);
+        let mut secrets = config.secret_values();
+        secrets.sort();
+        assert_eq!(secrets, ["fast", "from-the-agent-env"]);
+        assert!(
+            !format!("{config:?}").contains("from-the-agent-env"),
+            "{config:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_env_from_variable_fails_and_names_it() {
+        let mut config = McpConfig::parse(
+            r#"{"servers": {"files": {"command": "/bin/sh", "env_from": ["ISSUES_TOKEN"]}}}"#,
+        )
+        .unwrap();
+        let error = config.resolve_env(&no_env).unwrap_err();
+        assert_eq!(
+            error,
+            McpConfigError::MissingVariable {
+                server: "files".into(),
+                name: "ISSUES_TOKEN".into(),
+            }
+        );
+        assert!(error.to_string().contains("`ISSUES_TOKEN`"), "{error}");
+    }
+
+    #[test]
+    fn load_resolves_env_from() {
+        let (_ws, workspace) = canonical_tempdir();
+        let (_cfg, outside) = canonical_tempdir();
+        let path = write_config(
+            &outside,
+            r#"{"servers": {"files": {"command": "/bin/sh", "env_from": ["T"]}}}"#,
+        );
+        assert!(matches!(
+            McpConfig::load(&path, &workspace, &no_env),
+            Err(McpConfigError::MissingVariable { .. })
+        ));
+        let config = McpConfig::load(&path, &workspace, &|_| Some("v".into())).unwrap();
+        assert_eq!(config.servers["files"].inherited["T"], "v");
+    }
+
+    #[test]
+    fn a_bad_or_doubled_env_from_name_is_refused() {
+        for text in [
+            r#"{"servers": {"files": {"command": "/bin/sh", "env_from": [""]}}}"#,
+            r#"{"servers": {"files": {"command": "/bin/sh", "env_from": ["A=B"]}}}"#,
+            r#"{"servers": {"files": {"command": "/bin/sh", "env": {"T": "x"}, "env_from": ["T"]}}}"#,
+        ] {
+            assert!(
+                matches!(McpConfig::parse(text), Err(McpConfigError::Invalid { .. })),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -392,7 +554,7 @@ mod tests {
         let (_cfg, outside) = canonical_tempdir();
         let path = write_config(&outside, SH_SERVER);
 
-        let config = McpConfig::load(&path, &workspace).unwrap();
+        let config = McpConfig::load(&path, &workspace, &no_env).unwrap();
         assert!(config.servers["files"].command.is_absolute());
     }
 
@@ -401,7 +563,7 @@ mod tests {
         let (_ws, workspace) = canonical_tempdir();
         let path = write_config(&workspace, SH_SERVER);
 
-        let error = McpConfig::load(&path, &workspace).unwrap_err();
+        let error = McpConfig::load(&path, &workspace, &no_env).unwrap_err();
         assert!(
             matches!(error, McpConfigError::InsideWorkspace { .. }),
             "{error:?}"
@@ -418,7 +580,7 @@ mod tests {
         std::os::unix::fs::symlink(&inside, &link).unwrap();
 
         assert!(matches!(
-            McpConfig::load(&link, &workspace),
+            McpConfig::load(&link, &workspace, &no_env),
             Err(McpConfigError::InsideWorkspace { .. })
         ));
     }
@@ -437,7 +599,7 @@ mod tests {
             ),
         );
 
-        let error = McpConfig::load(&path, &workspace).unwrap_err();
+        let error = McpConfig::load(&path, &workspace, &no_env).unwrap_err();
         assert!(
             matches!(&error, McpConfigError::InsideWorkspace { what, .. } if what.contains("program")),
             "{error:?}"
@@ -459,7 +621,7 @@ mod tests {
             ),
         );
         assert!(matches!(
-            McpConfig::load(&path, &workspace),
+            McpConfig::load(&path, &workspace, &no_env),
             Err(McpConfigError::InsideWorkspace { .. })
         ));
 
@@ -471,7 +633,7 @@ mod tests {
                 workspace.display()
             ),
         );
-        assert!(McpConfig::load(&path, &workspace).is_ok());
+        assert!(McpConfig::load(&path, &workspace, &no_env).is_ok());
     }
 
     #[test]
@@ -482,7 +644,7 @@ mod tests {
             &outside,
             r#"{"servers": {"files": {"command": "/nonexistent/server"}}}"#,
         );
-        let error = McpConfig::load(&path, &workspace).unwrap_err();
+        let error = McpConfig::load(&path, &workspace, &no_env).unwrap_err();
         assert!(error.to_string().contains("/nonexistent/server"), "{error}");
     }
 }

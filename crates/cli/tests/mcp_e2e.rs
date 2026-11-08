@@ -26,6 +26,11 @@ const DEADLINE: Duration = Duration::from_secs(90);
 /// secret for the redactor.
 const SECRET: &str = "mcp-secret-0123456789";
 
+/// Handed to the server through `env_from`: set in the agent's environment,
+/// never written in the file. Its name has no secret-looking suffix, so only
+/// the value can keep it from other children.
+const INHERITED: &str = "inherited-secret-9876543210";
+
 /// A tiny MCP server. `$1` is the workspace, for the tool that writes there.
 const SERVER: &str = r#"
 ws="$1"
@@ -39,10 +44,12 @@ while IFS= read -r line; do
     *'"method":"initialize"'*)
       reply "$id" '{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"probe","version":"0"}}' ;;
     *'"method":"tools/list"'*)
-      reply "$id" '{"tools":[{"name":"echo","description":"Says what it was given.","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"hang"},{"name":"bump"},{"name":"spawn"}]}' ;;
+      reply "$id" '{"tools":[{"name":"echo","description":"Says what it was given.","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"hang"},{"name":"bump"},{"name":"spawn"},{"name":"inherited"},{"name":"config"}]}' ;;
     *'"method":"tools/call"'*)
       case "$line" in
         *'"name":"echo"'*) text "$id" "token=$PROBE_TOKEN" ;;
+        *'"name":"inherited"'*) text "$id" "key=${PROBE_KEY:-unset}" ;;
+        *'"name":"config"'*) text "$id" "config=${AGENT_MCP_CONFIG:-unset}" ;;
         *'"name":"hang"'*) : ;;
         *'"name":"bump"'*)
           printf 'tokio = "1"\n' >> "$ws/Cargo.toml"
@@ -83,6 +90,15 @@ impl Fixture {
     /// Writes a configuration for the probe server to `dir` and returns its
     /// path.
     fn config_in(&self, dir: &Path, workspace_access: &str) -> PathBuf {
+        self.write_config(dir, workspace_access, &[])
+    }
+
+    /// A configuration whose server also takes `env_from` from the agent.
+    fn config_inheriting(&self, env_from: &[&str]) -> PathBuf {
+        self.write_config(self.outside.path(), "none", env_from)
+    }
+
+    fn write_config(&self, dir: &Path, workspace_access: &str, env_from: &[&str]) -> PathBuf {
         let script = self.outside.path().join("server.sh");
         let config = serde_json::json!({
             "servers": {
@@ -90,6 +106,7 @@ impl Fixture {
                     "command": "/bin/sh",
                     "args": [script, self.workspace()],
                     "env": {"PROBE_TOKEN": SECRET},
+                    "env_from": env_from,
                     "workspace_access": workspace_access,
                 }
             }
@@ -240,6 +257,109 @@ async fn a_value_handed_to_a_server_is_redacted_from_what_it_returns() {
         "the call ran and its output was redacted: {result}"
     );
     assert!(!result.contains(SECRET), "{result}");
+}
+
+#[tokio::test]
+async fn env_from_hands_the_server_the_agents_value_and_it_is_redacted() {
+    let fixture = Fixture::new();
+    let config = fixture.config_inheriting(&["PROBE_KEY"]);
+    let llm = one_call("mcp__probe__inherited").await;
+
+    let output = agent(
+        &fixture.workspace(),
+        Some(&llm),
+        &[
+            ("AGENT_MCP_CONFIG", config.to_str().unwrap()),
+            ("AGENT_APPROVAL", "auto"),
+            ("PROBE_KEY", INHERITED),
+        ],
+        &["run", "inherited"],
+    )
+    .await;
+    assert_success(&output);
+
+    let result = tool_result(llm).await;
+    // `[REDACTED]` rather than `unset`: the value reached the server, and was
+    // hidden on the way back.
+    assert!(result.contains("key=[REDACTED]"), "{result}");
+    assert!(!result.contains(INHERITED), "{result}");
+}
+
+#[tokio::test]
+async fn an_env_from_variable_missing_from_the_agent_fails_startup() {
+    let fixture = Fixture::new();
+    let config = fixture.config_inheriting(&["PROBE_KEY"]);
+    let output = agent(
+        &fixture.workspace(),
+        None,
+        &[("AGENT_MCP_CONFIG", config.to_str().unwrap())],
+        &["tools"],
+    )
+    .await;
+
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("`PROBE_KEY`") && stderr.contains("env_from"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_is_not_told_where_the_configuration_is() {
+    let fixture = Fixture::new();
+    let config = fixture.config("none");
+    let llm = one_call("mcp__probe__config").await;
+
+    let output = agent(
+        &fixture.workspace(),
+        Some(&llm),
+        &[
+            ("AGENT_MCP_CONFIG", config.to_str().unwrap()),
+            ("AGENT_APPROVAL", "auto"),
+        ],
+        &["run", "config"],
+    )
+    .await;
+    assert_success(&output);
+
+    let result = tool_result(llm).await;
+    assert!(result.contains("config=unset"), "{result}");
+}
+
+#[tokio::test]
+async fn run_command_sees_neither_the_configuration_nor_a_servers_inherited_secret() {
+    let fixture = Fixture::new();
+    let config = fixture.config_inheriting(&["PROBE_KEY"]);
+    let llm = MockLlmServer::start(vec![
+        Response::tool_call(
+            "call_1",
+            "run_command",
+            r#"{"command": "echo config=${AGENT_MCP_CONFIG:-unset} key=${PROBE_KEY:-unset}"}"#,
+        ),
+        Response::assistant_text("done"),
+    ])
+    .await;
+
+    let output = agent(
+        &fixture.workspace(),
+        Some(&llm),
+        &[
+            ("AGENT_MCP_CONFIG", config.to_str().unwrap()),
+            ("AGENT_APPROVAL", "auto"),
+            ("AGENT_SHELL", "true"),
+            ("PROBE_KEY", INHERITED),
+        ],
+        &["run", "env"],
+    )
+    .await;
+    assert_success(&output);
+
+    let result = tool_result(llm).await;
+    assert!(
+        result.contains("config=unset key=unset"),
+        "the command ran and inherited neither: {result}"
+    );
 }
 
 #[tokio::test]

@@ -321,6 +321,44 @@ mod tests {
         assert!(!path.exists(), "{} survived the drop", path.display());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_name_already_taken_is_skipped_and_the_new_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let parent = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        // Every name the next calls could pick, taken in advance - generously,
+        // since other tests share the counter.
+        let start = COUNTER.load(Ordering::Relaxed);
+        let taken = start..start + 256;
+        for n in taken.clone() {
+            let dir = parent.path().join(format!("taken-{pid}-{n}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("planted"), "").unwrap();
+        }
+
+        let scratch = ScratchDir::create(parent.path(), "taken-").unwrap();
+
+        let name = scratch.path().file_name().unwrap().to_string_lossy();
+        let n: u64 = name.rsplit('-').next().unwrap().parse().unwrap();
+        assert!(n >= taken.end, "reused an existing directory: {name}");
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        let mode = std::fs::metadata(scratch.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "mode {mode:o}");
+        for n in taken {
+            let dir = parent.path().join(format!("taken-{pid}-{n}"));
+            assert!(
+                dir.join("planted").is_file(),
+                "{} was touched",
+                dir.display()
+            );
+        }
+    }
+
     #[test]
     fn keep_leaves_the_copy_in_place() {
         let fixture = fixture();

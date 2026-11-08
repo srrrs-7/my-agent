@@ -16,9 +16,18 @@
 //!   carries no secret-looking suffix, yet whoever can read it can post to the
 //!   user's phone; matching on what the settings hold catches it, and every
 //!   future setting of the kind, without naming it.
+//!
+//! Plus a short list of this agent's own variables that are no secret
+//! themselves but lead to one ([`ALWAYS_WITHHELD`]).
 use std::ffi::OsString;
 
 use crate::secrets::{MIN_SECRET_CHARS, is_secret};
+
+/// Removed from every child by name, whatever they hold.
+const ALWAYS_WITHHELD: &[&str] = &[
+    // Reads are not confined, so the path is all a child needs to read every server's `env`.
+    "AGENT_MCP_CONFIG",
+];
 
 /// Removes every secret variable from a child's environment: by name, and by
 /// holding one of `withheld` (the operator's configured secrets).
@@ -42,7 +51,9 @@ fn withheld_names(
         .collect();
     vars.into_iter()
         .filter(|(name, value)| {
-            let by_name = name.to_str().is_some_and(is_secret);
+            let by_name = name
+                .to_str()
+                .is_some_and(|name| is_secret(name) || ALWAYS_WITHHELD.contains(&name));
             // Lossy, because a value that is not UTF-8 as a whole can still
             // contain a secret's bytes.
             let value = value.to_string_lossy();
@@ -90,6 +101,18 @@ mod tests {
             ]
             .map(OsString::from),
         );
+    }
+
+    #[test]
+    fn the_mcp_configuration_path_is_withheld_from_every_child() {
+        let removed = withheld_names(
+            os(&[
+                ("AGENT_MCP_CONFIG", "/etc/agent/mcp.json"),
+                ("AGENT_MODEL", "qwen3:8b"),
+            ]),
+            &[],
+        );
+        assert_eq!(removed, [OsString::from("AGENT_MCP_CONFIG")]);
     }
 
     #[test]

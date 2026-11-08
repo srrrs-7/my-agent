@@ -198,6 +198,9 @@ application（`agent/compaction.rs`）にあります。
   MCP という語も JSON-RPC の型も出さない。`sandbox()` は `CommandRunner` と同じく実際に効いている封じ込めを返す
 - **infrastructure の `mcp/`** — JSON-RPC を serde_json の上に自前で書く（SDK を足さない。封じ込めを担う部品の
   サプライチェーンを増やさないため）。応答は id で振り分け、future の drop で `notifications/cancelled` を送る。
+  stdin に書くのは専用の writer タスクだけで、呼び出し側は行全体をキュー（上限 64 件）に渡す。`write_all` は
+  キャンセル安全でないため、呼び出し側の future が書く形だと drop で半端な行が残り、次のメッセージがそこへ連結される。
+  サーバが stdin を読まずに要求を送り続けて上限を超えたら停止扱いにする。
   1 メッセージ 4 MiB、stderr は読み捨て続け、drop で stdin を閉じてからプロセスグループを kill する。
   プロセスは `run_command` と同じ `exec::confined::confine_command` で封じ込めるが、書き込み可能なのは
   サーバ専用ディレクトリだけ（ワークスペースは設定で明示したときだけ）。サーバは呼び出しの合間にも動けるので、
@@ -208,6 +211,8 @@ application（`agent/compaction.rs`）にあります。
 
 設定ファイル（`AGENT_MCP_CONFIG`）は操作者のものとして扱い、ワークスペース内にあれば起動失敗、
 起動するプログラムがワークスペース内でも起動失敗にしています。設定はプログラムを起動する権限そのものだからです。
+読み取りは閉じられないので、設定ファイルに直接書いた値は全サーバと `run_command` から読めます。秘密は
+`env_from`（エージェント自身の環境からの名前指定）で渡し、その値は伏せ字の対象かつ他の子プロセスの環境から値で除去します。
 initialize の失敗やサンドボックスの欠如はエージェント全体の起動失敗です（設定したツールが黙って欠けない）。
 合成ルートは `redact_all` の前に `TimeoutTool` で包んで登録するので、最終的な形は
 `Redacting(DependencyWatch(Timeout(ServerTool)))` になります。
@@ -430,4 +435,4 @@ domain の値オブジェクト `Plan` が持ち、違反は直さず拒否し�
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 855 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 875 本）。

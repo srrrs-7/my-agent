@@ -155,7 +155,15 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     );
     // Read before the redactor: what the operator hands a server is a
     // credential, and the server can echo it back.
-    let mcp_config = load_mcp_config(&settings, workspace.as_path())?;
+    let mcp_config = load_mcp_config(&settings, workspace.as_path(), &environment)?;
+    // Kept from every child's environment by value. A server's `env_from`
+    // secrets are in this process's environment, so `run_command` and the
+    // other servers would inherit them otherwise.
+    let withheld: Vec<String> = settings
+        .configured_secrets()
+        .into_iter()
+        .chain(mcp_config.iter().flat_map(McpConfig::inherited_values))
+        .collect();
     // One instance for tool output and for notifications: a secret hidden
     // from the model must not leave by the other door.
     let redactor = Arc::new(Redactor::new(
@@ -234,12 +242,8 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     // sandbox is weaker than asked for, rather than registering the tool with
     // less protection than the operator believes it has.
     let commands = if settings.shell.enabled {
-        let runner = build_command_runner(
-            &settings.shell,
-            workspace.clone(),
-            settings.configured_secrets(),
-        )
-        .await?;
+        let runner =
+            build_command_runner(&settings.shell, workspace.clone(), withheld.clone()).await?;
 
         tools.register(TimeoutTool::wrap(
             Arc::new(RunCommandTool::new(
@@ -263,6 +267,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         mcp_config.as_ref(),
         &settings,
         workspace.as_path(),
+        &withheld,
     )
     .await?;
 
@@ -336,14 +341,25 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
 
 /// The MCP configuration, when `AGENT_MCP_CONFIG` names one. Checked against
 /// the canonical workspace: neither the file nor the programs it starts may
-/// live inside it.
-fn load_mcp_config(settings: &Settings, workspace: &std::path::Path) -> Result<Option<McpConfig>> {
+/// live inside it. `env_from` is resolved against `environment`, the agent's
+/// own variables.
+fn load_mcp_config(
+    settings: &Settings,
+    workspace: &std::path::Path,
+    environment: &[(String, String)],
+) -> Result<Option<McpConfig>> {
+    let lookup = |name: &str| {
+        environment
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
     settings
         .mcp
         .config
         .as_ref()
         .map(|path| {
-            McpConfig::load(path, workspace)
+            McpConfig::load(path, workspace, &lookup)
                 .context("AGENT_MCP_CONFIG cannot be used. Fix the file, or unset the variable")
         })
         .transpose()
@@ -361,22 +377,18 @@ async fn register_tool_servers(
     config: Option<&McpConfig>,
     settings: &Settings,
     workspace: &std::path::Path,
+    withheld: &[String],
 ) -> Result<Vec<Arc<McpServer>>> {
     let Some(config) = config else {
         return Ok(Vec::new());
     };
-    let servers = start_servers(
-        config,
-        settings.mcp.sandbox,
-        workspace,
-        &settings.configured_secrets(),
-    )
-    .await
-    .context(
-        "cannot start the MCP servers AGENT_MCP_CONFIG lists. They run only under a sandbox \
+    let servers = start_servers(config, settings.mcp.sandbox, workspace, withheld)
+        .await
+        .context(
+            "cannot start the MCP servers AGENT_MCP_CONFIG lists. They run only under a sandbox \
              (Linux 6.7+ for Landlock; macOS is not supported yet) - unset AGENT_MCP_CONFIG to \
              start without them",
-    )?;
+        )?;
     for server in &servers {
         let tools = server_tools(server.clone() as Arc<dyn ToolServer>, registry)?;
         for tool in tools {
@@ -749,7 +761,7 @@ mod tests {
         ]))
         .unwrap();
         assert!(
-            load_mcp_config(&settings, std::path::Path::new("/workspace"))
+            load_mcp_config(&settings, std::path::Path::new("/workspace"), &[])
                 .unwrap()
                 .is_none()
         );
@@ -761,6 +773,7 @@ mod tests {
             None,
             &settings,
             std::path::Path::new("/workspace"),
+            &[],
         )
         .await
         .unwrap();
