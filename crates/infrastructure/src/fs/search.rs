@@ -15,6 +15,8 @@
 //! Neither search follows symlinks below its starting point, so a link is
 //! never a match: it is neither read nor listed, wherever it leads.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -209,7 +211,13 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
         // walking it is most of the cost once hidden entries are included.
         .filter_entry(|entry| entry.file_name() != ".git");
 
-    let mut found: Vec<(SystemTime, WorkspacePath)> = Vec::new();
+    // Only the best `max_results` matches are kept, newest first and then by
+    // path: as keys `(Reverse(time), path)` they sort best-first, so the
+    // heap's top is the worst kept match and is what a better one replaces.
+    // `total` is counted apart, because the heap forgets what it drops.
+    let limit = query.max_results;
+    let mut best: BinaryHeap<(Reverse<SystemTime>, WorkspacePath)> = BinaryHeap::new();
+    let mut total = 0usize;
     for entry in builder.build() {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -229,17 +237,22 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
             .ok()
             .and_then(|meta| meta.modified().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        found.push((modified, path));
+        total += 1;
+        let key = (Reverse(modified), path);
+        if best.len() < limit {
+            best.push(key);
+        } else if best.peek().is_some_and(|worst| key < *worst) {
+            best.pop();
+            best.push(key);
+        }
     }
 
-    found.sort_by(|(a_time, a_path), (b_time, b_path)| {
-        b_time.cmp(a_time).then_with(|| a_path.cmp(b_path))
-    });
-    let total = found.len();
-    found.truncate(query.max_results);
-
     Ok(GlobMatches {
-        paths: found.into_iter().map(|(_, path)| path).collect(),
+        paths: best
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect(),
         total,
     })
 }
@@ -594,5 +607,50 @@ mod tests {
         assert_eq!(found.paths.len(), 2);
         assert_eq!(found.total, 3);
         assert!(found.truncated());
+    }
+
+    #[tokio::test]
+    async fn a_capped_glob_is_the_head_of_the_full_order_even_when_times_tie_across_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three distinct times, several files each, written in an order that
+        // is neither the result order nor the path order.
+        let files = [
+            ("m.rs", 2_000),
+            ("b.rs", 1_000),
+            ("z.rs", 3_000),
+            ("a.rs", 1_000),
+            ("k.rs", 2_000),
+            ("c.rs", 3_000),
+            ("y.rs", 1_000),
+            ("d.rs", 2_000),
+        ];
+        for (file, time) in files {
+            write(dir.path(), file, "");
+            touch(dir.path(), file, time);
+        }
+        let searcher = searcher(dir.path());
+
+        let full = searcher.glob(glob("*.rs")).await.unwrap();
+        assert_eq!(
+            shown(&full),
+            [
+                "c.rs", "z.rs", "d.rs", "k.rs", "m.rs", "a.rs", "b.rs", "y.rs"
+            ],
+            "newest first, equal times by path"
+        );
+
+        for cap in 0..=files.len() + 1 {
+            let mut capped = glob("*.rs");
+            capped.max_results = cap;
+            let found = searcher.glob(capped).await.unwrap();
+            let expected = &shown(&full)[..cap.min(files.len())];
+            assert_eq!(shown(&found), expected, "cap {cap}");
+            assert_eq!(
+                found.total,
+                files.len(),
+                "cap {cap}: the total ignores the cap"
+            );
+            assert_eq!(found.truncated(), cap < files.len(), "cap {cap}");
+        }
     }
 }

@@ -22,3 +22,6 @@ target/
 
 # agent worktrees (Claude Code isolation)
 .claude/worktrees/
+
+# temp dirs from the Unicode-folding test (removed on drop)
+.fold-test-*

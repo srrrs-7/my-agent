@@ -429,6 +429,47 @@ mod tests {
         );
     }
 
+    /// A spelling a case-insensitive filesystem opens as `x.key` is refused
+    /// before the filesystem is asked.
+    ///
+    /// The directory sits next to the crate's sources rather than in the
+    /// system temp directory: in the dev container that is the bind-mounted
+    /// macOS directory, the filesystem where the aliasing is real, while
+    /// `/tmp` is case-sensitive. Where the filesystem does not alias the
+    /// names, the refusal is still asserted and only the demonstration that
+    /// it matters is skipped.
+    #[tokio::test]
+    async fn a_unicode_spelling_of_a_protected_name_is_refused_on_a_real_filesystem() {
+        let dir = tempfile::Builder::new()
+            .prefix(".fold-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        std::fs::write(dir.path().join("x.key"), "sk-secret").unwrap();
+        let root = Arc::new(WorkspaceRoot::new(dir.path().to_path_buf()).unwrap());
+        let fs = LocalFileSystem::new(root.clone(), 1024).unwrap();
+
+        let kelvin = "x.\u{212A}ey";
+        match std::fs::read_to_string(dir.path().join(kelvin)) {
+            Ok(contents) => assert_eq!(contents, "sk-secret", "the alias reaches `x.key`"),
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::NotFound, "{error}");
+                eprintln!("skipped: this filesystem keeps `{kelvin}` and `x.key` apart");
+            }
+        }
+
+        let path = root.resolve(kelvin).unwrap();
+        let error = fs.read_to_string(&path).await.unwrap_err();
+        assert!(denied(&error, FileAccess::Read), "got {error:?}");
+        assert!(!error.to_string().contains("sk-secret"), "{error}");
+
+        let error = fs.write(&path, "overwritten").await.unwrap_err();
+        assert!(denied(&error, FileAccess::Write), "got {error:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("x.key")).unwrap(),
+            "sk-secret"
+        );
+    }
+
     #[tokio::test]
     async fn the_example_env_file_stays_readable_and_writable() {
         let fixture = fixture();

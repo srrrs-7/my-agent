@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: low
 importance: low
 priority: P3
+started: 2026-11-08
+completed: 2026-11-08
 scope: [infrastructure]
 ---
 
@@ -30,11 +32,11 @@ scope: [infrastructure]
 
 ## 達成条件
 
-- [ ] 一致の保持が `max_results` 件分のメモリで済む（`BinaryHeap` による top-k。O(N log k) 時間、O(k) 空間）
-- [ ] 既存の `glob` のテスト（新しい順 → 同時刻はパス順、件数の上限と総数の報告、保護ファイルを
+- [x] 一致の保持が `max_results` 件分のメモリで済む（`BinaryHeap` による top-k。O(N log k) 時間、O(k) 空間）
+- [x] 既存の `glob` のテスト（新しい順 → 同時刻はパス順、件数の上限と総数の報告、保護ファイルを
       出さない）がそのまま緑
-- [ ] 同じ更新日時のファイルが上限をまたぐ場合の並びが、全体ソート版と一致することをテストで固定する
-- [ ] `make check` が緑
+- [x] 同じ更新日時のファイルが上限をまたぐ場合の並びが、全体ソート版と一致することをテストで固定する
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -48,3 +50,16 @@ scope: [infrastructure]
   この issue の範囲外
 - 総数（`truncated` の注記に出す `total`）はヒープとは別にカウントすれば保てる
 - 出典: 2026-11-08 のレビュー（performance）で見送ったもの
+
+## 結果（2026-11-08）
+
+- `glob_blocking` は一致を `Vec` に全部ためて並べ替えるのをやめ、`BinaryHeap<(Reverse<SystemTime>,
+  WorkspacePath)>` に最大 `max_results` 件だけ保持する。キーの昇順が「新しい順 → 同時刻はパス順」
+  なので、ヒープの先頭は保持中の最下位で、それより良い一致が来たときだけ入れ替える。最後に
+  `into_sorted_vec()` で表示順にする。`total` はヒープとは別に数える（数え方は従来と同じ: 保護
+  ファイルは数えない）。`max_results == 0` でも 0 件・総数あり・切り詰め扱いで従来と同じ
+- テスト `a_capped_glob_is_the_head_of_the_full_order_even_when_times_tie_across_the_cap`:
+  3 種の更新日時に 8 ファイルを散らし、上限 0〜9 のそれぞれで、結果が上限なしの並びの先頭と一致し、
+  `total` と `truncated()` が従来どおりであることを固定。既存の glob テストは無変更で緑
+- stat はメモのとおり減っていない
+

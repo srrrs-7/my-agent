@@ -6,10 +6,12 @@
 //! question "is this file one of those?" is answered here, once, for every
 //! layer that asks it.
 //!
-//! Classification looks at the file name, compared case-insensitively: a
-//! case-insensitive filesystem (macOS, Windows) opens `cargo.toml` as
-//! `Cargo.toml`, so a spelling that slips past the comparison would slip past
-//! the gate while still changing the real file. The directory does not
+//! Classification looks at the file name, compared case-insensitively with
+//! Unicode case included: a case-insensitive filesystem (macOS, Windows) opens
+//! `cargo.toml` - and `package-lock.j\u{17F}on`, with a LONG S - as the real
+//! manifest, so a spelling that slips past the comparison would slip past the
+//! gate while still changing the real file. Names are compared folded, as the
+//! access policy compares them (see `file_name::fold`). The directory does not
 //! matter either - a nested crate or a vendored package has a manifest too,
 //! and a vendored manifest is committed code the next build trusts, so a
 //! change to it is a supply-chain change like any other. (What a scan of the
@@ -32,6 +34,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::model::file_name;
 use crate::model::tool::Before;
 use crate::model::workspace::WorkspacePath;
 
@@ -80,17 +83,17 @@ impl ManifestKind {
         if let Some(kind) = Self::classify_name(&name) {
             return Some(kind);
         }
-        let directory = file.parent()?.file_name()?.to_string_lossy();
-        let in_cargo_directory = directory.eq_ignore_ascii_case(".cargo");
-        let is_cargo_config =
-            name.eq_ignore_ascii_case("config") || name.eq_ignore_ascii_case("config.toml");
+        let directory = file_name::fold(&file.parent()?.file_name()?.to_string_lossy());
+        let in_cargo_directory = directory == ".cargo";
+        let name = file_name::fold(&name);
+        let is_cargo_config = name == "config" || name == "config.toml";
         (in_cargo_directory && is_cargo_config).then_some(Self::CargoConfig)
     }
 
     /// Like [`Self::classify`], for a bare file name - which cannot tell
     /// [`Self::CargoConfig`], whose name only counts inside `.cargo`.
-    pub fn classify_name(file_name: &str) -> Option<Self> {
-        let name = file_name.to_ascii_lowercase();
+    pub fn classify_name(raw: &str) -> Option<Self> {
+        let name = file_name::fold(raw);
         let kind = match name.as_str() {
             "cargo.toml" => Self::CargoToml,
             "cargo.lock" => Self::CargoLock,
@@ -373,6 +376,29 @@ mod tests {
         }
         assert_eq!(classify("Package.JSON"), Some(ManifestKind::PackageJson));
         assert_eq!(classify("gemfile"), Some(ManifestKind::Gemfile));
+    }
+
+    #[test]
+    fn unicode_spellings_that_open_a_manifest_are_recognised_as_it() {
+        // Each of these opens the ASCII-named file on APFS (macOS, and a
+        // Docker bind mount of it); classifying only ASCII case let them
+        // change the real manifest without the dependency approval.
+        for (spelling, kind) in [
+            ("package-lock.j\u{17F}on", ManifestKind::PackageLock),
+            ("PACKAGE-LOCK.J\u{17F}ON", ManifestKind::PackageLock),
+            ("Cargo.loc\u{212A}", ManifestKind::CargoLock),
+            ("go.\u{17F}um", ManifestKind::GoSum),
+            ("\u{FB01}xtures/package.json", ManifestKind::PackageJson),
+            ("requirement\u{17F}-dev.txt", ManifestKind::Requirements),
+            (".cargo/con\u{FB01}g.toml", ManifestKind::CargoConfig),
+            (".CARGO/CON\u{FB01}G", ManifestKind::CargoConfig),
+        ] {
+            assert_eq!(classify(spelling), Some(kind), "{spelling}");
+        }
+        assert_eq!(
+            ManifestKind::classify_name("yarn.loc\u{212A}"),
+            Some(ManifestKind::YarnLock)
+        );
     }
 
     #[test]

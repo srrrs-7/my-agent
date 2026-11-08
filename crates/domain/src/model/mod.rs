@@ -4,6 +4,7 @@ pub mod access;
 pub mod context;
 pub mod conversation;
 pub mod dependency;
+mod file_name;
 pub mod glob;
 pub mod llm;
 pub mod message;

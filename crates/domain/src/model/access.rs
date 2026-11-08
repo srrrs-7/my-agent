@@ -22,9 +22,10 @@
 //! * a path with a `/` before its end (`.agent/sessions/`) is a directory
 //!   relative to the workspace root, and matches it and everything below it.
 //!
-//! Matching ignores ASCII case. Case-insensitive filesystems (macOS, Windows)
-//! open `.ENV` as `.env`, and refusing `.ENV` on a case-sensitive one costs
-//! nothing.
+//! Matching ignores case, Unicode included. Case-insensitive filesystems
+//! (macOS, Windows) open `.ENV` as `.env` and `x.\u{212A}ey` (KELVIN SIGN) as
+//! `x.key`, and refusing either on a case-sensitive one costs nothing. Names
+//! are compared folded (see `file_name::fold` for exactly what that unifies).
 //!
 //! There is no way to *remove* a rule. [`AccessPolicy::standard`] is the only
 //! starting point and every other constructor adds to it, so a configuration
@@ -33,6 +34,7 @@
 use std::path::Component;
 
 use crate::error::DomainError;
+use crate::model::file_name;
 use crate::model::workspace::WorkspacePath;
 
 /// What a file operation is about to do with a path.
@@ -83,7 +85,7 @@ enum Segment {
 
 impl Segment {
     fn glob(raw: &str) -> Self {
-        let raw = raw.to_ascii_lowercase();
+        let raw = file_name::fold(raw);
         match raw.split_once('*') {
             Some((prefix, suffix)) => Self::Wildcard {
                 prefix: prefix.to_string(),
@@ -96,10 +98,10 @@ impl Segment {
     /// For a name that came from the filesystem rather than from a pattern:
     /// a `*` in it is a character, not a wildcard.
     fn literal(raw: &str) -> Self {
-        Self::Exact(raw.to_ascii_lowercase())
+        Self::Exact(file_name::fold(raw))
     }
 
-    /// `component` must already be lowercased.
+    /// `component` must already be folded.
     fn matches(&self, component: &str) -> bool {
         match self {
             Self::Exact(name) => component == name,
@@ -123,7 +125,7 @@ pub struct PathPattern {
     /// component.
     anchored: bool,
     segments: Vec<Segment>,
-    /// Lowercased names the rule leaves alone although they match it.
+    /// Folded names the rule leaves alone although they match it.
     exceptions: Vec<String>,
 }
 
@@ -206,7 +208,7 @@ impl PathPattern {
         &self.raw
     }
 
-    /// `components` must already be lowercased.
+    /// `components` must already be folded.
     fn matches(&self, components: &[String]) -> bool {
         if self.anchored {
             return components.len() >= self.segments.len()
@@ -250,7 +252,7 @@ impl AccessPolicy {
             .map(|raw| {
                 let mut pattern = builtin(raw);
                 if let Some((_, names)) = READ_EXCEPTIONS.iter().find(|(rule, _)| rule == raw) {
-                    pattern.exceptions = names.iter().map(|name| name.to_string()).collect();
+                    pattern.exceptions = names.iter().map(|name| file_name::fold(name)).collect();
                 }
                 pattern
             })
@@ -282,7 +284,7 @@ impl AccessPolicy {
     pub fn permits(&self, path: &WorkspacePath, access: FileAccess) -> bool {
         let components: Vec<String> = components(path)
             .iter()
-            .map(|name| name.to_ascii_lowercase())
+            .map(|name| file_name::fold(name))
             .collect();
         let write_only: &[PathPattern] = match access {
             FileAccess::Read => &[],
@@ -405,6 +407,51 @@ mod tests {
         assert!(!readable(&policy, "Server.PEM"));
         assert!(!writable(&policy, ".Git/config"));
         assert!(readable(&policy, ".ENV.EXAMPLE"));
+    }
+
+    #[test]
+    fn unicode_spellings_that_open_a_protected_file_are_refused() {
+        // Each of these opens the ASCII-named file on APFS (macOS, and a
+        // Docker bind mount of it), where `guard()`'s canonicalisation
+        // returns the spelling it was given rather than the stored name.
+        let policy = AccessPolicy::standard();
+        for denied in [
+            "x.\u{212A}ey",
+            "X.\u{212A}EY",
+            "certs/server.\u{212A}ey",
+            "id_r\u{17F}a",
+            "\u{131}d_rsa",
+            "\u{131}d_ed25519.pub",
+            ".pyp\u{131}rc",
+        ] {
+            assert!(!readable(&policy, denied), "`{denied}` must be unreadable");
+            assert!(!writable(&policy, denied), "`{denied}` must be unwritable");
+        }
+        assert!(
+            !readable(&policy, "secrets.\u{212A}ey/token"),
+            "a directory spelled differently is still the protected one"
+        );
+        assert!(
+            readable(&policy, "x.\u{FF4B}ey"),
+            "a fullwidth `k` is a different name on every filesystem"
+        );
+        assert!(
+            readable(&policy, "caf\u{E9}.txt"),
+            "other names stay usable"
+        );
+    }
+
+    #[test]
+    fn operator_rules_written_in_unicode_compare_case_insensitively() {
+        let policy = AccessPolicy::standard()
+            .with_read_denied(PathPattern::parse("\u{79D8}\u{5BC6}/").unwrap())
+            .with_read_denied(PathPattern::parse("CAF\u{C9}.yml").unwrap())
+            .with_write_denied(PathPattern::parse("con\u{FB01}g/").unwrap());
+        assert!(!readable(&policy, "\u{79D8}\u{5BC6}/a.txt"));
+        assert!(!readable(&policy, "deploy/caf\u{E9}.YML"));
+        assert!(!writable(&policy, "config/app.toml"));
+        assert!(!writable(&policy, "CON\u{FB01}G/app.toml"));
+        assert!(readable(&policy, "config/app.toml"));
     }
 
     #[test]
