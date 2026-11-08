@@ -8,6 +8,7 @@ use std::io::{IsTerminal, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use agent_domain::model::llm::TokenUsage;
 use agent_domain::ports::events::{AgentEvent, EventSink, FinishReason};
 
 const RESET: &str = "\x1b[0m";
@@ -139,9 +140,8 @@ impl EventSink for TerminalRenderer {
                     self.status(self.paint(
                         DIM,
                         &format!(
-                            "· {model} · {} in / {} out tokens · {} · {stop_reason:?}",
-                            usage.input_tokens,
-                            usage.output_tokens,
+                            "· {model} · {} · {} · {stop_reason:?}",
+                            describe_usage(&usage),
                             format_duration(latency),
                         ),
                     ));
@@ -195,8 +195,9 @@ impl EventSink for TerminalRenderer {
                         self.status(self.paint(
                             DIM,
                             &format!(
-                                "· done in {iterations} iteration(s), {} tokens",
-                                usage.total()
+                                "· done in {iterations} iteration(s), {} tokens{}",
+                                usage.total(),
+                                cache_suffix(&usage)
                             ),
                         ));
                     }
@@ -218,6 +219,30 @@ impl EventSink for TerminalRenderer {
     }
 }
 
+/// `1200 in / 40 out tokens`, followed by what the prompt cache did whenever
+/// it did anything. Shared by `-v` and `/usage` so the two never disagree.
+pub fn describe_usage(usage: &TokenUsage) -> String {
+    format!(
+        "{} in / {} out tokens{}",
+        usage.input_tokens,
+        usage.output_tokens,
+        cache_suffix(usage)
+    )
+}
+
+/// Empty when the cache was not involved - every request to a server without
+/// one, whose usage line should read the same as it always has.
+fn cache_suffix(usage: &TokenUsage) -> String {
+    if usage.touched_cache() {
+        format!(
+            " (cache: {} read, {} written)",
+            usage.cache_read_tokens, usage.cache_write_tokens
+        )
+    } else {
+        String::new()
+    }
+}
+
 fn format_duration(duration: Duration) -> String {
     let millis = duration.as_millis();
     if millis < 1000 {
@@ -235,6 +260,27 @@ mod tests {
     fn durations_switch_units() {
         assert_eq!(format_duration(Duration::from_millis(42)), "42ms");
         assert_eq!(format_duration(Duration::from_millis(1500)), "1.5s");
+    }
+
+    #[test]
+    fn usage_mentions_the_cache_only_when_it_was_used() {
+        let uncached = TokenUsage {
+            input_tokens: 120,
+            output_tokens: 24,
+            ..TokenUsage::default()
+        };
+        assert_eq!(describe_usage(&uncached), "120 in / 24 out tokens");
+
+        let cached = TokenUsage {
+            input_tokens: 4_050,
+            output_tokens: 7,
+            cache_read_tokens: 3_000,
+            cache_write_tokens: 1_000,
+        };
+        assert_eq!(
+            describe_usage(&cached),
+            "4050 in / 7 out tokens (cache: 3000 read, 1000 written)"
+        );
     }
 
     #[test]

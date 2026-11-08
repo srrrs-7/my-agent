@@ -122,6 +122,10 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 
 `chat` 内のコマンド: `/reset` `/usage` `/tools` `/help` `/exit`
 
+システムプロンプト（日付・ディレクトリ概要・`AGENTS.md` 等）はセッションの最初に 1 回だけ組み立てて固定します
+（プロンプトキャッシュを効かせるため）。セッション中に `AGENTS.md` を編集した・ファイル構成が大きく変わった
+といった場合は `/reset` で新しいセッションを始めると反映されます。
+
 ### 中断したセッションを再開する
 
 会話はセッションログに残るので（§4）、そこから続きを始められます。
@@ -252,6 +256,12 @@ AGENT_NOTIFY_FORMAT=ntfy
 - **プロジェクト指示ファイル** — `AGENTS.md` → `CLAUDE.md` → `.agent/instructions.md` →
   `.github/copilot-instructions.md` の順で最初に見つかったもの
 - ツール一覧と作業ルール
+
+システムプロンプトは**セッションの最初の 1 回だけ**組み立て、以後のターンでは同じものを送ります。
+エージェント自身がファイルを書くたびにディレクトリ概要が変わり、プロンプトのバイト列が動くと、
+プロバイダ側のプロンプトキャッシュ（前置きのバイト一致で効く）が会話全体で外れるためです。
+書いたものは会話履歴に残っているので、モデルが見失うことはありません。
+概要を取り直したいときは `chat` で `/reset` します（`--resume` で再開したセッションも組み立て直します）。
 
 システムプロンプトは外部から注入できます。`AGENT_SYSTEM_PROMPT_FILE`（または
 `--system-prompt-file`）で全体を差し替え、`AGENT_APPEND_SYSTEM_PROMPT`（または
@@ -539,7 +549,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 455 本、外部ネットワークもモデルも不要です。
+テストは 476 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -646,6 +656,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_TEMPERATURE` | `0.2` | |
 | `AGENT_REQUEST_TIMEOUT_SECS` | `180` | HTTP リクエストの上限時間 |
 | `AGENT_MAX_RETRIES` | `3` | 一時障害の再試行回数 |
+| `AGENT_PROMPT_CACHE` | `5m` | Anthropic のプロンプトキャッシュ。`5m` \| `1h` \| `off`。ツール定義＋システムプロンプトの末尾と会話の末尾（自動キャッシュ）に印を付け、毎ターン同じ前置きを全額で読み直させない。プロンプトの間に 5 分以上空くことが多いなら `1h`（書き込み単価は 2 倍）、`cache_control` を拒否するゲートウェイ経由なら `off`。OpenAI 互換サーバ側のキャッシュは自動なので影響しない。効果は `-v` と `/usage` の `cache: N read, M written` で確認できる |
 | `RUST_LOG` | `warn` | tracing フィルタ（例: `info`、`agent_application=debug,warn`） |
 | `RUST_BACKTRACE` | `0` | `1` でエラー時にバックトレース（テストの調査用） |
 | `OLLAMA_PORT` | `11434` | compose の ollama をホストに公開するポート（ホスト側の compose 設定） |

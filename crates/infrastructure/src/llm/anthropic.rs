@@ -6,12 +6,40 @@
 //! * tool results are `tool_result` blocks inside a **user** message, and
 //!   consecutive messages of the same role are merged, because the API expects
 //!   user and assistant turns to alternate.
+//!
+//! ## Prompt caching
+//!
+//! Every turn of the agent loop re-sends the tool definitions, the system
+//! prompt and the whole history so far, and Anthropic caches only what it is
+//! told to - without markers each turn pays full price for all of it again.
+//! Two markers are sent, both governed by [`PromptCache`]:
+//!
+//! * one on the last block of the request's own system prompt. The API renders
+//!   `tools`, then `system`, then `messages`, so this caches the tool
+//!   definitions and the system prompt together - the part that stays fixed
+//!   for a whole session - and gives it a read point that survives whatever
+//!   later happens to the history, compaction and trimming included;
+//! * a top-level `cache_control` (automatic caching): the server puts a
+//!   breakpoint on the last block and moves it forward as the conversation
+//!   grows, so each turn reads everything the previous turn sent.
+//!
+//! A hit needs the prefix to be byte-identical, so everything in front of a
+//! breakpoint must serialise the same way every time. It does: tools arrive
+//! sorted by name from the registry, `serde_json` objects (the input schemas)
+//! serialise in a fixed key order, and the loop builds the system prompt once
+//! per session rather than once per run.
+//!
+//! A prefix shorter than the model's minimum (512 to 4096 tokens, depending on
+//! the model) is silently not cached - no error, just zeros in the cache
+//! counts. Neither feature needs a beta header.
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use agent_domain::error::LlmError;
 use agent_domain::model::llm::{
-    ChatRequest, ChatResponse, ModelId, ProviderCapabilities, ProviderId, StopReason, TokenUsage,
+    ChatRequest, ChatResponse, ModelId, ProviderCapabilities, ProviderId, StopReason, TaskKind,
+    TokenUsage,
 };
 use agent_domain::model::message::{ContentBlock, Message, Role};
 use agent_domain::model::tool::{ToolCall, ToolCallId, ToolDefinition, ToolName};
@@ -27,6 +55,64 @@ const API_VERSION: &str = "2023-06-01";
 /// number.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// How long a cached prompt prefix lives (`AGENT_PROMPT_CACHE`).
+///
+/// Writing to the cache costs more than plain input (1.25x for five minutes,
+/// 2x for an hour) and reading from it far less, and every read restarts the
+/// clock. Five minutes therefore suits an agent loop, whose turns follow one
+/// another well inside that window; the hour pays off only when a session
+/// regularly sits idle between prompts for longer. `Off` is for gateways that
+/// reject `cache_control`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PromptCache {
+    Off,
+    #[default]
+    FiveMinutes,
+    OneHour,
+}
+
+impl PromptCache {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+        }
+    }
+
+    /// The marker both breakpoints carry. They must agree: the API rejects a
+    /// longer TTL behind a shorter one.
+    fn marker(self) -> Option<CacheControl> {
+        match self {
+            Self::Off => None,
+            // Five minutes is the API's default, so it is left unsaid.
+            Self::FiveMinutes => Some(CacheControl {
+                kind: "ephemeral",
+                ttl: None,
+            }),
+            Self::OneHour => Some(CacheControl {
+                kind: "ephemeral",
+                ttl: Some("1h"),
+            }),
+        }
+    }
+}
+
+impl FromStr for PromptCache {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "5m" | "5min" | "on" | "true" => Ok(Self::FiveMinutes),
+            "1h" | "60m" | "1hour" => Ok(Self::OneHour),
+            "off" | "false" | "none" | "0" => Ok(Self::Off),
+            other => Err(format!(
+                "unknown prompt cache setting `{other}` (expected 5m|1h|off)"
+            )),
+        }
+    }
+}
+
 pub struct AnthropicProvider {
     id: ProviderId,
     client: reqwest::Client,
@@ -34,6 +120,7 @@ pub struct AnthropicProvider {
     api_key: String,
     default_model: ModelId,
     timeout: Duration,
+    prompt_cache: PromptCache,
 }
 
 impl AnthropicProvider {
@@ -51,7 +138,14 @@ impl AnthropicProvider {
             api_key,
             default_model,
             timeout,
+            prompt_cache: PromptCache::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_prompt_cache(mut self, prompt_cache: PromptCache) -> Self {
+        self.prompt_cache = prompt_cache;
+        self
     }
 
     fn messages_url(&self) -> String {
@@ -85,22 +179,7 @@ impl LlmProvider for AnthropicProvider {
             .clone()
             .unwrap_or_else(|| self.default_model.clone());
 
-        let (system, messages) = split_system(&request);
-
-        let body = WireRequest {
-            model: model.as_str(),
-            max_tokens: request.params.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            system,
-            messages,
-            tools: request
-                .tools
-                .iter()
-                .map(WireTool::from_definition)
-                .collect(),
-            temperature: request.params.temperature,
-            top_p: request.params.top_p,
-            stop_sequences: request.params.stop_sequences.clone(),
-        };
+        let body = wire_request(&request, &model, self.prompt_cache);
 
         let builder = self
             .client
@@ -157,10 +236,7 @@ impl AnthropicProvider {
 
         let usage = response
             .usage
-            .map(|usage| TokenUsage {
-                input_tokens: usage.input_tokens.unwrap_or_default(),
-                output_tokens: usage.output_tokens.unwrap_or_default(),
-            })
+            .map(WireUsage::into_domain)
             .unwrap_or_default();
 
         Ok(ChatResponse {
@@ -175,17 +251,73 @@ impl AnthropicProvider {
 
 // --- outbound mapping --------------------------------------------------------
 
-/// Splits the domain request into the API's `system` field plus an alternating
-/// message list.
-fn split_system(request: &ChatRequest) -> (Option<String>, Vec<WireMessage>) {
-    let mut system_parts: Vec<String> = request.system.iter().cloned().collect();
+fn wire_request<'a>(
+    request: &ChatRequest,
+    model: &'a ModelId,
+    prompt_cache: PromptCache,
+) -> WireRequest<'a> {
+    let marker = prompt_cache.marker();
+    let (system, messages) = split_system(request, marker);
+
+    WireRequest {
+        model: model.as_str(),
+        max_tokens: request.params.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        system,
+        messages,
+        tools: request
+            .tools
+            .iter()
+            .map(WireTool::from_definition)
+            .collect(),
+        temperature: request.params.temperature,
+        top_p: request.params.top_p,
+        stop_sequences: request.params.stop_sequences.clone(),
+        cache_control: marker.filter(|_| resends_its_tail(request.metadata.task_kind)),
+    }
+}
+
+/// Whether a later request will start with everything this one sends.
+///
+/// Automatic caching writes everything up to the last block that is not
+/// cached yet, at a premium over plain input. Each turn of a conversation earns
+/// that back on the next turn; a one-off side call never does. Compaction is the case that matters:
+/// its transcript is summarised once and never sent again, so marking it would
+/// only make the largest request of the session a quarter dearer. Its system
+/// prompt is still marked - that part *is* sent again by the next compaction.
+fn resends_its_tail(kind: TaskKind) -> bool {
+    match kind {
+        TaskKind::Agentic | TaskKind::Chat => true,
+        TaskKind::Summarize | TaskKind::Classify => false,
+    }
+}
+
+/// Splits the domain request into the API's `system` blocks plus an
+/// alternating message list.
+///
+/// `marker` lands on the request's own system prompt rather than on whatever
+/// block happens to come last: that prompt is the part fixed for the session,
+/// and a breakpoint is only worth having on a prefix that repeats.
+fn split_system(
+    request: &ChatRequest,
+    marker: Option<CacheControl>,
+) -> (Vec<WireSystemBlock>, Vec<WireMessage>) {
+    let mut system: Vec<WireSystemBlock> = request
+        .system
+        .as_deref()
+        .and_then(WireSystemBlock::text)
+        .into_iter()
+        .collect();
+    if let Some(last) = system.last_mut() {
+        last.cache_control = marker;
+    }
+
     let mut messages: Vec<WireMessage> = Vec::with_capacity(request.messages.len());
 
     for message in &request.messages {
         if message.role == Role::System {
             // A system message inside the history is folded into the top-level
             // field rather than dropped.
-            system_parts.push(message.text());
+            system.extend(WireSystemBlock::text(&message.text()));
             continue;
         }
 
@@ -209,11 +341,6 @@ fn split_system(request: &ChatRequest) -> (Option<String>, Vec<WireMessage>) {
         }
     }
 
-    let system = if system_parts.is_empty() {
-        None
-    } else {
-        Some(system_parts.join("\n\n"))
-    };
     (system, messages)
 }
 
@@ -244,8 +371,8 @@ fn to_blocks(message: &Message) -> Vec<WireBlock> {
 struct WireRequest<'a> {
     model: &'a str,
     max_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    system: Vec<WireSystemBlock>,
     messages: Vec<WireMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool>,
@@ -255,6 +382,39 @@ struct WireRequest<'a> {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop_sequences: Vec<String>,
+    /// Automatic caching. Uses one of the four breakpoints a request may
+    /// carry; the system marker uses another.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct WireSystemBlock {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+impl WireSystemBlock {
+    /// `None` for blank text: the API rejects an empty text block, and one
+    /// carrying the cache marker would fail the whole request.
+    fn text(text: &str) -> Option<Self> {
+        (!text.trim().is_empty()).then(|| Self {
+            kind: "text",
+            text: text.to_string(),
+            cache_control: None,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -331,10 +491,31 @@ enum WireResponseBlock {
 
 #[derive(Debug, Deserialize)]
 struct WireUsage {
+    /// Only the part of the prompt that was neither read from nor written to
+    /// the cache.
     #[serde(default)]
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
+impl WireUsage {
+    /// The domain counts the whole prompt as input, so the three parts the
+    /// API reports separately are added back together here.
+    fn into_domain(self) -> TokenUsage {
+        let read = self.cache_read_input_tokens.unwrap_or_default();
+        let write = self.cache_creation_input_tokens.unwrap_or_default();
+        TokenUsage {
+            input_tokens: self.input_tokens.unwrap_or_default() + read + write,
+            output_tokens: self.output_tokens.unwrap_or_default(),
+            cache_read_tokens: read,
+            cache_write_tokens: write,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -393,9 +574,10 @@ mod tests {
         ])
         .with_system("be helpful");
 
-        let (system, messages) = split_system(&request);
+        let (system, messages) = split_system(&request, None);
 
-        assert_eq!(system.as_deref(), Some("be helpful"));
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].text, "be helpful");
         // user / assistant / user - the tool result and the follow-up user
         // message collapse into one turn.
         assert_eq!(messages.len(), 3);
@@ -462,5 +644,218 @@ mod tests {
 
         let decoded = provider().decode(response, ModelId::new("m")).unwrap();
         assert_eq!(decoded.message.text(), "done");
+    }
+
+    // --- prompt caching ------------------------------------------------------
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: ToolName::new(name).unwrap(),
+            description: format!("{name} does things."),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            safety: agent_domain::model::tool::ToolSafety::ReadOnly,
+        }
+    }
+
+    /// The JSON body an agent-loop turn would put on the wire.
+    fn body(request: &ChatRequest, prompt_cache: PromptCache) -> Value {
+        serde_json::to_value(wire_request(request, &ModelId::new("m"), prompt_cache)).unwrap()
+    }
+
+    fn loop_turn() -> ChatRequest {
+        ChatRequest::new(vec![Message::user("hi")])
+            .with_system("be helpful")
+            .with_tools(vec![tool("read_file"), tool("write_file")])
+    }
+
+    #[test]
+    fn by_default_the_system_prompt_and_the_conversation_are_both_cached() {
+        let body = body(&loop_turn(), PromptCache::default());
+
+        assert_eq!(
+            body["system"],
+            json!([{
+                "type": "text",
+                "text": "be helpful",
+                "cache_control": {"type": "ephemeral"}
+            }]),
+            "the breakpoint on the system prompt caches the tools in front of it too"
+        );
+        assert_eq!(
+            body["cache_control"],
+            json!({"type": "ephemeral"}),
+            "automatic caching follows the growing conversation"
+        );
+    }
+
+    #[test]
+    fn a_one_hour_ttl_is_set_on_both_breakpoints() {
+        // A longer TTL may not follow a shorter one, so they must agree.
+        let body = body(&loop_turn(), PromptCache::OneHour);
+
+        let one_hour = json!({"type": "ephemeral", "ttl": "1h"});
+        assert_eq!(body["system"][0]["cache_control"], one_hour);
+        assert_eq!(body["cache_control"], one_hour);
+    }
+
+    #[test]
+    fn turning_the_cache_off_sends_no_marker_anywhere() {
+        let body = body(&loop_turn(), PromptCache::Off);
+
+        let sent = body.to_string();
+        assert!(!sent.contains("cache_control"), "{sent}");
+        assert_eq!(
+            body["system"],
+            json!([{"type": "text", "text": "be helpful"}])
+        );
+    }
+
+    #[test]
+    fn tools_are_sent_unmarked_in_the_order_they_were_given() {
+        // Reordering them would move bytes in front of the system breakpoint.
+        let body = body(&loop_turn(), PromptCache::default());
+
+        let tools = body["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["read_file", "write_file"]);
+        assert!(
+            tools.iter().all(|tool| tool.get("cache_control").is_none()),
+            "{tools:?}"
+        );
+    }
+
+    #[test]
+    fn a_compaction_request_does_not_pay_to_cache_its_one_off_transcript() {
+        let request = ChatRequest::new(vec![Message::user("<transcript>")])
+            .with_system("summarise this")
+            .with_metadata(agent_domain::model::llm::RequestMetadata {
+                task_kind: TaskKind::Summarize,
+                ..Default::default()
+            });
+
+        let body = body(&request, PromptCache::default());
+
+        assert!(body.get("cache_control").is_none(), "{body}");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral"}),
+            "the summariser's instructions repeat across compactions, so they stay marked"
+        );
+    }
+
+    #[test]
+    fn a_blank_system_prompt_is_left_out_rather_than_sent_as_an_empty_block() {
+        let request = ChatRequest::new(vec![Message::user("hi")]).with_system("  \n");
+
+        let body = body(&request, PromptCache::default());
+
+        assert!(body.get("system").is_none(), "{body}");
+        assert_eq!(
+            body["cache_control"],
+            json!({"type": "ephemeral"}),
+            "the conversation is still cached"
+        );
+    }
+
+    #[test]
+    fn a_system_message_from_the_history_follows_the_marked_prompt() {
+        let request = ChatRequest::new(vec![
+            Message::user("hi"),
+            Message::new(Role::System, vec![ContentBlock::text("mid-session note")]),
+        ])
+        .with_system("base");
+
+        let body = body(&request, PromptCache::default());
+
+        assert_eq!(
+            body["system"],
+            json!([
+                {"type": "text", "text": "base", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "mid-session note"}
+            ]),
+            "the breakpoint stays on the part that repeats"
+        );
+    }
+
+    #[test]
+    fn cache_counts_are_added_back_into_the_input() {
+        let response: WireResponse = serde_json::from_value(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 7,
+                "cache_creation_input_tokens": 1000,
+                "cache_read_input_tokens": 3000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 1000, "ephemeral_1h_input_tokens": 0}
+            }
+        }))
+        .unwrap();
+
+        let decoded = provider().decode(response, ModelId::new("m")).unwrap();
+
+        assert_eq!(
+            decoded.usage,
+            TokenUsage {
+                input_tokens: 4050,
+                output_tokens: 7,
+                cache_read_tokens: 3000,
+                cache_write_tokens: 1000,
+            },
+            "the API's input_tokens is only the uncached remainder"
+        );
+    }
+
+    #[test]
+    fn missing_or_null_cache_counts_read_as_zero() {
+        for usage in [
+            json!({"input_tokens": 42, "output_tokens": 7}),
+            json!({
+                "input_tokens": 42,
+                "output_tokens": 7,
+                "cache_creation_input_tokens": null,
+                "cache_read_input_tokens": null
+            }),
+        ] {
+            let response: WireResponse =
+                serde_json::from_value(json!({"content": [], "usage": usage})).unwrap();
+
+            let decoded = provider().decode(response, ModelId::new("m")).unwrap();
+
+            assert_eq!(
+                decoded.usage,
+                TokenUsage {
+                    input_tokens: 42,
+                    output_tokens: 7,
+                    ..TokenUsage::default()
+                },
+                "{usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_cache_settings_parse_leniently_and_name_the_alternatives() {
+        assert_eq!(
+            "5m".parse::<PromptCache>().unwrap(),
+            PromptCache::FiveMinutes
+        );
+        assert_eq!(" 1H ".parse::<PromptCache>().unwrap(), PromptCache::OneHour);
+        assert_eq!("off".parse::<PromptCache>().unwrap(), PromptCache::Off);
+        assert_eq!(PromptCache::default(), PromptCache::FiveMinutes);
+
+        let error = "forever".parse::<PromptCache>().unwrap_err();
+        assert!(error.contains("5m|1h|off"), "{error}");
+
+        for cache in [
+            PromptCache::Off,
+            PromptCache::FiveMinutes,
+            PromptCache::OneHour,
+        ] {
+            assert_eq!(cache.as_str().parse::<PromptCache>().unwrap(), cache);
+        }
     }
 }

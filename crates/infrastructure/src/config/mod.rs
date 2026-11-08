@@ -29,6 +29,7 @@ use agent_domain::ports::notify::NotificationKind;
 use thiserror::Error;
 
 use crate::exec::SandboxRequirement;
+use crate::llm::PromptCache;
 use crate::notify::{NotifyFormat, WebhookUrl};
 
 pub use env::{EnvSource, MapEnv, SystemEnv};
@@ -101,6 +102,9 @@ pub struct LlmSettings {
     pub router: RouterKind,
     pub request_timeout: Duration,
     pub max_retries: u32,
+    /// Prompt-cache breakpoints for Anthropic providers. OpenAI-compatible
+    /// servers that cache do so on their own, so there is nothing to send them.
+    pub prompt_cache: PromptCache,
 }
 
 #[derive(Debug, Clone)]
@@ -601,6 +605,7 @@ impl LlmSettings {
             router: reader.parsed("AGENT_ROUTER", default_router)?,
             request_timeout: Duration::from_secs(reader.parsed("AGENT_REQUEST_TIMEOUT_SECS", 180)?),
             max_retries: reader.parsed("AGENT_MAX_RETRIES", 3)?,
+            prompt_cache: reader.parsed("AGENT_PROMPT_CACHE", PromptCache::default())?,
         })
     }
 }
@@ -782,6 +787,13 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         ),
     );
     description.insert("router".into(), settings.llm.router.as_str().into());
+    description.insert(
+        "prompt cache".into(),
+        match settings.llm.prompt_cache {
+            PromptCache::Off => "disabled".to_string(),
+            ttl => format!("{} (anthropic providers)", ttl.as_str()),
+        },
+    );
     description.insert(
         "default provider".into(),
         settings.llm.default_provider.to_string(),
@@ -1022,6 +1034,28 @@ mod tests {
     fn an_explicit_router_overrides_the_default() {
         let settings = settings(&[("AGENT_MODEL", "m"), ("AGENT_ROUTER", "model-prefix")]).unwrap();
         assert_eq!(settings.llm.router, RouterKind::ModelPrefix);
+    }
+
+    #[test]
+    fn prompt_caching_is_on_with_a_five_minute_ttl_unless_told_otherwise() {
+        let default = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert_eq!(default.llm.prompt_cache, PromptCache::FiveMinutes);
+        assert_eq!(
+            describe(&default)["prompt cache"],
+            "5m (anthropic providers)"
+        );
+
+        let hour = settings(&[("AGENT_MODEL", "m"), ("AGENT_PROMPT_CACHE", "1h")]).unwrap();
+        assert_eq!(hour.llm.prompt_cache, PromptCache::OneHour);
+
+        let off = settings(&[("AGENT_MODEL", "m"), ("AGENT_PROMPT_CACHE", "off")]).unwrap();
+        assert_eq!(off.llm.prompt_cache, PromptCache::Off);
+        assert_eq!(describe(&off)["prompt cache"], "disabled");
+
+        let error = settings(&[("AGENT_MODEL", "m"), ("AGENT_PROMPT_CACHE", "1d")])
+            .expect_err("an unknown TTL must abort startup");
+        assert!(error.to_string().contains("AGENT_PROMPT_CACHE"), "{error}");
+        assert!(error.to_string().contains("5m|1h|off"), "{error}");
     }
 
     #[test]

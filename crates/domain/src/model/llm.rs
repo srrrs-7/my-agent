@@ -150,10 +150,25 @@ impl ChatRequest {
     }
 }
 
+/// Tokens one request consumed, or the sum over several.
+///
+/// `input_tokens` is the whole prompt as the model read it, cached or not. The
+/// two cache counts are *parts* of it, not additions to it: how much of that
+/// prompt was served from the provider's prompt cache, and how much was written
+/// into it. Vendors disagree on this - Anthropic reports the uncached remainder
+/// as its `input_tokens` with the cache counts beside it, OpenAI reports the
+/// whole prompt with `cached_tokens` inside it - so each adapter normalises to
+/// this shape, and nothing above the adapters has to know which vendor it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Part of `input_tokens` read back from the prompt cache.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Part of `input_tokens` written to the prompt cache.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
 }
 
 impl TokenUsage {
@@ -161,9 +176,17 @@ impl TokenUsage {
         self.input_tokens + self.output_tokens
     }
 
+    /// Whether the prompt cache did anything at all - the cue for a display
+    /// to mention it.
+    pub fn touched_cache(&self) -> bool {
+        self.cache_read_tokens > 0 || self.cache_write_tokens > 0
+    }
+
     pub fn accumulate(&mut self, other: TokenUsage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
     }
 }
 
@@ -234,6 +257,43 @@ mod tests {
         let id = ModelId::new("cloud/claude-sonnet-5");
         assert_eq!(id.split_provider_hint(), Some(("cloud", "claude-sonnet-5")));
         assert_eq!(ModelId::new("qwen3:8b").split_provider_hint(), None);
+    }
+
+    #[test]
+    fn accumulating_usage_sums_the_cache_counts_too() {
+        let mut total = TokenUsage::default();
+        total.accumulate(TokenUsage {
+            input_tokens: 1_200,
+            output_tokens: 40,
+            cache_read_tokens: 0,
+            cache_write_tokens: 1_000,
+        });
+        total.accumulate(TokenUsage {
+            input_tokens: 1_300,
+            output_tokens: 30,
+            cache_read_tokens: 1_000,
+            cache_write_tokens: 250,
+        });
+
+        assert_eq!(total.input_tokens, 2_500);
+        assert_eq!(total.cache_read_tokens, 1_000);
+        assert_eq!(total.cache_write_tokens, 1_250);
+        assert_eq!(
+            total.total(),
+            2_570,
+            "cache counts are parts of the input, not added on top of it"
+        );
+        assert!(total.touched_cache());
+        assert!(!TokenUsage::default().touched_cache());
+    }
+
+    #[test]
+    fn usage_recorded_before_cache_counts_existed_still_reads() {
+        let usage: TokenUsage =
+            serde_json::from_value(serde_json::json!({"input_tokens": 3, "output_tokens": 4}))
+                .unwrap();
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_write_tokens, 0);
     }
 
     #[test]

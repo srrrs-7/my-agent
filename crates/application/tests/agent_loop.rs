@@ -150,6 +150,22 @@ impl ContextProvider for FakeContext {
     }
 }
 
+/// Context whose directory overview is whatever the file system holds right
+/// now - the property of the real provider that a write can change.
+struct ListingContext(Arc<MemoryFileSystem>);
+
+#[async_trait]
+impl ContextProvider for ListingContext {
+    async fn snapshot(&self) -> Result<ContextSnapshot, FsError> {
+        let mut overview: Vec<String> = self.0.files.lock().unwrap().keys().cloned().collect();
+        overview.sort();
+        Ok(ContextSnapshot {
+            directory_overview: overview,
+            ..FakeContext.snapshot().await?
+        })
+    }
+}
+
 struct AlwaysApprove;
 
 #[async_trait]
@@ -202,6 +218,7 @@ fn response(message: Message, stop_reason: StopReason) -> ChatResponse {
         usage: TokenUsage {
             input_tokens: 10,
             output_tokens: 5,
+            ..TokenUsage::default()
         },
         model: ModelId::new("fake"),
         provider: ProviderId::new("scripted"),
@@ -1259,4 +1276,104 @@ async fn compaction_can_be_turned_off() {
             .any(|event| matches!(event, AgentEvent::HistoryTrimmed { .. })),
         "trimming still has to keep the budget"
     );
+}
+
+// --- prompt-prefix stability -------------------------------------------------
+
+fn loop_over_listing(
+    provider: Arc<ScriptedProvider>,
+    file_system: Arc<MemoryFileSystem>,
+) -> AgentLoop {
+    AgentLoop::new(
+        AgentDependencies {
+            llm: provider,
+            tools: registry(file_system.clone()),
+            approval: Arc::new(AlwaysApprove),
+            events: Arc::new(NullEventSink),
+            context: Arc::new(ListingContext(file_system)),
+            prompt: Arc::new(DefaultPromptBuilder),
+            log: Arc::new(NullConversationLog),
+        },
+        AgentLoopConfig::default(),
+    )
+}
+
+#[tokio::test]
+async fn the_system_prompt_stays_byte_identical_after_the_agent_writes_a_file() {
+    // Provider-side prompt caching matches the request prefix byte for byte,
+    // and the system prompt sits near its front. A prompt that picked up the
+    // agent's own writes would invalidate the cache for the rest of the
+    // session on every turn that touched a file.
+    let file_system = MemoryFileSystem::with(&[("src/main.rs", "fn main() {}\n")]);
+    let provider = ScriptedProvider::new(vec![
+        tool_use(
+            "c1",
+            "write_file",
+            json!({"path": "notes.md", "content": "hello"}),
+        ),
+        assistant("Created notes.md."),
+        tool_use("c2", "read_file", json!({"path": "notes.md"})),
+        assistant("It says hello."),
+    ]);
+    let agent = loop_over_listing(provider.clone(), file_system.clone());
+
+    let mut session = Session::new("prefix-1");
+    agent.run(&mut session, "create notes.md").await.unwrap();
+    agent.run(&mut session, "what does it say?").await.unwrap();
+
+    let now = ListingContext(file_system).snapshot().await.unwrap();
+    assert!(
+        now.directory_overview.contains(&"notes.md".to_string()),
+        "precondition: the workspace really did change under the loop"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4, "two runs of two round-trips each");
+    let first = requests[0].system.clone().expect("a system prompt");
+    assert!(first.contains("src/main.rs"), "{first}");
+    assert!(
+        !first.contains("notes.md"),
+        "the overview was taken before the write: {first}"
+    );
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            request.system.as_deref(),
+            Some(first.as_str()),
+            "request {index} sent a different system prompt"
+        );
+        assert_eq!(
+            request.tools, requests[0].tools,
+            "request {index} sent different tools"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_new_session_renders_the_workspace_as_it_is_now() {
+    // The other half of freezing per session: `/reset` is how a user gets an
+    // up-to-date overview, so a fresh session must not inherit a stale one.
+    let file_system = MemoryFileSystem::with(&[]);
+    let provider = ScriptedProvider::new(vec![
+        tool_use(
+            "c1",
+            "write_file",
+            json!({"path": "notes.md", "content": "hello"}),
+        ),
+        assistant("Created notes.md."),
+        assistant("Hello again."),
+    ]);
+    let agent = loop_over_listing(provider.clone(), file_system);
+
+    agent
+        .run(&mut Session::new("prefix-2a"), "create notes.md")
+        .await
+        .unwrap();
+    agent
+        .run(&mut Session::new("prefix-2b"), "hi")
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    let fresh = requests[2].system.as_deref().unwrap_or_default();
+    assert!(fresh.contains("notes.md"), "{fresh}");
 }
