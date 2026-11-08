@@ -31,8 +31,8 @@
 
 | ポート | 実装 |
 |---|---|
-| `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider` |
-| `LlmRouter` | `StaticRouter`, `ModelPrefixRouter` |
+| `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider`, `FailoverProvider` |
+| `LlmRouter` | `StaticRouter`, `ModelPrefixRouter`, `TaskKindRouter` |
 | `Tool` | `application/src/tools/{file,web,exec}/*`（実装）, `TimeoutTool`・`RedactingTool`（装飾） |
 | `FileSystem` | `LocalFileSystem` |
 | `FileSearcher` | `IgnoreAwareSearcher` |

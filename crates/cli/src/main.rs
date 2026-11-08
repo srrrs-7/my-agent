@@ -42,7 +42,13 @@ fn main() -> ExitCode {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
-    agent_infrastructure::telemetry::init("warn");
+    // `-v` also shows which provider served each request and why - summaries
+    // included, which emit no event of their own.
+    agent_infrastructure::telemetry::init(if cli.verbose {
+        "warn,agent::route=info"
+    } else {
+        "warn"
+    });
 
     // The same configuration `#[tokio::main]` produced.
     let runtime = match tokio::runtime::Builder::new_multi_thread()

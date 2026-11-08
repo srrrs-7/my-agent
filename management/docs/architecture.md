@@ -46,8 +46,8 @@
 
 | ポート | 実装 | 役割 |
 |---|---|---|
-| `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider` | チャット補完 |
-| `LlmRouter` | `StaticRouter`, `ModelPrefixRouter` | 委譲先の選択 |
+| `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider`, `FailoverProvider` | チャット補完 |
+| `LlmRouter` | `StaticRouter`, `ModelPrefixRouter`, `TaskKindRouter` | 委譲先の選択 |
 | `Tool` | `ReadFileTool` ほか（application）, `TimeoutTool`・`RedactingTool`（装飾） | モデルに公開する能力 |
 | `FileSystem` | `LocalFileSystem` | サンドボックス化された I/O |
 | `FileSearcher` | `IgnoreAwareSearcher` | `.gitignore` 準拠の内容検索 |
@@ -308,4 +308,4 @@ Anthropic アダプタはこの前置きにキャッシュの印を付けます�
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 511 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 542 本）。

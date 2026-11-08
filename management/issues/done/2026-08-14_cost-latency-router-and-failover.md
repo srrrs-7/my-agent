@@ -4,6 +4,8 @@ created: 2026-08-14
 urgency: medium
 importance: high
 priority: P1
+started: 2026-11-08
+completed: 2026-11-08
 scope: [infrastructure, cli, docs]
 ---
 
@@ -55,18 +57,18 @@ scope: [infrastructure, cli, docs]
 
 ## 達成条件
 
-- [ ] `TaskKind::Summarize` をローカル、`Agentic` をクラウドへ向ける構成が環境変数だけで組める。
+- [x] `TaskKind::Summarize` をローカル、`Agentic` をクラウドへ向ける構成が環境変数だけで組める。
       モックサーバ 2 台で、圧縮の要約リクエストがローカル側に届くことを固定する
-- [ ] `TaskKind::Classify` も同じく振り分けられる（現状 `Classify` を発行する呼び出し元はない — メモ参照）
-- [ ] クラウドが落ちている（接続失敗・5xx など、対象にするエラーは設計で決めてテストで固定）とき、
+- [x] `TaskKind::Classify` も同じく振り分けられる（現状 `Classify` を発行する呼び出し元はない — メモ参照）
+- [x] クラウドが落ちている（接続失敗・5xx など、対象にするエラーは設計で決めてテストで固定）とき、
       同じリクエストがローカルで成功し、ターンが完了する
-- [ ] 復帰後は第一候補に戻る
-- [ ] ストリーミングで本文を流し始めた後の失敗では切り替えない（出力が二重になるため）。挙動をテストで固定する
-- [ ] `-v` で、各リクエストの振り先プロバイダと理由、フェイルオーバーの発生が見える
-- [ ] `AgentLoop` と既存プロバイダのコードに変更がない。`-v` 表示のために domain の型を変える必要が
+- [x] 復帰後は第一候補に戻る
+- [x] ストリーミングで本文を流し始めた後の失敗では切り替えない（出力が二重になるため）。挙動をテストで固定する
+- [x] `-v` で、各リクエストの振り先プロバイダと理由、フェイルオーバーの発生が見える
+- [x] `AgentLoop` と既存プロバイダのコードに変更がない。`-v` 表示のために domain の型を変える必要が
       出たら、先に `domain-specialist-agent` に確認する
-- [ ] 既存の `static` / `model-prefix` に退行がない
-- [ ] `make check` が緑
+- [x] 既存の `static` / `model-prefix` に退行がない
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -99,3 +101,5 @@ scope: [infrastructure, cli, docs]
   - `todo/2026-11-08_replay-and-eval-harness.md` — プロバイダ別の成績比較に使える
   - `todo/2026-08-14_verify-against-a-real-llm.md` — ローカルモデルの実力の確認
   - `done/2026-08-14_context-compaction-by-summarization.md` — 要約リクエストがこのルータの最初の利用者
+
+- 2026-11-08 完了（worktree で実装しマージ）。積み順は `Routing({ id: Failover(Retry(primary), [Retry(fallback)…]) })` — 宛先ごとに再試行し、尽きてから別の宛先へ。フェイルオーバーの対象は LlmError::is_retryable と同じ（転送失敗・タイムアウト・5xx・408・429）、401/400 等は対象外。ストリーム開始後は切り替えない。クールダウン中は第一候補を最後に回すだけ（失敗を増やさない）。`-v` で agent::route の info ログ（要約の振り先を含む）、フェイルオーバーは -v なしでも warn 1 行。domain の型変更なし。達成条件の「LlmRouter の追加のみ」は文字通りではない（合成プロバイダ + 積み順変更 + main.rs 1 行）

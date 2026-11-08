@@ -108,6 +108,7 @@ impl Fixture {
             request_timeout: Duration::from_secs(5),
             max_retries: 2,
             prompt_cache: PromptCache::default(),
+            routing: Default::default(),
         };
 
         // Every harness logs, so that any test can ask what the record kept -
