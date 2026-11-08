@@ -30,6 +30,7 @@ use thiserror::Error;
 use crate::exec::SandboxRequirement;
 use crate::llm::{Effort, PromptCache, Thinking};
 use crate::notify::{NotifyFormat, WebhookUrl};
+use crate::web::SearchApiKey;
 
 pub use access::AccessSettings;
 pub use describe::describe;
@@ -207,6 +208,40 @@ impl Default for WebFetchSettings {
             max_bytes: 1024 * 1024,
             timeout: Duration::from_secs(30),
         }
+    }
+}
+
+/// The `web_search` tool (Brave Search API).
+///
+/// Off by default for the same reason as `web_fetch`: every query is a
+/// message the model sends to a third party. `Debug` is safe to print -
+/// [`SearchApiKey`] hides the key.
+#[derive(Debug, Clone, Default)]
+pub struct WebSearchSettings {
+    pub enabled: bool,
+    pub api_key: Option<SearchApiKey>,
+}
+
+const WEB_SEARCH_KEY: &str = "AGENT_WEB_SEARCH";
+const WEB_SEARCH_API_KEY_KEY: &str = "AGENT_WEB_SEARCH_API_KEY";
+
+impl WebSearchSettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        let enabled = reader.parsed(WEB_SEARCH_KEY, false)?;
+        let api_key = reader.string(WEB_SEARCH_API_KEY_KEY).map(SearchApiKey::new);
+        if enabled && api_key.is_none() {
+            return Err(ConfigError::missing(
+                WEB_SEARCH_API_KEY_KEY,
+                "AGENT_WEB_SEARCH=true needs a Brave Search API key \
+                 (https://brave.com/search/api/). Set it, or unset AGENT_WEB_SEARCH",
+            ));
+        }
+        Ok(Self { enabled, api_key })
+    }
+
+    /// The key to search with, when searching is on.
+    pub fn active_key(&self) -> Option<&SearchApiKey> {
+        self.api_key.as_ref().filter(|_| self.enabled)
     }
 }
 
@@ -405,6 +440,7 @@ pub struct Settings {
     pub session: SessionSettings,
     pub prompt: PromptSettings,
     pub web_fetch: WebFetchSettings,
+    pub web_search: WebSearchSettings,
     pub shell: ShellSettings,
     pub mcp: McpSettings,
     pub notify: NotifySettings,
@@ -457,6 +493,7 @@ impl Settings {
                 max_bytes: reader.parsed("AGENT_WEB_FETCH_MAX_BYTES", 1024 * 1024)?,
                 timeout: Duration::from_secs(reader.parsed("AGENT_WEB_FETCH_TIMEOUT_SECS", 30)?),
             },
+            web_search: WebSearchSettings::read(&reader)?,
             shell: ShellSettings {
                 enabled: reader.parsed("AGENT_SHELL", false)?,
                 sandbox: reader.parsed("AGENT_SHELL_SANDBOX", SandboxRequirement::default())?,
@@ -490,6 +527,10 @@ impl Settings {
             .collect();
         if let Some(url) = &self.notify.webhook {
             secrets.extend(url.secrets(self.notify.format));
+        }
+        // Whether or not searching is on: a key that is set is a key to keep.
+        if let Some(key) = &self.web_search.api_key {
+            secrets.push(key.expose().to_string());
         }
         secrets
     }
@@ -1461,6 +1502,65 @@ mod tests {
         assert_eq!(
             shown, "[REDACTED] [REDACTED] short /usr/local/bin:/usr/bin /workspace/project",
             "secret-named values are hidden, others and short ones are not"
+        );
+    }
+
+    // --- web search -----------------------------------------------------------
+
+    const SEARCH_KEY: &str = "BSA-search-key-0123456789";
+
+    #[test]
+    fn web_search_is_off_by_default() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert!(!settings.web_search.enabled);
+        assert!(settings.web_search.active_key().is_none());
+        assert_eq!(describe(&settings)["web search"], "disabled");
+    }
+
+    #[test]
+    fn enabling_web_search_without_a_key_fails_and_names_the_variable() {
+        let error = settings(&[("AGENT_MODEL", "m"), ("AGENT_WEB_SEARCH", "true")]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("AGENT_WEB_SEARCH_API_KEY"), "{message}");
+    }
+
+    #[test]
+    fn the_search_key_is_a_configured_secret_and_never_printed() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_WEB_SEARCH", "true"),
+            ("AGENT_WEB_SEARCH_API_KEY", SEARCH_KEY),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            settings.web_search.active_key().map(SearchApiKey::expose),
+            Some(SEARCH_KEY)
+        );
+        assert!(
+            settings
+                .configured_secrets()
+                .contains(&SEARCH_KEY.to_string())
+        );
+        assert!(!format!("{settings:?}").contains(SEARCH_KEY));
+        let doctor = describe(&settings)["web search"].clone();
+        assert!(doctor.starts_with("enabled"), "{doctor}");
+        assert!(!doctor.contains(SEARCH_KEY), "{doctor}");
+    }
+
+    #[test]
+    fn a_key_alone_does_not_enable_web_search() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_WEB_SEARCH_API_KEY", SEARCH_KEY),
+        ])
+        .unwrap();
+        assert!(settings.web_search.active_key().is_none());
+        assert!(
+            settings
+                .configured_secrets()
+                .contains(&SEARCH_KEY.to_string()),
+            "a key that is set is withheld whether or not it is used"
         );
     }
 }

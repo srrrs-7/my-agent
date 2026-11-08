@@ -223,6 +223,11 @@ fn adapt_settings(settings: &mut Settings, args: &EvalArgs) -> Result<()> {
         eprintln!("eval: web_fetch is not offered - pass --allow-web to evaluate with it");
         settings.web_fetch.enabled = false;
     }
+    // A query is a message sent, like a URL.
+    if !args.allow_web && settings.web_search.enabled {
+        eprintln!("eval: web_search is not offered - pass --allow-web to evaluate with it");
+        settings.web_search.enabled = false;
+    }
 
     // Absolute, because a relative session dir is read against the
     // workspace - which is a different scratch directory every attempt.
@@ -422,6 +427,7 @@ fn fingerprint(
             "allow_web": args.allow_web,
             "mcp_servers": app.tool_servers.len(),
             "web_fetch": settings.web_fetch.enabled,
+            "web_search": settings.web_search.enabled,
             "run_command": settings.shell.enabled,
             "global_instructions_fnv1a": global_instructions,
         }),
@@ -777,6 +783,28 @@ mod tests {
             "{:?}",
             app.tools.names()
         );
+    }
+
+    /// Eval approves every call by itself, so a search there would send the
+    /// model's query with nobody asked.
+    #[tokio::test]
+    async fn eval_offers_web_search_only_with_allow_web() {
+        const SEARCH: [(&str, &str); 2] = [
+            ("AGENT_WEB_SEARCH", "true"),
+            ("AGENT_WEB_SEARCH_API_KEY", "BSA-0123456789abcdef"),
+        ];
+        let offered = |app: &Application| app.tools.names().iter().any(|n| n == "web_search");
+
+        let out = tempfile::tempdir().unwrap();
+        let mut unasked = settings(&SEARCH);
+        adapt_settings(&mut unasked, &args(&[], out.path())).unwrap();
+        let app = assembled(unasked).await.unwrap();
+        assert!(!offered(&app), "{:?}", app.tools.names());
+
+        let mut asked = settings(&SEARCH);
+        adapt_settings(&mut asked, &args(&["--allow-web"], out.path())).unwrap();
+        let app = assembled(asked).await.unwrap();
+        assert!(offered(&app), "{:?}", app.tools.names());
     }
 
     #[tokio::test]
