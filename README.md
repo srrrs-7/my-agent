@@ -449,13 +449,15 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 365 本、外部ネットワークもモデルも不要です。
+テストは 390 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
 - LLM クライアント … 生 TCP のモックサーバで実 HTTP を検証
 - E2E … HTTP → provider → routing → retry → loop → tools → 実ファイルシステム
   （`crates/cli/tests/end_to_end.rs`）
+- 実バイナリ … `agent` を子プロセスとして起動し、モック LLM とモック Webhook だけを相手に
+  合成ルートと終了処理まで通す（`crates/cli/tests/notify_e2e.rs`）
 
 ---
 

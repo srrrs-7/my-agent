@@ -202,6 +202,12 @@ impl Notifications {
         self.engaged_at(Instant::now());
     }
 
+    /// When the turn clock last restarted.
+    #[cfg(test)]
+    pub(crate) fn last_engaged(&self) -> Instant {
+        *lock(&self.last_engaged)
+    }
+
     // The `_at` variants exist so tests can move time forward by adding to an
     // `Instant`. Subtracting from `now()` instead panics on a machine that
     // booted more recently than the offset - a freshly started container VM.

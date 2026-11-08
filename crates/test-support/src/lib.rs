@@ -6,6 +6,7 @@
 //! bytes the client put on the wire.
 
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -279,8 +280,144 @@ impl MockLlmServer {
     }
 }
 
+/// One request as [`RecordingServer`] saw it.
+#[derive(Debug, Clone)]
+pub struct RecordedRequest {
+    pub method: String,
+    /// The request target as sent, e.g. `/` or `/services/T0/B0/x`.
+    pub path: String,
+    /// Header names lowercased, in the order they arrived.
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl RecordedRequest {
+    /// The body parsed as JSON. Panics with the raw body if it is not.
+    pub fn json(&self) -> Value {
+        serde_json::from_str(&self.body)
+            .unwrap_or_else(|error| panic!("not JSON ({error}): {}", self.body))
+    }
+
+    /// The first header called `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A server that answers *every* request the same way and remembers each one.
+///
+/// [`MockLlmServer`] replays a script and then stops listening, and its
+/// requests can only be read after the script is used up. A webhook receiver
+/// needs the opposite: any number of requests - including none - and a look
+/// at what arrived without waiting for anything. A request is recorded before
+/// it is answered, so a client that saw the reply is guaranteed to find its
+/// request in [`Self::received`].
+pub struct RecordingServer {
+    url: String,
+    received: Arc<Mutex<Vec<RecordedRequest>>>,
+    handle: JoinHandle<()>,
+}
+
+impl RecordingServer {
+    /// Replies with `response` to every request.
+    pub async fn start(response: Response) -> Self {
+        Self::spawn(Some(response)).await
+    }
+
+    /// Records each request and never answers it, holding the connection
+    /// open - a receiver that has stopped responding.
+    pub async fn unresponsive() -> Self {
+        Self::spawn(None).await
+    }
+
+    async fn spawn(response: Option<Response>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let address = listener.local_addr().expect("local address");
+        let received = Arc::new(Mutex::new(Vec::new()));
+
+        let log = received.clone();
+        let handle = tokio::spawn(async move {
+            // Held so that an unresponsive server keeps its connections open
+            // rather than resetting them, which a client would see at once.
+            let mut held = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let Some(request) = read_request(&mut socket).await else {
+                    continue;
+                };
+                log.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(request);
+                match &response {
+                    Some(response) => {
+                        let _ = socket.write_all(response.render().as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    }
+                    None => held.push(socket),
+                }
+            }
+        });
+
+        Self {
+            url: format!("http://{address}"),
+            received,
+            handle,
+        }
+    }
+
+    /// `http://127.0.0.1:<port>`, without a trailing slash.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Everything received so far, oldest first.
+    pub fn received(&self) -> Vec<RecordedRequest> {
+        self.received
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for RecordingServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Reads one request: the request line, the headers, and a
+/// `content-length`-sized body.
+async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<RecordedRequest> {
+    let (head, body) = read_head_and_body(socket).await?;
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next()?.split(' ');
+    let method = request_line.next()?.to_string();
+    let path = request_line.next()?.to_string();
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+    Some(RecordedRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
 /// Reads headers, honours `content-length`, and returns the body.
 async fn read_request_body(socket: &mut tokio::net::TcpStream) -> Option<String> {
+    read_head_and_body(socket).await.map(|(_, body)| body)
+}
+
+/// The raw head (request line and headers, without the blank line) and the
+/// body.
+async fn read_head_and_body(socket: &mut tokio::net::TcpStream) -> Option<(String, String)> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
 
@@ -311,5 +448,9 @@ async fn read_request_body(socket: &mut tokio::net::TcpStream) -> Option<String>
     }
 
     let end = (header_end + content_length).min(buffer.len());
-    Some(String::from_utf8_lossy(&buffer[header_end..end]).to_string())
+    let head = String::from_utf8_lossy(&buffer[..header_end - 4]).to_string();
+    Some((
+        head,
+        String::from_utf8_lossy(&buffer[header_end..end]).to_string(),
+    ))
 }

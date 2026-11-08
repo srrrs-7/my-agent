@@ -278,9 +278,10 @@ pub struct RequestMetadata {
 | infrastructure | ペイロード写像の単体テスト | `finish_reason:"stop"` + `tool_calls` の解釈 |
 | infrastructure | 生 TCP のモックサーバ | ステータス写像、実際に送出される JSON |
 | 全体 | E2E（`crates/cli/tests/end_to_end.rs`） | HTTP → ループ → 実ファイル書き込み |
+| 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/notify_e2e.rs`） | 合成ルート → `run` / `chat` → 終了処理。Webhook 通知の到達・中身・終了コード |
 
 モックサーバは `crates/test-support` に置いて infrastructure と cli の
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 365 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 390 本）。
