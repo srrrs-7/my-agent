@@ -9,6 +9,7 @@ pub mod exec;
 pub mod file;
 pub mod plan;
 pub mod registry;
+pub mod server;
 pub mod util;
 pub mod web;
 

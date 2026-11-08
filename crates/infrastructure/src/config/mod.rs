@@ -234,6 +234,55 @@ pub struct ShellSettings {
     pub extra_writable: Vec<PathBuf>,
 }
 
+/// MCP servers (stdio), each started inside the OS sandbox.
+///
+/// Off unless `config` is set. The file is the operator's, read once at
+/// startup, and must live outside the workspace: a configuration a cloned
+/// repository could ship would start code of the repository's choosing the
+/// moment the agent is launched in it.
+///
+/// `sandbox` is separate from the shell's on purpose. Turning the sandbox off
+/// for `run_command` in a disposable container is a decision about commands
+/// the human approves one by one; a server runs unattended between calls,
+/// so there is no `none` here.
+#[derive(Debug, Clone, Default)]
+pub struct McpSettings {
+    /// Absolute path of the JSON file listing the servers.
+    pub config: Option<PathBuf>,
+    /// The confinement every server runs under. Never `Disabled`.
+    pub sandbox: SandboxRequirement,
+}
+
+const MCP_CONFIG_KEY: &str = "AGENT_MCP_CONFIG";
+const MCP_SANDBOX_KEY: &str = "AGENT_MCP_SANDBOX";
+
+impl McpSettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        let config = match reader.string(MCP_CONFIG_KEY) {
+            None => None,
+            Some(raw) if Path::new(&raw).is_absolute() => Some(PathBuf::from(raw)),
+            Some(raw) => {
+                return Err(ConfigError::invalid(
+                    MCP_CONFIG_KEY,
+                    raw,
+                    "must be an absolute path outside the workspace (`~` is not expanded), e.g. \
+                     /home/me/.config/agent/mcp.json",
+                ));
+            }
+        };
+        let sandbox = reader.parsed(MCP_SANDBOX_KEY, SandboxRequirement::default())?;
+        if sandbox == SandboxRequirement::Disabled {
+            return Err(ConfigError::invalid(
+                MCP_SANDBOX_KEY,
+                reader.string(MCP_SANDBOX_KEY).unwrap_or_default(),
+                "MCP servers always run sandboxed. Use `confined` (the default) or `isolated`, \
+                 or unset AGENT_MCP_CONFIG to start no servers",
+            ));
+        }
+        Ok(Self { config, sandbox })
+    }
+}
+
 /// What a session leaves on disk.
 ///
 /// Off is a real option and not a formality: the log holds the conversation
@@ -407,6 +456,7 @@ pub struct Settings {
     pub prompt: PromptSettings,
     pub web_fetch: WebFetchSettings,
     pub shell: ShellSettings,
+    pub mcp: McpSettings,
     pub notify: NotifySettings,
     pub access: AccessSettings,
     /// Largest file the read tool will load.
@@ -467,6 +517,7 @@ impl Settings {
                     .map(PathBuf::from)
                     .collect(),
             },
+            mcp: McpSettings::read(&reader)?,
             notify: NotifySettings::read(&reader)?,
             access: AccessSettings::read(&reader)?,
             max_file_bytes: reader.parsed("AGENT_MAX_FILE_BYTES", 2 * 1024 * 1024)?,
@@ -827,6 +878,17 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
             format!("enabled (sandbox: {}; {egress})", settings.shell.sandbox)
         },
     );
+    description.insert(
+        "mcp servers".into(),
+        match &settings.mcp.config {
+            None => "disabled".to_string(),
+            Some(path) => format!(
+                "from {} (sandbox: {})",
+                path.display(),
+                settings.mcp.sandbox
+            ),
+        },
+    );
     description.insert("notify".into(), describe_notify(&settings.notify));
     description.insert(
         "file access".into(),
@@ -1034,6 +1096,45 @@ mod tests {
             "an absolute setting is taken as given, so the log can be kept \
              outside the workspace the model can read"
         );
+    }
+
+    #[test]
+    fn no_mcp_config_means_no_servers() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert_eq!(settings.mcp.config, None);
+        assert_eq!(settings.mcp.sandbox, SandboxRequirement::Confined);
+    }
+
+    #[test]
+    fn the_mcp_config_must_be_an_absolute_path() {
+        let error =
+            settings(&[("AGENT_MODEL", "m"), ("AGENT_MCP_CONFIG", "mcp.json")]).unwrap_err();
+        assert!(error.to_string().contains("AGENT_MCP_CONFIG"), "{error}");
+
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_MCP_CONFIG", "/etc/agent/mcp.json"),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.mcp.config,
+            Some(PathBuf::from("/etc/agent/mcp.json"))
+        );
+    }
+
+    #[test]
+    fn mcp_servers_cannot_run_unsandboxed_even_when_commands_can() {
+        let error = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SHELL_SANDBOX", "none"),
+            ("AGENT_MCP_SANDBOX", "none"),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("AGENT_MCP_SANDBOX"), "{error}");
+
+        // The shell's opt-out does not leak into the servers' requirement.
+        let settings = settings(&[("AGENT_MODEL", "m"), ("AGENT_SHELL_SANDBOX", "none")]).unwrap();
+        assert_eq!(settings.mcp.sandbox, SandboxRequirement::Confined);
     }
 
     #[test]

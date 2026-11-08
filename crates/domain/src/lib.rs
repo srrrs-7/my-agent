@@ -22,7 +22,7 @@ pub mod text;
 
 pub use error::{
     ApprovalError, CommandError, DomainError, FetchError, FsError, LlmError, NotifyError,
-    PlanError, ToolError,
+    PlanError, ToolError, ToolServerError,
 };
 pub use model::{
     access::{AccessPolicy, FileAccess, PathPattern},
@@ -57,5 +57,6 @@ pub use ports::{
     search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery},
     session_store::{SessionStore, SessionSummary},
     tool::Tool,
+    tool_server::{RemoteContent, RemoteTool, RemoteToolOutput, ToolServer},
     web::{FetchedContent, WebFetcher},
 };

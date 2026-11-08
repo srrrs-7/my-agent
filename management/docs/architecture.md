@@ -56,6 +56,7 @@
 | `ApprovalGate` | `CliApprovalGate` | human-in-the-loop。依存の変更は `authorize_dependency_change` で別に問う（§3.6.2） |
 | `WebFetcher` | `GuardedWebFetcher` | 外向き HTTP（SSRF ガード・許可リスト・サイズ上限） |
 | `CommandRunner` | `SandboxedCommandRunner` | 子プロセス実行（OS レベルの封じ込め・egress 許可リスト） |
+| `ToolServer` | `McpServer` | 長寿命のツールサーバ（MCP over stdio）。サーバは封じ込めの中で動き、ツール一覧は起動時に固定（§3.2.4） |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` | 進捗の可観測性 |
 | `ConversationLog` | `FileConversationLog`, `NullConversationLog` | 会話の永続的な記録（§3.2.3） |
 | `SessionStore` | `FileSessionStore` | その記録の読み出しと再開（§3.2.3） |
@@ -185,6 +186,28 @@ application（`agent/compaction.rs`）にあります。
 一致しておらず、これは「セッションが既に苦しいときに必ず通らなければならない」唯一の
 リクエストだからです。平坦化はツール出力の切り詰めも可能にします（ユーザー発言だけは
 切りません。それが最も失ってはいけないものだからです）。
+
+### 3.2.4 ツールサーバ（MCP）は 3 層に分ける
+
+外部の MCP サーバのツールをモデルに渡す経路は、責務ごとに層を分けています。
+
+- **domain の `ToolServer`** — 中立名のポート（`server_name` / `sandbox()` / 起動時に固定した `tools()` / `call`）。
+  MCP という語も JSON-RPC の型も出さない。`sandbox()` は `CommandRunner` と同じく実際に効いている封じ込めを返す
+- **infrastructure の `mcp/`** — JSON-RPC を serde_json の上に自前で書く（SDK を足さない。封じ込めを担う部品の
+  サプライチェーンを増やさないため）。応答は id で振り分け、future の drop で `notifications/cancelled` を送る。
+  1 メッセージ 4 MiB、stderr は読み捨て続け、drop で stdin を閉じてからプロセスグループを kill する。
+  プロセスは `run_command` と同じ `exec::confined::confine_command` で封じ込めるが、書き込み可能なのは
+  サーバ専用ディレクトリだけ（ワークスペースは設定で明示したときだけ）。サーバは呼び出しの合間にも動けるので、
+  承認ゲートも依存ファイルの検知も通らない書き込みを既定では許さない
+- **application の `tools/server.rs`** — 名前空間（`mcp__<server>__<tool>`）、文字種の置換と 64 文字の切り詰め、
+  衝突の検出（registry は黙って上書きするので起動時に失敗させる）、説明とスキーマの無害化と上限、
+  出所の前置き、安全区分は一律 `Destructive`（サーバの自己申告を信用しない）。どれも純粋関数でテストする
+
+設定ファイル（`AGENT_MCP_CONFIG`）は操作者のものとして扱い、ワークスペース内にあれば起動失敗、
+起動するプログラムがワークスペース内でも起動失敗にしています。設定はプログラムを起動する権限そのものだからです。
+initialize の失敗やサンドボックスの欠如はエージェント全体の起動失敗です（設定したツールが黙って欠けない）。
+合成ルートは `redact_all` の前に `TimeoutTool` で包んで登録するので、最終的な形は
+`Redacting(DependencyWatch(Timeout(ServerTool)))` になります。
 
 ### 3.3 ツール失敗は実行失敗ではない
 
@@ -353,9 +376,11 @@ Anthropic アダプタはこの前置きにキャッシュの印を付けます�
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/plan_e2e.rs`） | `todo_write` の登録・承認なしでの実行・stderr への表示・`--resume` での復元・`/reset` |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/dependency_gate_e2e.rs`） | 非対話の `auto` で `Cargo.toml` の編集が拒否されファイルが変わらない、`AGENT_ALLOW_DEPENDENCY_CHANGES` で通る |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/interrupt_e2e.rs`） | SIGINT で `run` が 130、`chat` はターンだけ止まりプロンプトに戻る、プロンプト待ちの Ctrl-C は 0 |
+| infrastructure（実プロセス） | `/bin/sh` 製の MCP サーバ（`crates/infrastructure/tests/mcp_sandbox.rs`） | 既定でワークスペースに書けない・自分のディレクトリには書ける・許可外へ接続できない・drop で孫まで止まる・initialize 失敗で起動失敗 |
+| 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/mcp_e2e.rs`） | MCP ツールの登録と `destructive` 分類、伏せ字・タイムアウト・依存の検知・承認の各装飾、終了時に孫が残らない、設定の位置による起動失敗 |
 
 モックサーバは `crates/test-support` に置いて infrastructure と cli の
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 670 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 741 本）。

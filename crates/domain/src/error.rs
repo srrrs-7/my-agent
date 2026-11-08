@@ -239,6 +239,31 @@ pub enum CommandError {
     Io { message: String },
 }
 
+/// Failures produced by [`crate::ports::tool_server::ToolServer`].
+///
+/// A tool that ran and reported failure is not one of these - that comes back
+/// as an output with `is_error` set. These are the cases where no usable
+/// answer arrived. Messages are read by the model, so each says whether
+/// trying again can help.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ToolServerError {
+    /// The server process is gone or its connection is closed. Every later
+    /// call fails the same way; servers are not restarted mid-session.
+    #[error(
+        "the tool server `{server}` is no longer running ({reason}). Its tools cannot be used \
+         for the rest of this session; do not retry them"
+    )]
+    Stopped { server: String, reason: String },
+
+    /// The server answered the call with a protocol-level error.
+    #[error("the tool server `{server}` refused the call: {message}")]
+    Refused { server: String, message: String },
+
+    /// The server answered with something that is not a valid result.
+    #[error("the tool server `{server}` sent an invalid response: {reason}")]
+    Protocol { server: String, reason: String },
+}
+
 /// Failures produced while running a tool.
 #[derive(Debug, Error, Clone)]
 pub enum ToolError {

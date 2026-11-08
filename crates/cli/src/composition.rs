@@ -18,6 +18,7 @@ use agent_application::tools::file::{
     EditFileTool, GlobTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
 };
 use agent_application::tools::plan::TodoWriteTool;
+use agent_application::tools::server::server_tools;
 use agent_application::tools::web::WebFetchTool;
 use agent_domain::model::llm::{GenerationParams, ModelId};
 use agent_domain::model::workspace::WorkspaceRoot;
@@ -29,12 +30,14 @@ use agent_domain::ports::notify::{Notifier, NullNotifier};
 use agent_domain::ports::prompt::PromptBuilder;
 use agent_domain::ports::session_store::SessionStore;
 use agent_domain::ports::tool::Tool;
+use agent_domain::ports::tool_server::ToolServer;
 use agent_infrastructure::config::{
     ApprovalPolicy, PromptSettings, Settings, ShellSettings, SystemEnv,
 };
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
+use agent_infrastructure::mcp::{McpConfig, McpServer, start_servers};
 use agent_infrastructure::notify::WebhookNotifier;
 use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
 use agent_infrastructure::tools::{DependencyWatchTool, RedactingTool, Redactor, TimeoutTool};
@@ -65,6 +68,9 @@ pub struct Application {
     /// The same instance the approval gate holds: the gate restarts the turn
     /// clock when a prompt is answered, and the subcommands read it.
     pub notifications: Arc<Notifications>,
+    /// The MCP servers, running for the life of the process. Their tools hold
+    /// them too; dropping the last handle stops the server and its group.
+    pub tool_servers: Vec<Arc<McpServer>>,
 }
 
 /// Async because the egress proxy binds a socket at startup - see
@@ -89,10 +95,18 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             .context("the workspace path must be absolute")?
             .with_policy(access),
     );
+    // Read before the redactor: what the operator hands a server is a
+    // credential, and the server can echo it back.
+    let mcp_config = load_mcp_config(&settings, workspace.as_path())?;
     // One instance for tool output and for notifications: a secret hidden
     // from the model must not leave by the other door. Read after `main`
     // loaded `.env`, so its variables are among the environment's.
-    let redactor = Arc::new(Redactor::new(settings.secrets(SystemEnv.vars())));
+    let redactor = Arc::new(Redactor::new(
+        settings
+            .secrets(SystemEnv.vars())
+            .into_iter()
+            .chain(mcp_config.iter().flat_map(McpConfig::secret_values)),
+    ));
 
     // --- adapters ------------------------------------------------------------
     let file_system = Arc::new(
@@ -191,6 +205,18 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         None
     };
 
+    // Before the wrapping below, so server tools are watched and redacted
+    // like every other destructive tool.
+    let mut registry = (*tools).clone();
+    let tool_servers = register_tool_servers(
+        &mut registry,
+        mcp_config.as_ref(),
+        &settings,
+        workspace.as_path(),
+    )
+    .await?;
+    let tools = Arc::new(registry);
+
     // After every tool is registered, so none can be missed. Unconditional:
     // AGENT_ALLOW_DEPENDENCY_CHANGES skips the question, not the report.
     let tools = watch_destructive(&tools, &workspace, &events);
@@ -252,7 +278,55 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         sessions,
         commands,
         notifications,
+        tool_servers,
     })
+}
+
+/// The MCP configuration, when `AGENT_MCP_CONFIG` names one. Checked against
+/// the canonical workspace: neither the file nor the programs it starts may
+/// live inside it.
+fn load_mcp_config(settings: &Settings, workspace: &std::path::Path) -> Result<Option<McpConfig>> {
+    settings
+        .mcp
+        .config
+        .as_ref()
+        .map(|path| {
+            McpConfig::load(path, workspace)
+                .context("AGENT_MCP_CONFIG cannot be used. Fix the file, or unset the variable")
+        })
+        .transpose()
+}
+
+/// Starts the configured MCP servers and registers their tools, each in a
+/// timeout. Nothing at all without a configuration.
+///
+/// Every failure is fatal - a server that does not start, a sandbox the
+/// platform lacks, a tool whose name would collide - because an agent quietly
+/// missing tools the operator configured, or quietly running them with less
+/// confinement, is worse than one that does not start.
+async fn register_tool_servers(
+    registry: &mut ToolRegistry,
+    config: Option<&McpConfig>,
+    settings: &Settings,
+    workspace: &std::path::Path,
+) -> Result<Vec<Arc<McpServer>>> {
+    let Some(config) = config else {
+        return Ok(Vec::new());
+    };
+    let servers = start_servers(config, settings.mcp.sandbox, workspace)
+        .await
+        .context(
+            "cannot start the MCP servers AGENT_MCP_CONFIG lists. They run only under a sandbox \
+             (Linux 6.7+ for Landlock; macOS is not supported yet) - unset AGENT_MCP_CONFIG to \
+             start without them",
+        )?;
+    for server in &servers {
+        let tools = server_tools(server.clone() as Arc<dyn ToolServer>, registry)?;
+        for tool in tools {
+            registry.register(TimeoutTool::wrap(tool, settings.agent_loop.tool_timeout));
+        }
+    }
+    Ok(servers)
 }
 
 /// Deletes the session records the retention policy no longer covers.
@@ -571,6 +645,37 @@ mod tests {
         assert_eq!(planned[0].path.display(), "Cargo.toml");
         assert_eq!(planned[0].before.as_deref(), Some("[dependencies]\n"));
         assert!(planned[0].after.contains("serde"));
+    }
+
+    #[tokio::test]
+    async fn without_an_mcp_config_no_server_starts_and_the_registry_is_untouched() {
+        use agent_infrastructure::config::MapEnv;
+
+        let settings = Settings::from_source(&MapEnv::new(&[
+            ("AGENT_WORKSPACE", "/workspace"),
+            ("AGENT_PROVIDER", "ollama"),
+            ("AGENT_MODEL", "m"),
+        ]))
+        .unwrap();
+        assert!(
+            load_mcp_config(&settings, std::path::Path::new("/workspace"))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut registry = ToolRegistry::new().with(Arc::new(TodoWriteTool::new()));
+        let before = registry.names();
+        let servers = register_tool_servers(
+            &mut registry,
+            None,
+            &settings,
+            std::path::Path::new("/workspace"),
+        )
+        .await
+        .unwrap();
+
+        assert!(servers.is_empty());
+        assert_eq!(registry.names(), before);
     }
 
     #[test]

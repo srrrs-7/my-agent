@@ -49,6 +49,24 @@ fn print_configuration(app: &Application) {
         app.provider.capabilities().supports_tools
     );
     print_sandbox(app);
+    print_tool_servers(app);
+}
+
+/// Each running MCP server with the confinement it actually got.
+fn print_tool_servers(app: &Application) {
+    use agent_domain::ports::tool_server::ToolServer as _;
+    for server in &app.tool_servers {
+        let egress = match server.egress_port() {
+            Some(port) => format!("network via the proxy on 127.0.0.1:{port}"),
+            None => "no network".to_string(),
+        };
+        println!(
+            "  {:<20} {} tools; {}; {egress}",
+            format!("mcp[{}]", server.server_name()),
+            server.tools().len(),
+            server.sandbox().as_str(),
+        );
+    }
 }
 
 /// What the sandbox *is*, not what was configured.

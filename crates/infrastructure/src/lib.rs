@@ -11,6 +11,7 @@ pub mod config;
 pub mod exec;
 pub mod fs;
 pub mod llm;
+pub mod mcp;
 pub(crate) mod net;
 pub mod notify;
 pub mod session;

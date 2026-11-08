@@ -17,6 +17,7 @@ pub mod prompt;
 pub mod search;
 pub mod session_store;
 pub mod tool;
+pub mod tool_server;
 pub mod web;
 
 pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest};
@@ -31,4 +32,5 @@ pub use prompt::PromptBuilder;
 pub use search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery};
 pub use session_store::{SessionStore, SessionSummary};
 pub use tool::Tool;
+pub use tool_server::{RemoteContent, RemoteTool, RemoteToolOutput, ToolServer};
 pub use web::{FetchedContent, WebFetcher};
