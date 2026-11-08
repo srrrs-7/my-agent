@@ -229,6 +229,11 @@ impl Snapshot {
     /// Directories come from an ignore-aware walk, which prunes them; the
     /// files in each are then listed directly, so no ignore rule ever hides a
     /// file (see the module docs).
+    ///
+    /// Not `fs::walk::workspace_walker`: that one is the model's view of the
+    /// workspace and skips hidden directories, where `.github/` and `.cargo/`
+    /// keep manifests this check exists to watch, and it would let a global
+    /// excludes file make the check differ by machine.
     fn take(root: &WorkspaceRoot, limit: usize) -> Self {
         let mut files = BTreeMap::new();
         let mut visited = 0usize;

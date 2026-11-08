@@ -12,7 +12,7 @@ color: yellow
 
 1. `.claude/rules/testing.md` — 層ごとの手法、既存のフェイク、禁止事項
 2. `.claude/rules/invariants.md` — 守るべき契約の一覧。テストはこれに対応しているべき
-3. `crates/application/tests/agent_loop.rs` — フェイクが揃っている。新規に書く前にここを見る
+3. `crates/application/tests/common/mod.rs` — フェイクが揃っている。新規に書く前にここを見る（シナリオは `agent_loop.rs` / `compaction_trim.rs` / `plan.rs` / `interrupt.rs` / `dependency_gate.rs` に分割）
 
 ## 原則
 

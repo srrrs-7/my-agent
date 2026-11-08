@@ -17,7 +17,7 @@
 │ agent-application            │ │ agent-infrastructure        │
 │  ユースケース                │ │  アダプタ                   │
 │   agent/loop_runner.rs       │ │   llm/openai.rs             │
-│   agent/dispatch.rs          │ │   llm/anthropic.rs          │
+│   agent/dispatch.rs          │ │   llm/anthropic/            │
 │   agent/prompt.rs            │ │   llm/routing.rs            │
 │   agent/session.rs           │ │   llm/retry.rs              │
 │   tools/file/*.rs            │ │   llm/http.rs（共有配管）   │

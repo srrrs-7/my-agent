@@ -31,8 +31,10 @@ use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::context::ContextProvider;
 use agent_domain::text;
 use async_trait::async_trait;
-use ignore::WalkBuilder;
 use tracing::warn;
+
+use super::resolve::ResolvedWorkspace;
+use super::walk::workspace_walker;
 
 /// Instruction files, in precedence order. The first one found in a directory
 /// wins - this is the convention Claude Code and Codex established, and
@@ -101,7 +103,7 @@ impl ContextProvider for WorkspaceContextProvider {
                 is_git_repository: base.join(".git").exists(),
                 project_instructions: read_instructions(&root, global.as_deref()),
                 nested_instructions: nested_instructions(&root),
-                directory_overview: overview(base),
+                directory_overview: overview(&root),
             })
         })
         .await
@@ -209,21 +211,12 @@ fn instruction_file_permitted(
     root: &WorkspaceRoot,
     requested: &WorkspacePath,
 ) -> Result<(), FsError> {
-    let real_root = super::canonical_root(root)?;
+    let workspace = ResolvedWorkspace::new(root)?;
     let real = std::fs::canonicalize(root.absolute(requested)).map_err(|error| FsError::Io {
         path: requested.display(),
         message: error.to_string(),
     })?;
-    let real = real_root.relativize(&real)?;
-
-    if root.permits(requested, FileAccess::Read) && real_root.permits(&real, FileAccess::Read) {
-        Ok(())
-    } else {
-        Err(FsError::AccessDenied {
-            path: requested.display(),
-            access: FileAccess::Read,
-        })
-    }
+    workspace.check(requested, &real, FileAccess::Read)
 }
 
 /// Paths of the instruction files in subdirectories, sorted, at most
@@ -232,14 +225,8 @@ fn instruction_file_permitted(
 /// The walk honours `.gitignore` and skips hidden directories, so vendored
 /// trees (`node_modules/`, `target/`) and `.git/` contribute nothing.
 fn nested_instructions(root: &WorkspaceRoot) -> Vec<String> {
-    let base = root.as_path();
-    let mut found: Vec<String> = WalkBuilder::new(base)
-        .hidden(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
+    let mut found: Vec<String> = workspace_walker(root.as_path())
         .max_depth(Some(NESTED_MAX_DEPTH))
-        .follow_links(false)
         .build()
         .filter_map(Result::ok)
         .filter(|entry| entry.depth() > 0 && entry.file_type().is_some_and(|kind| kind.is_dir()))
@@ -260,20 +247,15 @@ fn nested_instructions(root: &WorkspaceRoot) -> Vec<String> {
     found
 }
 
-fn overview(base: &Path) -> Vec<String> {
-    let mut entries: Vec<String> = WalkBuilder::new(base)
-        .hidden(true)
-        .git_ignore(true)
-        .require_git(false)
+fn overview(root: &WorkspaceRoot) -> Vec<String> {
+    let mut entries: Vec<String> = workspace_walker(root.as_path())
         .max_depth(Some(OVERVIEW_MAX_DEPTH))
-        .follow_links(false)
         .build()
         .filter_map(Result::ok)
         // depth 0 is the root itself
         .filter(|entry| entry.depth() > 0)
         .filter_map(|entry| {
-            let relative = entry.path().strip_prefix(base).ok()?;
-            let display = relative.to_string_lossy().replace('\\', "/");
+            let display = root.relativize(entry.path()).ok()?.display();
             let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
             Some(if is_dir {
                 format!("{display}/")

@@ -35,9 +35,9 @@ make exec CMD="grep -rn 'tokio\|agent_infrastructure' crates/application/src/ | 
 | 段 | 場所 | 防ぐもの |
 |---|---|---|
 | 字句 | `domain/src/model/workspace.rs` | `..` による脱出、範囲外の絶対パス、NUL |
-| 正規化 | `infrastructure/src/fs/local.rs` の `guard()` | ワークスペース内から外部を指すシンボリックリンク、リンク先が存在しないシンボリックリンク |
+| 正規化 | `infrastructure/src/fs/resolve.rs` の `ResolvedWorkspace`（`LocalFileSystem::guard()` はここへ委譲） | ワークスペース内から外部を指すシンボリックリンク、リンク先が存在しないシンボリックリンク |
 
-`guard()` には既知の落とし穴があります: 既存パスに空の tail を `join` すると末尾スラッシュが付き、
+`resolve_leniently`（`fs/resolve.rs`）には既知の落とし穴があります: 既存パスに空の tail を `join` すると末尾スラッシュが付き、
 通常ファイルへの全 syscall が ENOTDIR になります。早期 return で回避済みなので消さないでください。
 
 ### ワークスペース内の保護ファイル（`AccessPolicy`）
@@ -51,7 +51,7 @@ make exec CMD="grep -rn 'tokio\|agent_infrastructure' crates/application/src/ | 
 | 字句 | モデルが指定した `WorkspacePath` | `.env -> config/app.env`（保護された名前が無害な実体を指す） |
 | 正規化 | canonicalize 後の実パスを正規化済みルートで相対化したもの | `notes -> .env`（無害な名前が保護された実体を指す） |
 
-両段とも `FileSystem` / `FileSearcher` のアダプタ（`guard()`、`IgnoreAwareSearcher`）で適用します。
+両段とも `FileSystem` / `FileSearcher` のアダプタ（`guard()`、`IgnoreAwareSearcher`）で、共通の `ResolvedWorkspace`（`fs/resolve.rs`）を通して適用します。
 読み書きはすべてそこを通るため、`WorkspacePath` をどの経路で得ても迂回できません。
 `list_dir` と `exists` は名前しか返さないので規則を当てません。
 起動時の指示ファイル（`fs/context.rs`）にも同じ 2 段を当てます。

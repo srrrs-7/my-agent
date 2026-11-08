@@ -12,7 +12,7 @@ $ARGUMENTS
 話すなら**コードは不要**です。`AGENT_PROVIDER=openai` に `AGENT_BASE_URL` と `AGENT_MODEL` を設定するだけで動きます
 （Ollama, vLLM, LM Studio, llama.cpp, OpenRouter, Groq, Together はこれに該当）。
 
-独自プロトコルの場合だけ以下に進みます。参考実装: `crates/infrastructure/src/llm/anthropic.rs`。
+独自プロトコルの場合だけ以下に進みます。参考実装: `crates/infrastructure/src/llm/anthropic/`（`mod.rs` が写像、`cache.rs` / `blocks.rs` がキャッシュと thinking ブロック）。
 
 ## 1. クライアントを実装する
 

@@ -9,6 +9,7 @@ pub mod dependency_watch;
 pub mod redact;
 pub mod timeout;
 
+pub use crate::secrets::Redactor;
 pub use dependency_watch::DependencyWatchTool;
-pub use redact::{RedactingTool, Redactor};
+pub use redact::RedactingTool;
 pub use timeout::TimeoutTool;

@@ -24,9 +24,11 @@ use agent_domain::model::access::FileAccess;
 use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery};
 use async_trait::async_trait;
-use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use regex::RegexBuilder;
+
+use super::resolve::ResolvedWorkspace;
+use super::walk::workspace_walker;
 
 /// Files larger than this are skipped: a match inside a multi-megabyte blob is
 /// not useful to the model and reading it is pure latency.
@@ -76,18 +78,11 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
 
     let WalkStart {
         base,
-        real_root,
+        workspace,
         real_base,
     } = walk_start(root, &query.root)?;
 
-    let mut builder = WalkBuilder::new(&base);
-    builder
-        .hidden(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        // Apply ignore rules even when the workspace is not a git checkout.
-        .require_git(false)
-        .follow_links(false);
+    let mut builder = workspace_walker(&base);
 
     if let Some(glob) = &query.include_glob {
         let mut overrides = OverrideBuilder::new(&base);
@@ -116,7 +111,7 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
             continue;
         };
         // Decided before the file is opened: a refused file is never read.
-        if !permitted(root, &path, &real_root, &base, &real_base, entry.path()) {
+        if !permitted(&workspace, &path, &base, &real_base, entry.path()) {
             continue;
         }
 
@@ -151,7 +146,7 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
 /// filesystem really resolves it.
 struct WalkStart {
     base: PathBuf,
-    real_root: WorkspaceRoot,
+    workspace: ResolvedWorkspace,
     real_base: PathBuf,
 }
 
@@ -167,28 +162,16 @@ fn walk_start(root: &WorkspaceRoot, subtree: &WorkspacePath) -> Result<WalkStart
     // of the search is resolved and checked like any other path: a link to a
     // directory outside the workspace, or to a protected one, would otherwise
     // be searched in full.
-    let real_root = super::canonical_root(root)?;
+    let workspace = ResolvedWorkspace::new(root)?;
     let real_base = std::fs::canonicalize(&base).map_err(|error| FsError::Io {
         path: subtree.display(),
         message: error.to_string(),
     })?;
-    let real_subtree = real_root
-        .relativize(&real_base)
-        .map_err(|_| FsError::OutsideWorkspace {
-            path: subtree.display(),
-        })?;
-    if !root.permits(subtree, FileAccess::Read)
-        || !real_root.permits(&real_subtree, FileAccess::Read)
-    {
-        return Err(FsError::AccessDenied {
-            path: subtree.display(),
-            access: FileAccess::Read,
-        });
-    }
+    workspace.check(subtree, &real_base, FileAccess::Read)?;
 
     Ok(WalkStart {
         base,
-        real_root,
+        workspace,
         real_base,
     })
 }
@@ -198,7 +181,7 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
 
     let WalkStart {
         base,
-        real_root,
+        workspace,
         real_base,
     } = walk_start(root, &query.root)?;
 
@@ -216,16 +199,12 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
             .map_err(|error| FsError::InvalidPattern(format!("glob: {error}")))?
     };
 
-    let mut builder = WalkBuilder::new(&base);
+    let mut builder = workspace_walker(&base);
     builder
         // Hidden entries are walked only when the pattern names one: `*.yml`
         // should not surface every file under `.github/` and `.cargo/`, but
         // `.github/**/*.yml` has to be able to match at all.
         .hidden(!names_a_hidden_entry(pattern))
-        .git_ignore(true)
-        .git_exclude(true)
-        .require_git(false)
-        .follow_links(false)
         // Git's object store is never what a path search is looking for, and
         // walking it is most of the cost once hidden entries are included.
         .filter_entry(|entry| entry.file_name() != ".git");
@@ -242,7 +221,7 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
         let Ok(path) = root.relativize(entry.path()) else {
             continue;
         };
-        if !permitted(root, &path, &real_root, &base, &real_base, entry.path()) {
+        if !permitted(&workspace, &path, &base, &real_base, entry.path()) {
             continue;
         }
         let modified = entry
@@ -280,16 +259,12 @@ fn names_a_hidden_entry(pattern: &str) -> bool {
 /// is the resolved start plus the same tail - no syscall per file. Anything
 /// that does not fit that shape is refused rather than guessed at.
 fn permitted(
-    root: &WorkspaceRoot,
+    workspace: &ResolvedWorkspace,
     path: &WorkspacePath,
-    real_root: &WorkspaceRoot,
     base: &Path,
     real_base: &Path,
     found: &Path,
 ) -> bool {
-    if !root.permits(path, FileAccess::Read) {
-        return false;
-    }
     let Ok(tail) = found.strip_prefix(base) else {
         return false;
     };
@@ -298,9 +273,7 @@ fn permitted(
     } else {
         real_base.join(tail)
     };
-    real_root
-        .relativize(&real)
-        .is_ok_and(|real| real_root.permits(&real, FileAccess::Read))
+    workspace.check(path, &real, FileAccess::Read).is_ok()
 }
 
 #[cfg(test)]
