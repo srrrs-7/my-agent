@@ -334,6 +334,9 @@ fn render_transcript(conversation: &Conversation, split: usize) -> String {
                         text::clip(&result.content, budget)
                     ));
                 }
+                // Provider-private reasoning: opaque by definition (often
+                // empty or encrypted), so it has nothing to give a summary.
+                ContentBlock::Opaque { .. } => {}
             }
         }
     }

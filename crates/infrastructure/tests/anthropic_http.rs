@@ -153,3 +153,80 @@ async fn with_caching_off_no_marker_leaves_the_process() {
     let sent = server.received().remove(0);
     assert!(!sent.body.contains("cache_control"), "{}", sent.body);
 }
+
+/// A tool-use turn with reasoning in front of the call, as Claude returns it
+/// with thinking on: one `thinking` block with its text omitted, one
+/// `redacted_thinking` block, then the call.
+const THINKING_REPLY: &str = r#"{
+    "id": "msg_2",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-opus-5-5",
+    "content": [
+        {"type": "thinking", "thinking": "", "signature": "EqQBCkYIARgCKkBzaWduYXR1cmU="},
+        {"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix/LafPsn4a"},
+        {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.rs"}}
+    ],
+    "stop_reason": "tool_use",
+    "usage": {"input_tokens": 10, "output_tokens": 20}
+}"#;
+
+#[tokio::test]
+async fn thinking_blocks_return_to_the_api_unchanged_on_the_next_turn() {
+    use agent_domain::model::tool::ToolResult;
+    use agent_infrastructure::llm::{Effort, Thinking};
+
+    let server = RecordingServer::start(Response::ok(THINKING_REPLY)).await;
+    let client = provider(server.url(), PromptCache::Off)
+        .with_thinking(Thinking::Adaptive)
+        .with_effort(Some(Effort::High));
+
+    let question = Message::user("read a.rs");
+    let first = client
+        .chat(ChatRequest::new(vec![question.clone()]).with_tools(vec![tool("read_file")]))
+        .await
+        .unwrap();
+    let call = first.message.tool_calls().next().unwrap().clone();
+    client
+        .chat(
+            ChatRequest::new(vec![
+                question,
+                first.message,
+                Message::tool_results(vec![ToolResult::ok(&call, "fn main() {}")]),
+            ])
+            .with_tools(vec![tool("read_file")]),
+        )
+        .await
+        .unwrap();
+
+    let received = server.received();
+    for request in &received {
+        let body = request.json();
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+        assert!(body.get("temperature").is_none(), "{body}");
+    }
+
+    let replied: serde_json::Value = serde_json::from_str(THINKING_REPLY).unwrap();
+    let second = received[1].json();
+    assert_eq!(
+        second["messages"][1],
+        json!({"role": "assistant", "content": replied["content"]}),
+        "the assistant turn goes back block for block, signatures included"
+    );
+}
+
+#[tokio::test]
+async fn with_thinking_off_no_thinking_field_leaves_the_process() {
+    let server = RecordingServer::start(Response::ok(REPLY)).await;
+    let [request, _] = two_turns();
+
+    provider(server.url(), PromptCache::Off)
+        .chat(request)
+        .await
+        .unwrap();
+
+    let sent = server.received().remove(0);
+    assert!(!sent.body.contains("thinking"), "{}", sent.body);
+    assert!(!sent.body.contains("output_config"), "{}", sent.body);
+}

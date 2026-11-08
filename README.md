@@ -734,9 +734,15 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_REQUEST_TIMEOUT_SECS` | `180` | HTTP リクエストの上限時間 |
 | `AGENT_MAX_RETRIES` | `3` | 一時障害の再試行回数 |
 | `AGENT_PROMPT_CACHE` | `5m` | Anthropic のプロンプトキャッシュ。`5m` \| `1h` \| `off`。ツール定義＋システムプロンプトの末尾と会話の末尾（自動キャッシュ）に印を付け、毎ターン同じ前置きを全額で読み直させない。プロンプトの間に 5 分以上空くことが多いなら `1h`（書き込み単価は 2 倍）、`cache_control` を拒否するゲートウェイ経由なら `off`。OpenAI 互換サーバ側のキャッシュは自動なので影響しない。効果は `-v` と `/usage` の `cache: N read, M written` で確認できる |
+| `AGENT_THINKING` | `off` | Anthropic の拡張思考。`off`（`thinking` フィールドを**送らない**。`disabled` は送らないので、思考を止められないモデルではモデル既定のまま）\| `adaptive`（`"thinking": {"type": "adaptive"}`。思考するかと量をモデルが決める）。`adaptive` では `AGENT_TEMPERATURE` を送らない（思考と温度指定は併用できない）。思考は `AGENT_MAX_TOKENS` を消費するので、上げておくとよい。応答中の `thinking` / `redacted_thinking` ブロックは表示せず、同じ会話の後続リクエストにそのまま送り返す（署名検証・推論の継続・キャッシュのため）。`budget_tokens` は使わない。OpenAI 互換サーバには影響しない |
+| `AGENT_EFFORT` | —（送らない） | Anthropic の `output_config.effort`。`low` \| `medium` \| `high` \| `xhigh` \| `max`。未設定ならフィールド自体を送らず、モデルの既定に従う |
 | `RUST_LOG` | `warn` | tracing フィルタ（例: `info`、`agent_application=debug,warn`） |
 | `RUST_BACKTRACE` | `0` | `1` でエラー時にバックトレース（テストの調査用） |
 | `OLLAMA_PORT` | `11434` | compose の ollama をホストに公開するポート（ホスト側の compose 設定） |
+
+`AGENT_THINKING` と `AGENT_EFFORT` は会話の途中で変えるとプロンプトキャッシュが無効になります。
+どちらもプロセス単位の設定（起動時に読むだけ）なので、1 つのセッション内で変わることはありません。
+`--resume` で再開するときに値を変えると、再開後の最初のリクエストはキャッシュを読めません。
 
 ---
 

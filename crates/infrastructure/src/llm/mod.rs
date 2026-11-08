@@ -23,7 +23,7 @@ pub mod retry;
 pub mod routing;
 pub(crate) mod sse;
 
-pub use anthropic::{AnthropicProvider, PromptCache};
+pub use anthropic::{AnthropicProvider, Effort, PromptCache, Thinking};
 pub use factory::build_provider;
 pub use failover::{Clock, FailoverProvider, SystemClock};
 pub use openai::OpenAiCompatibleProvider;

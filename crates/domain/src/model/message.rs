@@ -6,6 +6,7 @@
 //! lossless, while the reverse would not be.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::tool::{ToolCall, ToolResult};
 
@@ -22,9 +23,28 @@ pub enum Role {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    /// Something a provider put in an assistant turn that this program does
+    /// not interpret but must hand back, byte for byte, on later requests of
+    /// the same conversation - Anthropic's `thinking` and `redacted_thinking`
+    /// blocks, whose signature the API checks and whose loss breaks both the
+    /// model's reasoning across tool calls and the prompt cache.
+    ///
+    /// `dialect` names the adapter that produced it. Only that adapter sends
+    /// it back; every other one leaves it out, the way OpenAI-compatible
+    /// servers would reject a block type they never emitted. `data` is the
+    /// block exactly as it arrived.
+    ///
+    /// It is not text: [`Message::text`] skips it, and nothing shows it to
+    /// the user or summarises it.
+    Opaque {
+        dialect: String,
+        data: Value,
+    },
 }
 
 impl ContentBlock {
@@ -37,6 +57,7 @@ impl ContentBlock {
             Self::Text { text } => text.len(),
             Self::ToolCall(call) => call.name.as_str().len() + call.arguments.to_string().len(),
             Self::ToolResult(result) => result.content.len(),
+            Self::Opaque { data, .. } => data.to_string().len(),
         }
     }
 }
@@ -152,6 +173,28 @@ mod tests {
         ]);
         assert_eq!(message.text(), "hello\nworld");
         assert!(message.has_tool_calls());
+    }
+
+    /// The session log stores messages as JSON, so an opaque block has to
+    /// come back from it exactly as it went in - a resumed conversation sends
+    /// it to the provider again.
+    #[test]
+    fn an_opaque_block_round_trips_through_json_unchanged_and_is_not_text() {
+        let data = json!({"type": "thinking", "thinking": "", "signature": "EqQBCkYIARgCKkA="});
+        let message = Message::assistant(vec![
+            ContentBlock::Opaque {
+                dialect: "anthropic".into(),
+                data: data.clone(),
+            },
+            ContentBlock::text("done"),
+        ]);
+
+        let restored: Message =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+
+        assert_eq!(restored, message);
+        assert_eq!(restored.text(), "done");
+        assert!(message.approx_bytes() > data.to_string().len());
     }
 
     /// A history written before sequence numbers existed must still load, and

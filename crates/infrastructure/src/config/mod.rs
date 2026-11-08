@@ -30,7 +30,7 @@ use agent_domain::ports::notify::NotificationKind;
 use thiserror::Error;
 
 use crate::exec::SandboxRequirement;
-use crate::llm::PromptCache;
+use crate::llm::{Effort, PromptCache, Thinking};
 use crate::notify::{NotifyFormat, WebhookUrl};
 
 pub use env::{EnvSource, MapEnv, SystemEnv};
@@ -107,6 +107,11 @@ pub struct LlmSettings {
     /// Prompt-cache breakpoints for Anthropic providers. OpenAI-compatible
     /// servers that cache do so on their own, so there is nothing to send them.
     pub prompt_cache: PromptCache,
+    /// Extended thinking for Anthropic providers. Off leaves the field out of
+    /// the request entirely.
+    pub thinking: Thinking,
+    /// `output_config.effort` for Anthropic providers; `None` sends nothing.
+    pub effort: Option<Effort>,
     /// Per-task destinations and the failover chain.
     pub routing: RoutingSettings,
 }
@@ -638,6 +643,8 @@ impl LlmSettings {
             request_timeout: Duration::from_secs(reader.parsed("AGENT_REQUEST_TIMEOUT_SECS", 180)?),
             max_retries: reader.parsed("AGENT_MAX_RETRIES", 3)?,
             prompt_cache: reader.parsed("AGENT_PROMPT_CACHE", PromptCache::default())?,
+            thinking: reader.parsed("AGENT_THINKING", Thinking::default())?,
+            effort: reader.optional("AGENT_EFFORT")?,
             routing,
         })
     }
@@ -835,6 +842,17 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
             PromptCache::Off => "disabled".to_string(),
             ttl => format!("{} (anthropic providers)", ttl.as_str()),
         },
+    );
+    description.insert(
+        "thinking".into(),
+        format!(
+            "{}; effort {} (anthropic providers)",
+            settings.llm.thinking.as_str(),
+            settings
+                .llm
+                .effort
+                .map_or("not sent", |effort| effort.as_str())
+        ),
     );
     description.insert(
         "default provider".into(),
@@ -1098,6 +1116,40 @@ mod tests {
             .expect_err("an unknown TTL must abort startup");
         assert!(error.to_string().contains("AGENT_PROMPT_CACHE"), "{error}");
         assert!(error.to_string().contains("5m|1h|off"), "{error}");
+    }
+
+    #[test]
+    fn thinking_is_off_and_effort_unsent_unless_configured() {
+        let default = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert_eq!(default.llm.thinking, Thinking::Off);
+        assert_eq!(default.llm.effort, None);
+        assert_eq!(
+            describe(&default)["thinking"],
+            "off; effort not sent (anthropic providers)"
+        );
+
+        let set = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_THINKING", "adaptive"),
+            ("AGENT_EFFORT", "xhigh"),
+        ])
+        .unwrap();
+        assert_eq!(set.llm.thinking, Thinking::Adaptive);
+        assert_eq!(set.llm.effort, Some(Effort::XHigh));
+        assert_eq!(
+            describe(&set)["thinking"],
+            "adaptive; effort xhigh (anthropic providers)"
+        );
+
+        for (key, value, alternatives) in [
+            ("AGENT_THINKING", "disabled", "off|adaptive"),
+            ("AGENT_EFFORT", "extreme", "low|medium|high|xhigh|max"),
+        ] {
+            let error = settings(&[("AGENT_MODEL", "m"), (key, value)])
+                .expect_err("an unknown value must abort startup");
+            assert!(error.to_string().contains(key), "{error}");
+            assert!(error.to_string().contains(alternatives), "{error}");
+        }
     }
 
     #[test]
