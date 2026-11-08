@@ -71,6 +71,10 @@ pub struct Application {
     /// The MCP servers, running for the life of the process. Their tools hold
     /// them too; dropping the last handle stops the server and its group.
     pub tool_servers: Vec<Arc<McpServer>>,
+    /// The one redactor tool output and notifications go through, for
+    /// anything else the process writes out that may echo a secret (an eval
+    /// report quoting a check's output).
+    pub redactor: Arc<Redactor>,
 }
 
 /// What differs between the callers of [`assemble`].
@@ -326,6 +330,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         commands,
         notifications,
         tool_servers,
+        redactor,
     })
 }
 

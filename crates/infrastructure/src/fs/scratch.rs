@@ -72,14 +72,20 @@ impl ScratchDir {
         Self::create(&std::env::temp_dir(), prefix)
     }
 
+    /// Fails the way [`Self::copy_of`] would on what `fixture` holds - a
+    /// link, a socket, not a directory at all - without copying anything.
+    ///
+    /// For checking every fixture of a run up front, before anything is
+    /// spent on it. The copy still checks again: the fixture can change in
+    /// between.
+    pub fn check_fixture(fixture: &Path) -> Result<(), ScratchError> {
+        fixture_root(fixture)?;
+        check_tree(fixture)
+    }
+
     /// [`Self::copy_of`], under `parent` instead of the system temp dir.
     pub fn copy_into(parent: &Path, fixture: &Path, prefix: &str) -> Result<Self, ScratchError> {
-        // Followed on purpose: the fixture root is the operator's own path
-        // and may well sit behind a link. Links *inside* it are the concern.
-        let meta = std::fs::metadata(fixture).map_err(io_error(fixture))?;
-        if !meta.is_dir() {
-            return Err(ScratchError::NotADirectory(fixture.to_path_buf()));
-        }
+        fixture_root(fixture)?;
 
         let scratch = Self::create(parent, prefix)?;
         // From here on `scratch` owns the directory, so a copy that fails
@@ -152,6 +158,35 @@ fn make_private_dir(path: &Path) -> io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(path)
+}
+
+/// Refuses a fixture root that is not a directory.
+fn fixture_root(fixture: &Path) -> Result<(), ScratchError> {
+    // Followed on purpose: the fixture root is the operator's own path and
+    // may well sit behind a link. Links *inside* it are the concern.
+    let meta = std::fs::metadata(fixture).map_err(io_error(fixture))?;
+    if meta.is_dir() {
+        Ok(())
+    } else {
+        Err(ScratchError::NotADirectory(fixture.to_path_buf()))
+    }
+}
+
+/// [`copy_tree`]'s refusals, without the copy.
+fn check_tree(dir: &Path) -> Result<(), ScratchError> {
+    for entry in std::fs::read_dir(dir).map_err(io_error(dir))? {
+        let entry = entry.map_err(io_error(dir))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(io_error(&path))?;
+        if kind.is_symlink() {
+            return Err(ScratchError::Symlink(path));
+        } else if kind.is_dir() {
+            check_tree(&path)?;
+        } else if !kind.is_file() {
+            return Err(ScratchError::Unsupported(path));
+        }
+    }
+    Ok(())
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<(), ScratchError> {
@@ -248,6 +283,21 @@ mod tests {
             0,
             "the half-made copy must be removed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checking_a_fixture_finds_a_nested_symlink_without_copying_anything() {
+        let fixture = fixture();
+        std::os::unix::fs::symlink("/etc", fixture.path().join("src/nested/escape")).unwrap();
+
+        let error = ScratchDir::check_fixture(fixture.path()).unwrap_err();
+
+        assert!(
+            matches!(&error, ScratchError::Symlink(path) if path.ends_with("src/nested/escape")),
+            "{error:?}"
+        );
+        assert!(ScratchDir::check_fixture(self::fixture().path()).is_ok());
     }
 
     #[test]

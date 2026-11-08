@@ -96,9 +96,11 @@ impl Tokens {
 pub struct AttemptReport {
     /// 1-based, counting `--repeat`.
     pub attempt: u32,
-    /// No run error and every check passed. How the loop finished does not
-    /// enter into it: a model that wrote the right file and then ran out of
-    /// iterations did the work.
+    /// No run error, not interrupted, and every check passed. Otherwise how
+    /// the loop finished does not enter into it: a model that wrote the right
+    /// file and then ran out of iterations did the work. An interrupted
+    /// attempt is never checked - the operator asked to stop - so it cannot
+    /// have passed.
     pub passed: bool,
     /// `completed`, `max_iterations`, `stopped`, `interrupted` or `error`.
     pub finish_reason: &'static str,
@@ -117,7 +119,8 @@ pub struct AttemptReport {
     /// Where the scratch workspace was left, with `--keep`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scratch_dir: Option<String>,
-    /// Why the run itself failed - the provider broke. Checks still ran.
+    /// Why the attempt could not be run: the provider broke (checks still
+    /// ran), or the attempt could not be set up at all (no checks ran).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub checks: Vec<CheckOutcome>,
@@ -148,13 +151,14 @@ impl AttemptReport {
             scratch_dir,
             checks,
         } = input;
+        let interrupted = matches!(finish, Ok(FinishReason::Interrupted));
         let (finish_reason, error) = match finish {
             Ok(reason) => (finish_label(&reason), None),
             Err(error) => ("error", Some(error)),
         };
         Self {
             attempt,
-            passed: error.is_none() && checks.iter().all(|check| check.passed),
+            passed: error.is_none() && !interrupted && checks.iter().all(|check| check.passed),
             finish_reason,
             iterations: metrics.iterations,
             tokens: usage.into(),
@@ -268,6 +272,10 @@ pub struct Summary {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SuiteReport {
     pub schema: u32,
+    /// The operator stopped the run with Ctrl-C: the report covers only the
+    /// attempts made until then, and `repeat` is what was asked for, not
+    /// what ran.
+    pub interrupted: bool,
     pub fingerprint: Fingerprint,
     pub summary: Summary,
     pub tasks: Vec<TaskReport>,
@@ -278,6 +286,7 @@ impl SuiteReport {
         let totals = Totals::over(tasks.iter().flat_map(|task| &task.attempts));
         Self {
             schema: REPORT_SCHEMA,
+            interrupted: false,
             fingerprint,
             summary: Summary {
                 tasks: tasks.len(),
@@ -291,6 +300,16 @@ impl SuiteReport {
     /// Every attempt of every task passed.
     pub fn all_passed(&self) -> bool {
         self.tasks.iter().all(TaskReport::all_passed)
+    }
+
+    /// Every attempt was run to the end: none hit a broken provider or failed
+    /// to be set up. When this is false a low pass rate says nothing about
+    /// the model.
+    pub fn all_ran(&self) -> bool {
+        self.tasks
+            .iter()
+            .flat_map(|task| &task.attempts)
+            .all(|attempt| attempt.error.is_none())
     }
 }
 
@@ -353,6 +372,26 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_attempt_has_not_passed_even_without_failed_checks() {
+        let report = AttemptReport::new(AttemptInput {
+            attempt: 1,
+            finish: Ok(FinishReason::Interrupted),
+            usage: TokenUsage::default(),
+            metrics: RunMetrics::default(),
+            wall: Duration::ZERO,
+            session_id: "s".into(),
+            scratch_dir: None,
+            checks: Vec::new(),
+        });
+        assert!(!report.passed, "{report:?}");
+        assert_eq!(report.finish_reason, "interrupted");
+        assert!(
+            report.error.is_none(),
+            "an interrupt is not a failure to run"
+        );
+    }
+
+    #[test]
     fn totals_roll_up_per_task_and_for_the_suite() {
         let id = |raw: &str| TaskId::new(raw).unwrap();
         let report = SuiteReport::new(
@@ -389,6 +428,10 @@ mod tests {
         assert_eq!(report.summary.totals.tokens.total, 800);
         assert_eq!(report.summary.totals.wall_ms, 40);
         assert!(!report.all_passed());
+        assert!(
+            report.all_ran(),
+            "a failed check is a result, not a failure to run"
+        );
 
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["summary"]["pass_rate"], 0.75, "{json}");

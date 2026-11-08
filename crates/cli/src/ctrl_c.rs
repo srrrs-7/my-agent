@@ -15,7 +15,8 @@
 //! Only the third row drops the turn's future, and only because the process
 //! is about to exit.
 //!
-//! The handler is installed by `chat` and `run` alone. Once installed, SIGINT
+//! The handler is installed by `chat`, `run` and `eval` alone (`eval` treats
+//! each attempt as a turn). Once installed, SIGINT
 //! no longer kills the process for the rest of its life, so the subcommands
 //! that do not route it anywhere (`doctor`, `sessions`, ...) keep the
 //! default.
@@ -149,7 +150,7 @@ impl Sigint {
 
     /// Presses that come from the test instead of the keyboard.
     #[cfg(test)]
-    fn fake() -> (tokio::sync::mpsc::UnboundedSender<()>, Self) {
+    pub(crate) fn fake() -> (tokio::sync::mpsc::UnboundedSender<()>, Self) {
         let (press, presses) = tokio::sync::mpsc::unbounded_channel();
         (
             press,

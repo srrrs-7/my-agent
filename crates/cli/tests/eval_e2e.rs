@@ -9,9 +9,9 @@
 
 use std::path::Path;
 use std::process::{Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use agent_test_support::{MockLlmServer, Response};
+use agent_test_support::{MockLlmServer, RecordingServer, Response};
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -45,12 +45,21 @@ const SUITE: &str = r#"{
 }"#;
 
 async fn eval(root: &Path, llm: &MockLlmServer, args: &[&str]) -> Output {
+    let mut command = command(root, llm.base_url(), args);
+    tokio::time::timeout(DEADLINE, command.output())
+        .await
+        .unwrap_or_else(|_| panic!("eval was still running after {DEADLINE:?}"))
+        .expect("run the agent binary")
+}
+
+/// `agent eval <args>` in `root`, against the model at `base_url`.
+fn command(root: &Path, base_url: &str, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent"));
     command
         .env_clear()
         .env("AGENT_WORKSPACE", root.join("real-workspace"))
         .env("AGENT_PROVIDER", "openai")
-        .env("AGENT_BASE_URL", llm.base_url())
+        .env("AGENT_BASE_URL", base_url)
         .env("AGENT_MODEL", "mock")
         .env("AGENT_STREAM", "false")
         .env("AGENT_MAX_RETRIES", "0")
@@ -64,11 +73,7 @@ async fn eval(root: &Path, llm: &MockLlmServer, args: &[&str]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-
-    tokio::time::timeout(DEADLINE, command.output())
-        .await
-        .unwrap_or_else(|_| panic!("eval was still running after {DEADLINE:?}"))
-        .expect("run the agent binary")
+    command
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -230,4 +235,132 @@ async fn an_invalid_suite_fails_before_the_model_is_asked_anything() {
         "no report for a suite that never ran"
     );
     assert!(llm.requests().await.is_empty());
+}
+
+/// One task, for the tests that are about how the run ends rather than about
+/// the numbers.
+const ONE_TASK: &str = r#"{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "write-hello",
+      "fixture": "fixtures/base",
+      "prompt": "Create hello.txt saying hello eval.",
+      "checks": [{"type": "file_contains", "path": "hello.txt", "contains": "hello eval"}]
+    }
+  ]
+}"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_in_a_later_tasks_fixture_fails_before_the_model_is_asked_anything() {
+    let llm = MockLlmServer::start(Vec::new()).await;
+    let root = layout();
+    let linked = root.path().join("fixtures/linked");
+    std::fs::create_dir_all(linked.join("src")).unwrap();
+    std::os::unix::fs::symlink("/etc", linked.join("src/escape")).unwrap();
+    std::fs::write(
+        root.path().join("suite.json"),
+        serde_json::json!({
+            "version": 1,
+            "tasks": [
+                {"id": "write-hello", "fixture": "fixtures/base", "prompt": "p",
+                 "checks": [{"type": "file_contains", "path": "a", "contains": "a"}]},
+                {"id": "never-writes", "fixture": "fixtures/linked", "prompt": "p",
+                 "checks": [{"type": "file_contains", "path": "a", "contains": "a"}]},
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let output = eval(root.path(), &llm, &["suite.json", "--out", "out"]).await;
+    let stderr = text(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("never-writes"), "{stderr}");
+    assert!(stderr.contains("symbolic link"), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "no report for a suite that never ran"
+    );
+    assert!(
+        llm.requests().await.is_empty(),
+        "the first task must not have been run either"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_that_refuses_every_request_exits_1_with_the_report() {
+    let llm = MockLlmServer::start(vec![Response::status(
+        "HTTP/1.1 401 Unauthorized",
+        r#"{"error":{"message":"invalid api key"}}"#,
+    )])
+    .await;
+    let root = layout();
+    std::fs::write(root.path().join("suite.json"), ONE_TASK).unwrap();
+
+    let output = eval(root.path(), &llm, &["suite.json", "--out", "out"]).await;
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a run that could not reach the model is not a task failure\n--- stderr\n{stderr}"
+    );
+    let report: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("the report is still printed ({error}):\n{stdout}"));
+    let run = &report["tasks"][0]["runs"][0];
+    assert_eq!(run["finish_reason"], "error", "{run}");
+    assert!(run["error"].as_str().is_some(), "{run}");
+}
+
+#[tokio::test]
+async fn ctrl_c_stops_the_suite_with_a_partial_report_and_no_scratch_left() {
+    let model = RecordingServer::unresponsive().await;
+    let root = layout();
+    let base_url = format!("{}/v1", model.url());
+    let child = command(root.path(), &base_url, &["suite.json", "--out", "out"])
+        .spawn()
+        .expect("start the agent binary");
+
+    let deadline = Instant::now() + DEADLINE;
+    while model.received().is_empty() {
+        assert!(Instant::now() < deadline, "the model was never asked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid = child.id().expect("still running");
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("kill -INT {pid}"))
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill -INT {pid} failed");
+
+    let output = tokio::time::timeout(DEADLINE, child.wait_with_output())
+        .await
+        .unwrap_or_else(|_| panic!("eval was still running after {DEADLINE:?}"))
+        .expect("wait for the agent");
+    let stdout = text(&output.stdout);
+    let stderr = text(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(130), "--- stderr\n{stderr}");
+    let report: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("a partial report is printed ({error}):\n{stdout}"));
+    assert_eq!(report["interrupted"], true, "{report}");
+    assert_eq!(report["summary"]["attempts"], 1, "{report}");
+    let run = &report["tasks"][0]["runs"][0];
+    assert_eq!(run["finish_reason"], "interrupted", "{run}");
+    assert_eq!(run["passed"], false, "{run}");
+    assert_eq!(
+        report["tasks"][1]["runs"].as_array().map(Vec::len),
+        Some(0),
+        "the suite stops after the interrupted attempt: {report}"
+    );
+    assert_eq!(
+        std::fs::read_dir(root.path().join("tmp")).unwrap().count(),
+        0,
+        "the interrupted attempt's scratch workspace must be removed"
+    );
 }

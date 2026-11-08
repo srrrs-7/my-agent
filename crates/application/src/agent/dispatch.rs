@@ -200,8 +200,11 @@ impl ToolDispatcher {
 
     async fn plan(&self, call: &ToolCall) -> Disposition {
         let Some(tool) = self.tools.get(&call.name) else {
-            return Disposition::Short(ToolResult::error(
+            // Nothing is known about a tool that does not exist, so it is
+            // shown as the kind that is never assumed harmless.
+            return Disposition::Short(self.failed(
                 call,
+                ToolSafety::Destructive,
                 format!(
                     "Unknown tool `{}`. Available tools: {}. Use one of these instead.",
                     call.name,
@@ -226,8 +229,9 @@ impl ToolDispatcher {
                 );
                 Disposition::Short(self.denied(call, reason, message))
             }
-            Err(error) => Disposition::Short(ToolResult::error(
+            Err(error) => Disposition::Short(self.failed(
                 call,
+                safety,
                 format!("Could not obtain approval for this call: {error}"),
             )),
         }
@@ -256,19 +260,7 @@ impl ToolDispatcher {
             // not match), and the model reads the tool's own error first,
             // just as it would had the call run.
             Err(error) => {
-                let message = error.to_string();
-                self.events.emit(AgentEvent::ToolCallStarted {
-                    call: call.clone(),
-                    safety,
-                });
-                self.events.emit(AgentEvent::ToolCallFinished {
-                    name: call.name.clone(),
-                    call_id: call.id.clone(),
-                    is_error: true,
-                    summary: message.clone(),
-                    duration: Duration::ZERO,
-                });
-                return Err(ToolResult::error(call, format!("{message} {UNCHECKED}")));
+                return Err(self.failed(call, safety, format!("{error} {UNCHECKED}")));
             }
         };
 
@@ -302,14 +294,35 @@ impl ToolDispatcher {
                 );
                 Err(self.denied(call, reason, message))
             }
-            Err(error) => Err(ToolResult::error(
+            Err(error) => Err(self.failed(
                 call,
+                safety,
                 format!(
                     "Not executed: this call changes dependency files ({files}), and approval \
                      for that could not be obtained: {error}. Nothing was written."
                 ),
             )),
         }
+    }
+
+    /// Answers a call that failed before it could run with `message`, and
+    /// narrates it as a call that started and failed - so the terminal shows
+    /// it like any other tool error, and an eval's counts include it. Without
+    /// the events, a model calling tools that do not exist would look to the
+    /// metrics like one that called none.
+    fn failed(&self, call: &ToolCall, safety: ToolSafety, message: String) -> ToolResult {
+        self.events.emit(AgentEvent::ToolCallStarted {
+            call: call.clone(),
+            safety,
+        });
+        self.events.emit(AgentEvent::ToolCallFinished {
+            name: call.name.clone(),
+            call_id: call.id.clone(),
+            is_error: true,
+            summary: message.clone(),
+            duration: Duration::ZERO,
+        });
+        ToolResult::error(call, message)
     }
 
     /// Records a denial for the human (an event carrying their `reason`) and

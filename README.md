@@ -254,7 +254,13 @@ agent eval evals/tasks.json --repeat 3 --out .agent/eval --keep > report.json
 |---|---|
 | `--repeat N` | 各タスクを N 回流す（既定 1）。実 LLM の結果はばらつくので、比べるなら 3 回以上を推奨 |
 | `--out DIR` | 会話ログの置き場所。`<DIR>/sessions/` に試行ごとに 1 ファイル（既定 `.agent/eval`） |
-| `--keep` | 試行ごとの作業ディレクトリを消さずに残し、レポートの `scratch_dir` に場所を書く |
+| `--keep` | 試行ごとの作業ディレクトリを消さずに残し、レポートの `scratch_dir` に場所を書く（準備に失敗した試行も含む） |
+| `--allow-mcp` | `AGENT_MCP_CONFIG` の MCP サーバを起動する（既定では起動しない） |
+| `--allow-web` | `AGENT_WEB_FETCH=true` のとき `web_fetch` を渡す（既定では渡さない） |
+
+> **信頼できないスイートを実行しないでください。** タスクファイルの `command` 検査は、書かれたコマンドを
+> そのまま実行します（サンドボックス内ですが、任意のコマンド実行と同じです）。他人のタスクファイルは
+> 中身を読んでから流してください。
 
 グローバルな `--model` / `--max-iterations` / `--system-prompt-file` / `--append-system-prompt` も効きます。
 
@@ -302,33 +308,49 @@ agent eval evals/tasks.json --repeat 3 --out .agent/eval --keep > report.json
   フィクスチャ内のシンボリックリンクは拒否します（複製先から外を指せてしまうため）
 - 承認は `auto`（使い捨てのコピーなので）。ただし依存ファイルの変更は従来どおり別に問われ、
   答える人がいないため拒否されます（`AGENT_ALLOW_DEPENDENCY_CHANGES=true` で通す）。Webhook 通知は送りません
+- 「使い捨てのコピーしか触らない」はファイル系ツールにしか成り立たないため、外部に作用するツールは
+  明示しない限り渡しません。MCP サーバは `--allow-mcp`、`web_fetch` は `--allow-web` を付けたときだけです
+  （`run_command` は従来どおり、サンドボックス必須で渡します）
+- 試行の準備（フィクスチャの複製、エージェントの組み立て、検査用サンドボックスの起動）に失敗した場合は、
+  その試行を `finish_reason: "error"` として記録し、残りの試行を続けます。フィクスチャ内の
+  シンボリックリンクや特殊ファイルは、全タスク分を**最初の LLM 呼び出しより前に**検査します
 - `command` 検査は `run_command` と同じサンドボックスで、試行ごとの一時ディレクトリをルートに実行します
   （`cargo test` はモデルが書いた `build.rs` を実行するため）。`AGENT_SHELL_SANDBOX=none` でも検査は
   封じ込めを要求し、得られない環境（macOS のホストなど）では**最初の LLM 呼び出しより前に**失敗します
 - `AGENT_SHELL=true` でも、`AGENT_SHELL_SANDBOX=none` のときは eval では `run_command` をモデルに渡しません
 
-stdout はレポートの JSON だけです。進捗（`[1/4] write-hello #1 PASS ...`）と失敗した検査の理由は stderr に出ます。
+stdout はレポートの JSON だけです。進捗（`[1/4] write-hello #1 PASS ...`）と失敗した検査の理由は stderr に出ます
+（端末を操作する制御文字は `?` に置き換えます）。検査の出力をレポートに入れる前に、既知の秘密の値は
+`[REDACTED]` に置き換えます（§5「秘密の値の伏せ字」と同じ対象）。
+
+**Ctrl-C** は `agent run` と同じです。1 回目で実行中の試行を中断し（その試行は `finish_reason: "interrupted"`、
+不合格、検査は実行しません）、それまでの試行のレポートを `"interrupted": true` 付きで出力して 130 で終了します。
+2 回目は試行の終了を待たずに放棄します。どちらでも作業ディレクトリは片付けます（`--keep` を除く）。
 
 **終了コード**
 
 | コード | 意味 |
 |---|---|
 | `0` | 全タスクの全試行が合格 |
-| `1` | 実行できなかった（タスクファイル不正、フィクスチャがない、設定不正、検査用サンドボックスが得られない） |
-| `3` | 実行はできたが、合格しなかった試行がある |
+| `1` | 実行できなかった。スイート全体（タスクファイル不正、フィクスチャがない・リンクを含む、設定不正、検査用サンドボックスが得られない — この場合レポートは出ません）、または一部の試行（プロバイダの障害、試行の準備失敗 — レポートは出ます） |
+| `3` | 全試行を実行でき、合格しなかった試行がある（成功率を比べてよいのはこの場合と `0` だけ） |
+| `130` | Ctrl-C で中断した（それまでの試行のレポートは出ます） |
 
 **レポートの形**（`schema` はフィールドの意味が変わったときに上がります。追加では上がりません）
 
 ```jsonc
 {
   "schema": 1,
+  "interrupted": false,                   // Ctrl-C で途中までのレポートなら true
   "fingerprint": {
     "agent_version": "0.1.0",
     "provider": "default", "model": "claude-sonnet-5",
     "tools": ["edit_file", "glob", "..."],
     "run_command_sandbox": null,          // run_command を渡したときの実際の封じ込め
     "check_sandbox": "landlock",          // command 検査の封じ込め（検査がなければ null）
-    "settings": { "max_iterations": 25, "max_history_bytes": 200000, "compact": true, "...": "..." },
+    "settings": { "max_iterations": 25, "max_history_bytes": 200000, "compact": true,
+                  "tool_timeout_secs": 60, "allow_mcp": false, "allow_web": false,
+                  "global_instructions_fnv1a": null, "...": "..." },
     "system_prompt_fnv1a": "9f3c2a7b0e1d4c55"
   },
   "summary": {
@@ -360,13 +382,15 @@ stdout はレポートの JSON だけです。進捗（`[1/4] write-hello #1 PAS
 ```
 
 - **合格**は「実行がエラーで終わらず、全検査が通った」こと。`finish_reason` が `max_iterations` でも、
-  検査が通っていれば合格です（仕事は済んでいるため）。プロバイダが壊れた試行は `finish_reason: "error"` と
-  `error` を持ち、不合格になります（残りのタスクは続行）
+  検査が通っていれば合格です（仕事は済んでいるため）。プロバイダが壊れた試行と準備に失敗した試行は
+  `finish_reason: "error"` と `error` を持ち、不合格になります（残りのタスクは続行、終了コードは 1）
 - `tokens` は圧縮の要約リクエストの分も含みます。`model_latency_ms` はループ本体のモデル応答待ちの合計、
   `wall_ms` は試行全体の経過時間です
 - `system_prompt_fnv1a` は、システムプロンプトを**固定の文脈**（ワークスペースのパス・日付・ディレクトリ概要を
   プレースホルダにしたもの）で描画した結果の FNV-1a です。テンプレート・`--system-prompt-file`・
-  `--append-system-prompt`・渡すツールが変わると変わり、日付やフィクスチャでは変わりません
+  `--append-system-prompt`・渡すツールが変わると変わり、日付やフィクスチャでは変わりません。
+  `AGENT_GLOBAL_INSTRUCTIONS` の中身はこの固定の文脈に入らないため、`settings.global_instructions_fnv1a`
+  に別に載せます（未設定なら `null`）
 
 **2 回分を比べる**には、まず `fingerprint` が意図した差分だけかを確かめ、次に `summary` を並べます。
 
@@ -623,7 +647,7 @@ jq -r 'select(.role=="tool") | .content[].content' .agent/sessions/*.jsonl
 - MCP サーバに渡す環境変数の値
 - 子プロセスから除去される名前（`*_API_KEY` / `*_TOKEN` / `*_SECRET` など。
   `run_command` の環境変数除去と同じ判定）の環境変数の値。`.env` は起動時に
-  プロセス環境へ読み込まれるため、そこに書かれた他の資格情報もここに含まれます
+  プロセス環境へ読み込まれるため（§8 の拒否対象を除く）、そこに書かれた他の資格情報もここに含まれます
 
 8 文字未満の値は、普通の文字列と衝突するため対象外です。
 最後の項目（名前から推測した値）はさらに条件を絞り、**12 文字以上で、かつ英小文字・英大文字・
@@ -952,7 +976,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 834 本、外部ネットワークもモデルも不要です。
+テストは 855 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -973,8 +997,28 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 （Ollama ならキーも不要）、`.env.example` にはこの 3 つしか載せていません。
 それ以外はすべて任意で、表の既定値で動きます。
 
-どの変数も `.env` に書いても、通常の環境変数として渡しても同じです（`.env` は compose 用の便宜です）。
 値が空の行（`AGENT_API_KEY=`）は未設定として扱います。
+
+### `.env` から設定できない変数
+
+`.env` はカレントディレクトリから親へたどって見つけたものを読み、実環境変数にないキーだけを補います。
+ただし**能力を広げる・封じ込めを緩める変数は `.env` からは設定できません**。見つけた場合は無視し、
+名前を 1 行の警告で stderr に出します。実環境変数（`export`、`docker compose` の `env_file` を含む）
+で渡したものは従来どおり効きます。
+
+| 変数 | 理由 |
+|---|---|
+| `AGENT_MCP_CONFIG`, `AGENT_MCP_SANDBOX` | 任意のプログラムを起動できる |
+| `AGENT_SHELL`, `AGENT_SHELL_SANDBOX`, `AGENT_SHELL_NETWORK_ALLOW`, `AGENT_SHELL_WRITABLE` | コマンド実行を有効にする・封じ込めを緩める |
+| `AGENT_APPROVAL`, `AGENT_ALLOW_DEPENDENCY_CHANGES` | 人間の承認を省く |
+| `AGENT_WEB_FETCH`, `AGENT_WEB_FETCH_ALLOW`, `AGENT_WEB_FETCH_ALLOW_PRIVATE`, `AGENT_NOTIFY_WEBHOOK_URL` | 外部へ送る経路を開く |
+| `AGENT_GLOBAL_INSTRUCTIONS`, `AGENT_SYSTEM_PROMPT_FILE`, `AGENT_APPEND_SYSTEM_PROMPT` | モデルへの指示を差し替える |
+| `AGENT_WORKSPACE` | ファイルツールの届く範囲を変える |
+| `PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_*`（3 種）, `BASH_ENV`, `ENV`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`（大文字小文字を問わない） | 起動する子プロセスと HTTPS 通信（API キーを含む）の行き先を変える |
+
+理由は、**リポジトリに同梱された `.env` による権限昇格を防ぐため**です。他人のリポジトリを clone して
+その中で `agent` を起動しただけで、そこに置かれた `.env` が MCP サーバを起動したり、承認を `auto` に
+したりできてはいけません。上の表にない変数（接続先・モデル・ループの設定など）は従来どおり `.env` に書けます。
 
 ### 接続先
 

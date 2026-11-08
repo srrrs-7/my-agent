@@ -9,7 +9,7 @@ use std::time::Duration;
 use agent_application::agent::{
     AgentDependencies, AgentLoop, AgentLoopConfig, DefaultPromptBuilder, Session,
 };
-use agent_application::eval::{Check, MetricsSink, verify};
+use agent_application::eval::{Check, MetricsSink, RunMetrics, verify};
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::file::{ReadFileTool, WriteFileTool};
 use agent_domain::error::{ApprovalError, CommandError, FsError, LlmError};
@@ -415,4 +415,58 @@ async fn a_real_run_leaves_its_tool_errors_and_denials_in_the_sink() {
         "reading a missing file is a tool error"
     );
     assert_eq!(metrics.denials, 1);
+}
+
+/// Fails every approval: the gate itself is broken, as a closed terminal
+/// would leave it.
+struct BrokenGate;
+
+#[async_trait]
+impl ApprovalGate for BrokenGate {
+    async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
+        Err(ApprovalError::Unavailable("the terminal went away".into()))
+    }
+}
+
+async fn metrics_of_one_call(approval: Arc<dyn ApprovalGate>, tool: &str) -> RunMetrics {
+    let files = MemoryFileSystem::with(&[]);
+    let root = Arc::new(WorkspaceRoot::new("/workspace").unwrap());
+    let tools = Arc::new(
+        ToolRegistry::new().with(Arc::new(ReadFileTool::new(files.clone(), root.clone()))),
+    );
+    let provider = Arc::new(Scripted(Mutex::new(vec![
+        tool_use("1", tool, json!({"path": "a.txt"})),
+        response(Message::assistant_text("done"), StopReason::EndTurn),
+    ])));
+    let sink = Arc::new(MetricsSink::new());
+    let agent = AgentLoop::new(
+        AgentDependencies {
+            llm: provider,
+            tools,
+            approval,
+            events: sink.clone(),
+            context: Arc::new(FakeContext),
+            prompt: Arc::new(DefaultPromptBuilder),
+            log: Arc::new(NullConversationLog),
+        },
+        AgentLoopConfig::default(),
+    );
+    let mut session = Session::new("eval-metrics");
+    agent.run(&mut session, "go").await.unwrap();
+    sink.snapshot()
+}
+
+#[tokio::test]
+async fn a_call_to_an_unknown_tool_counts_as_a_failed_tool_call() {
+    let metrics = metrics_of_one_call(Arc::new(DenyWrites), "no_such_tool").await;
+    assert_eq!(metrics.tool_calls, 1, "{metrics:?}");
+    assert_eq!(metrics.tool_errors, 1, "{metrics:?}");
+    assert_eq!(metrics.denials, 0, "nobody refused it: {metrics:?}");
+}
+
+#[tokio::test]
+async fn a_call_whose_approval_could_not_be_obtained_counts_as_a_failed_tool_call() {
+    let metrics = metrics_of_one_call(Arc::new(BrokenGate), "read_file").await;
+    assert_eq!(metrics.tool_calls, 1, "{metrics:?}");
+    assert_eq!(metrics.tool_errors, 1, "{metrics:?}");
 }

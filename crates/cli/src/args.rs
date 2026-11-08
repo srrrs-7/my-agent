@@ -85,7 +85,9 @@ pub enum Command {
     Doctor,
 
     /// Run a task suite against the configured model and print a JSON report
-    /// on stdout. Exits 0 when every task passed, 3 when some did not.
+    /// on stdout. Exits 0 when every task passed, 3 when every attempt ran
+    /// but some did not pass, 1 when some attempt could not run, 130 when
+    /// interrupted.
     Eval(EvalArgs),
 }
 
@@ -111,6 +113,17 @@ pub struct EvalArgs {
     /// report names where each one is.
     #[arg(long)]
     pub keep: bool,
+
+    /// Start the MCP servers AGENT_MCP_CONFIG lists. Off by default: every
+    /// call is approved in eval, and a server acts on whatever it is
+    /// connected to, not on the scratch copy.
+    #[arg(long)]
+    pub allow_mcp: bool,
+
+    /// Offer web_fetch when AGENT_WEB_FETCH enables it. Off by default: every
+    /// call is approved in eval, and a fetched URL is a message sent out.
+    #[arg(long)]
+    pub allow_web: bool,
 }
 
 /// Which conversation `agent chat` should start from.
@@ -241,7 +254,17 @@ mod tests {
                 assert_eq!(args.repeat, 3);
                 assert!(args.keep);
                 assert_eq!(args.out, PathBuf::from(".agent/eval"));
+                assert!(
+                    !args.allow_mcp && !args.allow_web,
+                    "tools that reach outside the scratch copy are opt-in"
+                );
             }
+            other => panic!("expected eval, got {other:?}"),
+        }
+        match Cli::parse_from(["agent", "eval", "suite.json", "--allow-mcp", "--allow-web"])
+            .resolve_command()
+        {
+            Command::Eval(args) => assert!(args.allow_mcp && args.allow_web),
             other => panic!("expected eval, got {other:?}"),
         }
         assert!(

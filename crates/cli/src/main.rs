@@ -12,7 +12,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use agent_cli::args::{Cli, Command};
-use agent_cli::{commands, composition};
+use agent_cli::{commands, composition, dotenv};
 
 /// How long exit waits for blocking work still running on the runtime.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -26,8 +26,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 // `ExitCode` normally - unlike `process::exit`, destructors and stdout
 // flushing run.
 fn main() -> ExitCode {
-    // `.env` is a convenience for local runs; real environment variables win.
-    let _ = dotenvy::dotenv();
+    // First, while the process has one thread - see `load_dotenv`.
+    load_dotenv();
 
     let cli = Cli::parse();
     // `-v` also shows which provider served each request and why - summaries
@@ -61,6 +61,29 @@ fn main() -> ExitCode {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `.env` is a convenience for local runs: it fills in what the real
+/// environment leaves unset, except the settings `agent_cli::dotenv` keeps
+/// for the real environment alone. A missing or malformed file is not an
+/// error - the entries before a malformed line still apply, as they always
+/// did.
+fn load_dotenv() {
+    let Ok(entries) = dotenvy::dotenv_iter() else {
+        return;
+    };
+    let entries = entries.map_while(Result::ok);
+    let applied = dotenv::apply(entries, |key| std::env::var_os(key).is_some());
+    for (key, value) in applied.set {
+        // SAFETY: called first thing in `main`, before the runtime or any
+        // other thread exists, so nothing can be reading the environment
+        // concurrently - the condition `set_var` requires. `dotenvy::dotenv`
+        // made the same call from the same place.
+        unsafe { std::env::set_var(key, value) };
+    }
+    if let Some(warning) = dotenv::warning(&applied.ignored) {
+        eprintln!("{warning}");
     }
 }
 

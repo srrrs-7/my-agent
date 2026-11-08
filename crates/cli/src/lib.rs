@@ -19,6 +19,7 @@ pub mod args;
 pub mod commands;
 pub mod composition;
 mod ctrl_c;
+pub mod dotenv;
 mod input;
 mod notify;
 mod render;
