@@ -169,7 +169,7 @@ impl Tool for DependencyWatchTool {
         match result {
             Ok(outcome) => Ok(ToolOutcome {
                 content: format!("{note}\n\n{}", outcome.content),
-                summary: outcome.summary,
+                ..outcome
             }),
             // The note has to reach the model whichever way the call ended,
             // and only `Execution` carries free text.

@@ -20,7 +20,7 @@ use serde::Deserialize;
 use tokio::io::AsyncReadExt as _;
 use tracing::warn;
 
-use super::{SCHEMA_VERSION, io_error, path_for};
+use super::{SCHEMA_VERSION, io_error, path_for, subagents_of};
 
 /// How much of the opening request a listing shows.
 const PREVIEW_BYTES: usize = 72;
@@ -171,7 +171,10 @@ impl FileSessionStore {
             }
 
             match tokio::fs::remove_file(&entry.path).await {
-                Ok(()) => removed.push(entry.id),
+                Ok(()) => {
+                    self.remove_subagents(&entry.id).await;
+                    removed.push(entry.id);
+                }
                 Err(error) => {
                     warn!(session = entry.id, %error, "cannot delete this session; leaving it")
                 }
@@ -179,6 +182,23 @@ impl FileSessionStore {
         }
 
         Ok(removed)
+    }
+
+    /// Deletes the records of the sub-agents `session_id` started, which
+    /// nothing lists and nothing else would ever remove. A failure is a
+    /// warning: the parent is gone either way, and what is left is only
+    /// disk space.
+    async fn remove_subagents(&self, session_id: &str) {
+        let directory = subagents_of(&self.directory, session_id);
+        match tokio::fs::remove_dir_all(&directory).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                session = session_id,
+                %error,
+                "cannot delete the sub-agent records of this session; leaving them"
+            ),
+        }
     }
 }
 
@@ -359,7 +379,10 @@ impl SessionStore for FileSessionStore {
     async fn delete(&self, session_id: &str) -> Result<(), FsError> {
         let path = path_for(&self.directory, session_id);
         match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.remove_subagents(session_id).await;
+                Ok(())
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(FsError::NotFound {
                 path: path.display().to_string(),
             }),
@@ -847,6 +870,69 @@ mod tests {
             store.delete("s1").await,
             Err(FsError::NotFound { .. })
         ));
+    }
+
+    // --- sub-agents ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_subagents_record_is_kept_but_never_listed_counted_or_taken_for_the_latest() {
+        let directory = tempfile::tempdir().unwrap();
+        seeded_sessions(directory.path(), &[("a", 30), ("b", 20)]).await;
+        // Written after both, so it would be the newest if it were counted.
+        seeded(
+            directory.path(),
+            "b.call_1",
+            vec![Message::user("find the parser")],
+        )
+        .await;
+        let store = FileSessionStore::new(directory.path());
+
+        assert_eq!(remaining(&store).await, vec!["b", "a"]);
+        assert_eq!(store.latest().await.unwrap().as_deref(), Some("b"));
+        let child = store.load("b.call_1").await.unwrap();
+        assert_eq!(child.messages()[0].text(), "find the parser");
+
+        let removed = store
+            .prune(
+                &RetentionPolicy {
+                    keep: Some(2),
+                    max_age: None,
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            removed.is_empty(),
+            "the sub-agent took a place: {removed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_takes_its_subagents_records_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        seeded_sessions(directory.path(), &[("old", 30), ("new", 5)]).await;
+        for id in ["old.c1", "old.c2", "new.c1"] {
+            seeded(directory.path(), id, vec![Message::user(id)]).await;
+        }
+        let store = FileSessionStore::new(directory.path());
+        let children = |parent: &str| directory.path().join("subagents").join(parent);
+
+        store
+            .prune(
+                &RetentionPolicy {
+                    keep: Some(1),
+                    max_age: None,
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(!children("old").exists(), "pruned without its sub-agents");
+        assert!(children("new").join("c1.jsonl").exists());
+
+        store.delete("new").await.unwrap();
+        assert!(!children("new").exists(), "deleted without its sub-agents");
     }
 
     #[tokio::test]

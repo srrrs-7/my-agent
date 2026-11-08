@@ -29,11 +29,19 @@
 //!   out is not run - unless its arguments are invalid, which `execute`
 //!   refuses before writing anything - and is reported as a failed call
 //!   carrying the tool's own error, not as a denial.
+//! * **A call runs inside its [`CallScope`].** A tool that has to know which
+//!   call it is running for - `spawn_agent` names its sub-agent's session
+//!   after it - reads it from there (see [`super::call_scope`]); the tool
+//!   port stays free of call ids.
+//! * **What a call spent is added up.** A tool that asked a model itself
+//!   reports the tokens in its outcome, and the batch's total goes back to
+//!   the loop with the results, to be counted in the session's usage.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_domain::error::ToolError;
+use agent_domain::model::llm::TokenUsage;
 use agent_domain::model::tool::{ToolCall, ToolDefinition, ToolResult, ToolSafety};
 use agent_domain::ports::approval::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest,
@@ -43,6 +51,7 @@ use agent_domain::ports::tool::Tool;
 use agent_domain::text;
 use futures::future::join_all;
 
+use super::call_scope::{self, CallScope};
 use super::interrupt::Interrupt;
 use crate::supply_chain;
 use crate::tools::registry::ToolRegistry;
@@ -89,6 +98,17 @@ pub struct DispatchConfig {
     pub parallel_read_only_tools: bool,
 }
 
+/// The results of one batch, and what running it cost in model tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dispatched {
+    /// One per call, in call order.
+    pub results: Vec<ToolResult>,
+    /// The tokens the calls themselves spent (a sub-agent's requests), on
+    /// top of whatever the loop's own request cost.
+    pub usage: TokenUsage,
+}
+
+#[derive(Clone)]
 pub struct ToolDispatcher {
     tools: Arc<ToolRegistry>,
     approval: Arc<dyn ApprovalGate>,
@@ -125,9 +145,41 @@ impl ToolDispatcher {
         self.tools.definitions()
     }
 
+    /// The same dispatcher, narrating to `events` instead.
+    pub(crate) fn with_events(&self, events: Arc<dyn EventSink>) -> Self {
+        Self {
+            events,
+            ..self.clone()
+        }
+    }
+
     /// Produces exactly one [`ToolResult`] per call, in call order - also when
     /// `interrupt` fires part-way through.
+    ///
+    /// Outside any session: a tool that needs to know its call (see
+    /// [`super::call_scope`]) refuses to run. The loop goes through
+    /// [`Self::dispatch_in`].
     pub async fn dispatch(&self, calls: &[ToolCall], interrupt: &Interrupt) -> Vec<ToolResult> {
+        self.run(None, calls, interrupt).await.results
+    }
+
+    /// [`Self::dispatch`] for the calls of the session `session_id`, each run
+    /// inside its [`CallScope`], with what they spent added up.
+    pub async fn dispatch_in(
+        &self,
+        session_id: &str,
+        calls: &[ToolCall],
+        interrupt: &Interrupt,
+    ) -> Dispatched {
+        self.run(Some(session_id), calls, interrupt).await
+    }
+
+    async fn run(
+        &self,
+        session_id: Option<&str>,
+        calls: &[ToolCall],
+        interrupt: &Interrupt,
+    ) -> Dispatched {
         // Phase 1 - resolve and authorise, sequentially: the approval gate may
         // be an interactive prompt, and two prompts at once are unreadable.
         // An interrupt during a prompt abandons it: no answer means no
@@ -143,6 +195,7 @@ impl ToolDispatcher {
 
         // Phase 2 - split by safety, then run.
         let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
+        let mut usage = TokenUsage::default();
         let mut concurrent = Vec::new();
         let mut sequential = Vec::new();
 
@@ -165,11 +218,13 @@ impl ToolDispatcher {
                 .map(|(index, tool, safety)| async move {
                     (
                         index,
-                        self.invoke(tool, &calls[index], safety, interrupt).await,
+                        self.invoke(tool, &calls[index], safety, session_id, interrupt)
+                            .await,
                     )
                 });
-            for (index, result) in join_all(running).await {
+            for (index, (result, spent)) in join_all(running).await {
                 results[index] = Some(result);
+                usage.accumulate(spent);
             }
         }
 
@@ -183,12 +238,17 @@ impl ToolDispatcher {
             {
                 None => ToolResult::error(call, NOT_STARTED),
                 Some(Err(refused)) => refused,
-                Some(Ok(())) => self.invoke(tool, call, safety, interrupt).await,
+                Some(Ok(())) => {
+                    let (result, spent) =
+                        self.invoke(tool, call, safety, session_id, interrupt).await;
+                    usage.accumulate(spent);
+                    result
+                }
             };
             results[index] = Some(result);
         }
 
-        results
+        let results = results
             .into_iter()
             .enumerate()
             .map(|(index, result)| {
@@ -198,7 +258,8 @@ impl ToolDispatcher {
                     ToolResult::error(&calls[index], "tool produced no result")
                 })
             })
-            .collect()
+            .collect();
+        Dispatched { results, usage }
     }
 
     async fn plan(&self, call: &ToolCall) -> Disposition {
@@ -341,31 +402,47 @@ impl ToolDispatcher {
         ToolResult::error(call, message)
     }
 
+    /// Runs one approved call, returning its result and the tokens it spent.
     async fn invoke(
         &self,
         tool: Arc<dyn Tool>,
         call: &ToolCall,
         safety: ToolSafety,
+        session_id: Option<&str>,
         interrupt: &Interrupt,
-    ) -> ToolResult {
+    ) -> (ToolResult, TokenUsage) {
         // Checked before announcing the call: one that never starts must not
         // show up on screen as started.
         if interrupt.is_fired() {
-            return ToolResult::error(call, NOT_STARTED);
+            return (ToolResult::error(call, NOT_STARTED), TokenUsage::default());
         }
         self.events.emit(AgentEvent::ToolCallStarted {
             call: call.clone(),
             safety,
         });
         let started = Instant::now();
-        let outcome = interrupt.guard(tool.execute(call.arguments.clone())).await;
+        let execution = tool.execute(call.arguments.clone());
+        let outcome = match session_id {
+            Some(session_id) => {
+                let scope = CallScope {
+                    session_id: session_id.to_string(),
+                    call_id: call.id.clone(),
+                };
+                interrupt.guard(call_scope::within(scope, execution)).await
+            }
+            None => interrupt.guard(execution).await,
+        };
         let duration = started.elapsed();
 
+        let mut spent = TokenUsage::default();
         let (result, summary) = match outcome {
             // Dropping the tool's future is what stops it; a running command
             // takes its process group down with it (see the command runner).
             None => (ToolResult::error(call, CUT_OFF), "interrupted".to_string()),
             Some(Ok(outcome)) => {
+                if let Some(usage) = outcome.usage {
+                    spent = usage;
+                }
                 let (content, truncated) =
                     text::truncate_owned(&outcome.content, self.config.max_tool_output_bytes);
                 let summary = outcome
@@ -394,7 +471,7 @@ impl ToolDispatcher {
             summary,
             duration,
         });
-        result
+        (result, spent)
     }
 }
 

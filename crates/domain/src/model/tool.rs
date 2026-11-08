@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::DomainError;
+use crate::model::llm::TokenUsage;
 use crate::model::workspace::WorkspacePath;
 
 /// A validated tool name.
@@ -181,6 +182,11 @@ pub struct ToolOutcome {
     pub content: String,
     /// Short single-line summary for the terminal UI.
     pub summary: Option<String>,
+    /// Model tokens the call itself spent, for a tool that asks a model on
+    /// its own (`spawn_agent`). The dispatcher adds it to the session's
+    /// usage, so a turn reports what it cost whoever spent it. `None` for
+    /// every tool that spends none.
+    pub usage: Option<TokenUsage>,
 }
 
 impl ToolOutcome {
@@ -188,11 +194,17 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             summary: None,
+            usage: None,
         }
     }
 
     pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
         self.summary = Some(summary.into());
+        self
+    }
+
+    pub fn with_usage(mut self, usage: TokenUsage) -> Self {
+        self.usage = Some(usage);
         self
     }
 }

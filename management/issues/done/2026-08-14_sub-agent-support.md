@@ -4,6 +4,8 @@ created: 2026-08-14
 urgency: low
 importance: high
 priority: P2
+started: 2026-11-08
+completed: 2026-11-08
 scope: [domain, application, cli, docs]
 ---
 
@@ -38,15 +40,15 @@ scope: [domain, application, cli, docs]
 
 ## 達成条件
 
-- [ ] モデルが `spawn_agent`（名称は要検討）で子ループを起動し、子の最終回答のみを
+- [x] モデルが `spawn_agent`（名称は要検討）で子ループを起動し、子の最終回答のみを
       `tool_result` で受け取れる
-- [ ] 子の履歴・ツール出力が親の履歴に混入しない（親の消費は要約分のみ）ことをテストで固定
-- [ ] 深さ上限・子の反復上限が効き、子の暴走が親の予算とは独立に止まる
-- [ ] 子のツール呼び出しが承認ゲートを通る（`read-only` ポリシーで子の書き込みにも確認が入る）
-- [ ] 子の失敗（反復切れ・プロバイダ障害）は `is_error` 付き `tool_result` として親に返り、
+- [x] 子の履歴・ツール出力が親の履歴に混入しない（親の消費は要約分のみ）ことをテストで固定
+- [x] 深さ上限・子の反復上限が効き、子の暴走が親の予算とは独立に止まる
+- [x] 子のツール呼び出しが承認ゲートを通る（`read-only` ポリシーで子の書き込みにも確認が入る）
+- [x] 子の失敗（反復切れ・プロバイダ障害）は `is_error` 付き `tool_result` として親に返り、
       親のループは継続する
-- [ ] `domain-specialist-agent` に設計（循環の解き方）を確認してから実装する
-- [ ] `make check` が緑
+- [x] `domain-specialist-agent` に設計（循環の解き方）を確認してから実装する
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -65,3 +67,14 @@ scope: [domain, application, cli, docs]
 - 関連（2026-11-08 追記）:
   - `todo/2026-11-08_todo-plan-tool.md` — 子エージェントの計画を親にどう見せるか
   - `todo/2026-11-08_interrupt-turn-with-ctrl-c.md` — 子ループも中断できる必要がある
+- 実装メモ（2026-11-08、`management/docs/design/parity-features.md` §9 に従って実装）:
+  - 深さは設定ではなく構造で 1 段（子のレジストリに `spawn_agent` がない）。`AGENT_MAX_SUBAGENT_DEPTH` は作らなかった。
+    子の反復上限は `AGENT_SUBAGENT_MAX_ITERATIONS`（既定 15）
+  - v1 の子は読み取り専用なので「子の書き込みに確認が入る」は「子は書き込みツールを持たず、
+    読み取りも親と同じゲート（プランモード・フック・ルール・CLI）を通る」で満たした
+  - call_id は `agent/call_scope.rs`（ディスパッチャが呼び出しごとに設定する task-local 相当）で渡す。
+    子のセッションは `"{親}.{call_id}"`、記録は `sessions/subagents/<親>/<call>.jsonl`
+  - 既知の制約: 失敗した子（反復切れ・プロバイダ障害）が使ったトークンは親の使用量に入らない
+    （`ToolError` に使用量を載せる経路がない）
+
+- 2026-11-08 完了（v1 = 読み取り専用の子、設計は management/docs/design/parity-features.md §9、domain-specialist 確認済み）。既知の制約: 失敗した子（反復切れ等）の使用トークンは親の usage に入らない（ToolError に usage を載せる経路がない）

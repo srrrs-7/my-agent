@@ -35,7 +35,7 @@ use agent_domain::model::llm::{
     ChatRequest, ChatResponse, ModelId, RequestMetadata, StopReason, TaskKind, TokenUsage,
 };
 use agent_domain::model::message::Message;
-use agent_domain::model::tool::{ToolCall, ToolDefinition};
+use agent_domain::model::tool::{ToolCall, ToolCallId, ToolDefinition};
 use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::context::ContextProvider;
 use agent_domain::ports::conversation_log::ConversationLog;
@@ -176,6 +176,34 @@ impl AgentLoop {
         self
     }
 
+    /// This loop, narrating to `events` instead - every event it emits,
+    /// its dispatcher's and its compactions' included. Everything else is
+    /// shared, not copied.
+    fn with_events(&self, events: Arc<dyn EventSink>) -> Self {
+        Self {
+            llm: self.llm.clone(),
+            dispatcher: self.dispatcher.with_events(events.clone()),
+            compactor: self.compactor.clone(),
+            events,
+            context: self.context.clone(),
+            prompt: self.prompt.clone(),
+            log: self.log.clone(),
+            checkpoints: self.checkpoints.clone(),
+            config: self.config.clone(),
+        }
+    }
+
+    /// This loop as the sub-agent started by the call `parent_call_id`: each
+    /// of its events reaches this loop's sink wrapped in
+    /// [`AgentEvent::Nested`], so whoever reads them can tell the child's
+    /// work - and above all its answer - from the parent's.
+    pub(crate) fn nested_under(&self, parent_call_id: ToolCallId) -> Self {
+        self.with_events(Arc::new(NestedSink {
+            parent: self.events.clone(),
+            parent_call_id,
+        }))
+    }
+
     /// Takes back the files the newest turn that wrote any changed, leaving
     /// the conversation as it is; the model is told on its next turn.
     pub async fn undo(&self, session: &mut Session) -> Result<RestoreReport, CheckpointError> {
@@ -295,8 +323,16 @@ impl AgentLoop {
             // Answers every call even when interrupted, so the results are
             // pushed and recorded before the interrupt is acted on - never
             // instead of it.
-            let results = self.dispatcher.dispatch(&calls, interrupt).await;
-            session.conversation.push(Message::tool_results(results));
+            let dispatched = self
+                .dispatcher
+                .dispatch_in(&session.id, &calls, interrupt)
+                .await;
+            // What a sub-agent spent is this turn's cost too. Not in
+            // `last_usage`: that one measures this context, not the child's.
+            session.usage.accumulate(dispatched.usage);
+            session
+                .conversation
+                .push(Message::tool_results(dispatched.results));
             self.record(session, 1).await;
             // The call and its result, read now: by the next shortening the
             // call that wrote the plan may already be gone.
@@ -625,6 +661,22 @@ impl AgentLoop {
             usage: session.usage,
             reason,
         }
+    }
+}
+
+/// Hands a sub-agent's events to its parent's sink, each marked with the call
+/// that started it.
+struct NestedSink {
+    parent: Arc<dyn EventSink>,
+    parent_call_id: ToolCallId,
+}
+
+impl EventSink for NestedSink {
+    fn emit(&self, event: AgentEvent) {
+        self.parent.emit(AgentEvent::Nested {
+            parent_call_id: self.parent_call_id.clone(),
+            event: Box::new(event),
+        });
     }
 }
 

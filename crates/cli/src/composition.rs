@@ -10,11 +10,12 @@ use std::sync::Arc;
 
 use agent_application::agent::{
     AgentDependencies, AgentLoop, AgentLoopConfig, AppendingPromptBuilder, DefaultPromptBuilder,
-    FixedPromptBuilder,
+    FixedPromptBuilder, SubagentPromptBuilder,
 };
 use agent_application::approval::{PlanMode, PlanModeGate, RuleGate};
 use agent_application::checkpoint::{CheckpointJournal, CheckpointingTool};
 use agent_application::tools::ToolRegistry;
+use agent_application::tools::agent::{SPAWN_AGENT, SpawnAgentTool, SubagentLimits};
 use agent_application::tools::exec::{
     KillCommandTool, ReadOutputTool, RunCommandTool, StartCommandTool,
 };
@@ -42,8 +43,8 @@ use agent_domain::ports::session_store::SessionStore;
 use agent_domain::ports::tool::Tool;
 use agent_domain::ports::tool_server::ToolServer;
 use agent_infrastructure::config::{
-    ApprovalPolicy, NotifySettings, PromptSettings, Settings, ShellSettings, SystemEnv,
-    load_permissions,
+    ApprovalPolicy, NotifySettings, PromptSettings, Settings, ShellSettings, SubagentSettings,
+    SystemEnv, load_permissions,
 };
 use agent_infrastructure::exec::background::BackgroundSupervisor;
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
@@ -351,7 +352,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     // they record and compare; outside the timeout, which bounds the tool
     // and not the hooks, each of which has its own.
     let tools = match &hooks {
-        Some(hooks) => observe_tools(tools, hooks)?,
+        Some(hooks) => observe_tools(tools, hooks, settings.subagents.enabled)?,
         None => tools,
     };
     // After every tool is registered, so no command or server tool is
@@ -362,15 +363,16 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     let tools = watch_destructive(tools, &workspace, &events);
     // Last, so that a tool registered above can never be missed - and so the
     // dependency note is redacted like the rest of the output.
-    let tools = Arc::new(redact_all(tools, &redactor));
+    let tools = redact_all(tools, &redactor);
 
     // After the last decorator, so a rule previews a write through exactly
-    // the tools the dispatcher runs.
+    // the tools the dispatcher runs. Before `spawn_agent`, which needs this
+    // gate for its sub-agent and previews nothing.
     let plan_mode = PlanMode::new();
     let approval = approval_stack(
         asks,
         permissions,
-        &tools,
+        &Arc::new(tools.clone()),
         &workspace,
         &plan_mode,
         hooks.as_ref(),
@@ -393,6 +395,52 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     let sessions: Arc<dyn SessionStore> = store;
 
     let prompt = build_prompt_builder(&settings.prompt)?;
+    let config = AgentLoopConfig {
+        model,
+        params: GenerationParams {
+            temperature: settings.agent_loop.temperature,
+            max_tokens: settings.agent_loop.max_tokens,
+            top_p: None,
+            stop_sequences: Vec::new(),
+        },
+        max_iterations: settings.agent_loop.max_iterations,
+        max_tool_output_bytes: settings.agent_loop.max_tool_output_bytes,
+        max_history_bytes: settings.agent_loop.max_history_bytes,
+        keep_recent_messages: 6,
+        compact: settings.agent_loop.compact,
+        compact_keep_recent: settings.agent_loop.compact_keep_recent,
+        compact_keep_recent_bytes: settings.agent_loop.compact_keep_recent_bytes,
+        parallel_read_only_tools: settings.agent_loop.parallel_read_only_tools,
+        stream: settings.agent_loop.stream,
+    };
+
+    // Last of the tools, because it is built from the others: its sub-agent
+    // runs over the read-only ones as they stand now, decorators and all,
+    // with the same gate, sink and log as the loop below.
+    let tools = if settings.subagents.enabled {
+        let child = AgentLoop::new(
+            AgentDependencies {
+                llm: provider.clone(),
+                tools: Arc::new(tools.read_only()),
+                approval: approval.clone(),
+                events: events.clone(),
+                context: context.clone(),
+                prompt: Arc::new(SubagentPromptBuilder),
+                log: log.clone(),
+            },
+            subagent_config(&config, &settings.subagents),
+        );
+        tools.with(spawn_tool(
+            child,
+            &settings.subagents,
+            hooks.as_ref(),
+            &redactor,
+        ))
+    } else {
+        tools
+    };
+    let tools = Arc::new(tools);
+
     let agent = AgentLoop::new(
         AgentDependencies {
             llm: provider.clone(),
@@ -403,24 +451,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
             prompt,
             log,
         },
-        AgentLoopConfig {
-            model,
-            params: GenerationParams {
-                temperature: settings.agent_loop.temperature,
-                max_tokens: settings.agent_loop.max_tokens,
-                top_p: None,
-                stop_sequences: Vec::new(),
-            },
-            max_iterations: settings.agent_loop.max_iterations,
-            max_tool_output_bytes: settings.agent_loop.max_tool_output_bytes,
-            max_history_bytes: settings.agent_loop.max_history_bytes,
-            keep_recent_messages: 6,
-            compact: settings.agent_loop.compact,
-            compact_keep_recent: settings.agent_loop.compact_keep_recent,
-            compact_keep_recent_bytes: settings.agent_loop.compact_keep_recent_bytes,
-            parallel_read_only_tools: settings.agent_loop.parallel_read_only_tools,
-            stream: settings.agent_loop.stream,
-        },
+        config,
     )
     .with_checkpoints(checkpoints.clone());
 
@@ -443,6 +474,45 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         files,
         hooks,
     })
+}
+
+/// The sub-agent's loop configuration: the parent's, with its own bounds.
+///
+/// Not streamed: nobody watches a sub-agent's prose arrive - it is the
+/// call's result, read by the parent's model once it is whole - and a whole
+/// request is one the provider adapter can retry.
+fn subagent_config(parent: &AgentLoopConfig, subagents: &SubagentSettings) -> AgentLoopConfig {
+    AgentLoopConfig {
+        max_iterations: subagents.max_iterations,
+        max_history_bytes: subagents.max_history_bytes,
+        stream: false,
+        ..parent.clone()
+    }
+}
+
+/// `spawn_agent` over `child`, decorated as every other tool is that the
+/// decorators apply to: the post hooks that name it, and the redactor. Not
+/// the timeout - a sub-agent is bounded by its own iteration budget, and a
+/// cut at a fixed number of seconds would throw away a finished
+/// investigation - nor the checkpoint or the dependency watch, which are
+/// about tools that write.
+fn spawn_tool(
+    child: AgentLoop,
+    subagents: &SubagentSettings,
+    hooks: Option<&Arc<Hooks>>,
+    redactor: &Arc<Redactor>,
+) -> Arc<dyn Tool> {
+    let tool: Arc<dyn Tool> = Arc::new(SpawnAgentTool::new(
+        Arc::new(child),
+        SubagentLimits {
+            max_answer_bytes: subagents.max_answer_bytes,
+        },
+    ));
+    let tool = match hooks {
+        Some(hooks) => HookedTool::wrap(tool, hooks),
+        None => tool,
+    };
+    RedactingTool::wrap(tool, redactor.clone())
 }
 
 /// The approval gates, outermost first: plan mode refuses before anything
@@ -504,9 +574,14 @@ fn start_hooks(
 
 /// Every tool a post hook is about, wrapped so the hooks see its result -
 /// after refusing a `match` that names no registered tool, which would be a
-/// hook that never runs.
-fn observe_tools(tools: ToolRegistry, hooks: &Arc<Hooks>) -> Result<ToolRegistry> {
-    let unknown = hooks.config().unknown_tools(&tools.names());
+/// hook that never runs. `spawn_agent` counts as registered when
+/// `subagents` is on: it is added (and wrapped) last, see [`spawn_tool`].
+fn observe_tools(tools: ToolRegistry, hooks: &Arc<Hooks>, subagents: bool) -> Result<ToolRegistry> {
+    let mut offered = tools.names();
+    if subagents {
+        offered.push(SPAWN_AGENT.to_string());
+    }
+    let unknown = hooks.config().unknown_tools(&offered);
     anyhow::ensure!(
         unknown.is_empty(),
         "AGENT_HOOKS names tools that are not offered: {}. Fix the `match`, use `*` for every \

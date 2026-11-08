@@ -4,6 +4,14 @@
 //! conversation happens; [`store`] reads them back to resume a session or to
 //! list what is there.
 //!
+//! A sub-agent's record (its session id names a parent, see
+//! [`parent_session`]) goes one level down instead, to
+//! `subagents/<parent>/<call>.jsonl`. Kept, because it is what the parent's
+//! summary was made from; out of the top level, because it is not a session
+//! anybody resumes - so `sessions`, `--resume latest` and the retention
+//! count, which all read only the top level, never see it. It is removed
+//! with its parent.
+//!
 //! **One file, not two.** Resuming replays the log that was already being
 //! written rather than a separate snapshot of the history: two files that are
 //! meant to say the same thing eventually disagree - a crash between the two
@@ -17,6 +25,8 @@ pub use log::FileConversationLog;
 pub use store::{FileSessionStore, RetentionPolicy};
 
 use std::path::{Path, PathBuf};
+
+use agent_domain::ports::conversation_log::parent_session;
 
 /// Bumped when the shape of a line changes in a way a reader must notice.
 ///
@@ -33,8 +43,22 @@ const SCHEMA_VERSION: u32 = 2;
 /// Longest file stem a session id may turn into.
 const MAX_STEM_BYTES: usize = 128;
 
+/// Where the records of sub-agents go, under the session directory. Not a
+/// `.jsonl` file, so a listing of the top level passes over it.
+const SUBAGENTS: &str = "subagents";
+
 fn path_for(directory: &Path, session_id: &str) -> PathBuf {
-    directory.join(format!("{}.jsonl", file_stem(session_id)))
+    match parent_session(session_id) {
+        Some((parent, call)) => {
+            subagents_of(directory, parent).join(format!("{}.jsonl", file_stem(call)))
+        }
+        None => directory.join(format!("{}.jsonl", file_stem(session_id))),
+    }
+}
+
+/// The directory holding the records of the sub-agents `parent` started.
+fn subagents_of(directory: &Path, parent: &str) -> PathBuf {
+    directory.join(SUBAGENTS).join(file_stem(parent))
 }
 
 /// Turns a session id into a file name that cannot escape the directory.
@@ -89,6 +113,27 @@ mod tests {
         assert_eq!(file_stem("   "), "session");
         assert_eq!(file_stem(".."), "__");
         assert_eq!(file_stem("a/b"), "a_b");
+    }
+
+    #[test]
+    fn a_subagents_record_goes_under_its_parent_and_cannot_escape_either() {
+        let directory = Path::new("/sessions");
+        assert_eq!(
+            path_for(directory, "p-1.call_7"),
+            Path::new("/sessions/subagents/p-1/call_7.jsonl")
+        );
+        assert_eq!(
+            path_for(directory, "../up.../../and/out"),
+            Path::new("/sessions/___up_______and_out.jsonl"),
+            "an empty parent names no sub-agent, and the stem still cannot climb"
+        );
+        assert_eq!(
+            path_for(directory, "up/../.../../out"),
+            Path::new("/sessions/subagents/up_/_________out.jsonl")
+        );
+        assert_eq!(path_for(directory, "p-1"), Path::new("/sessions/p-1.jsonl"));
+        // Not a sub-agent's id: no parent to file it under.
+        assert_eq!(path_for(directory, ".."), Path::new("/sessions/__.jsonl"));
     }
 
     #[test]

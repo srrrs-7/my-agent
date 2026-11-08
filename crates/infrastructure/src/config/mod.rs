@@ -141,6 +141,39 @@ pub struct LoopSettings {
     pub max_tokens: Option<u32>,
 }
 
+/// `spawn_agent`: read-only sub-agents the model can hand an investigation
+/// to.
+///
+/// On by default: a sub-agent can do nothing the model could not already do
+/// with its own read-only tools, and every call it makes goes through the
+/// same approval gate. What it adds is cost - a sub-agent's requests are
+/// tokens too - so it has its own bounds rather than the parent's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSettings {
+    pub enabled: bool,
+    /// The sub-agent's own iteration budget, independent of the parent's.
+    pub max_iterations: u32,
+    /// The sub-agent's own history budget. Smaller than the parent's by
+    /// default: it starts empty and is meant to finish quickly.
+    pub max_history_bytes: usize,
+    /// Longest answer handed back to the parent.
+    pub max_answer_bytes: usize,
+}
+
+impl SubagentSettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        Ok(Self {
+            enabled: reader.parsed("AGENT_SUBAGENTS", true)?,
+            // At least one round trip, as for the parent's budget.
+            max_iterations: reader
+                .parsed("AGENT_SUBAGENT_MAX_ITERATIONS", 15u32)?
+                .max(1),
+            max_history_bytes: reader.parsed("AGENT_SUBAGENT_MAX_HISTORY_BYTES", 128 * 1024)?,
+            max_answer_bytes: reader.parsed("AGENT_SUBAGENT_MAX_ANSWER_BYTES", 8 * 1024)?,
+        })
+    }
+}
+
 /// Operator control over the system prompt.
 ///
 /// The file is read once at startup by the *operator's* process, not through
@@ -689,6 +722,7 @@ pub struct Settings {
     pub allow_dependency_changes: bool,
     pub llm: LlmSettings,
     pub agent_loop: LoopSettings,
+    pub subagents: SubagentSettings,
     pub session: SessionSettings,
     pub prompt: PromptSettings,
     pub web_fetch: WebFetchSettings,
@@ -728,6 +762,7 @@ impl Settings {
             allow_dependency_changes: reader.parsed("AGENT_ALLOW_DEPENDENCY_CHANGES", false)?,
             llm: LlmSettings::read(&reader)?,
             agent_loop: LoopSettings::read(&reader)?,
+            subagents: SubagentSettings::read(&reader)?,
             session: SessionSettings {
                 log: reader.parsed("AGENT_SESSION_LOG", true)?,
                 dir: reader
@@ -1179,6 +1214,41 @@ mod tests {
             "blank entries must be dropped rather than becoming an empty allowlist entry"
         );
         assert_eq!(settings.shell.extra_writable.len(), 2);
+    }
+
+    #[test]
+    fn subagents_are_on_with_their_own_bounds_unless_turned_off() {
+        let default = settings(&[("AGENT_MODEL", "m")]).unwrap().subagents;
+        assert_eq!(
+            default,
+            SubagentSettings {
+                enabled: true,
+                max_iterations: 15,
+                max_history_bytes: 128 * 1024,
+                max_answer_bytes: 8 * 1024,
+            }
+        );
+
+        let tuned = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SUBAGENTS", "false"),
+            ("AGENT_SUBAGENT_MAX_ITERATIONS", "0"),
+            ("AGENT_SUBAGENT_MAX_HISTORY_BYTES", "4096"),
+            ("AGENT_SUBAGENT_MAX_ANSWER_BYTES", "512"),
+        ])
+        .unwrap()
+        .subagents;
+        assert!(!tuned.enabled);
+        assert_eq!(
+            tuned.max_iterations, 1,
+            "a zero budget still allows one request"
+        );
+        assert_eq!(tuned.max_history_bytes, 4096);
+        assert_eq!(tuned.max_answer_bytes, 512);
+
+        let error = settings(&[("AGENT_MODEL", "m"), ("AGENT_SUBAGENTS", "maybe")])
+            .expect_err("an unreadable switch must abort startup");
+        assert!(error.to_string().contains("AGENT_SUBAGENTS"), "{error}");
     }
 
     #[test]

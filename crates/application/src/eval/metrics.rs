@@ -81,6 +81,11 @@ impl EventSink for MetricsSink {
             | AgentEvent::DependencyCheckIncomplete { .. }
             | AgentEvent::PlanUpdated { .. }
             | AgentEvent::RunFinished { .. } => {}
+            // The run's metrics are the parent loop's: its `spawn_agent` call
+            // is one tool call, and what the sub-agent spent is already in
+            // the run's usage. Counting the child's iterations or calls here
+            // would make a run that delegated look like one that looped.
+            AgentEvent::Nested { .. } => {}
         }
     }
 }

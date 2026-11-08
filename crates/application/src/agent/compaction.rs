@@ -204,6 +204,7 @@ pub enum ManualCompaction {
     Interrupted,
 }
 
+#[derive(Clone)]
 pub struct HistoryCompactor {
     llm: Arc<dyn LlmProvider>,
     config: CompactionConfig,

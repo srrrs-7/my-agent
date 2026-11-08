@@ -70,6 +70,15 @@ pub struct CliApprovalGate {
     /// Raced against the terminal for ordinary prompts. Never resolves when
     /// remote approval is off.
     remote: Arc<dyn RemoteApprover>,
+    /// Held while a question is on screen, so there is only ever one.
+    ///
+    /// The dispatcher asks one call at a time, but sub-agents started in
+    /// the same turn run side by side, each with its own dispatcher asking
+    /// this same gate. Two prompts at once would interleave on the terminal
+    /// and race for the next line typed - an answer meant for one call could
+    /// approve the other. Async, so a prompt waiting its turn does not block
+    /// the thread the other one is being answered on.
+    prompting: tokio::sync::Mutex<()>,
 }
 
 impl CliApprovalGate {
@@ -86,6 +95,7 @@ impl CliApprovalGate {
             notifications,
             read_line: Box::new(|question| Box::pin(async move { prompt_line(&question).await })),
             remote: Arc::new(NullRemoteApprover),
+            prompting: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -152,6 +162,12 @@ impl ApprovalGate for CliApprovalGate {
                     request.call.name
                 ),
             });
+        }
+
+        let _turn = self.prompting.lock().await;
+        // Answered "all" to the prompt this one was waiting behind.
+        if self.approve_all.load(Ordering::SeqCst) && !request.must_ask {
+            return Ok(ApprovalDecision::Approve);
         }
 
         let question = call_question(request);
@@ -228,6 +244,7 @@ impl ApprovalGate for CliApprovalGate {
             });
         }
 
+        let _turn = self.prompting.lock().await;
         let question = dependency_question(request);
         let terminal = (self.read_line)(question);
 
@@ -648,6 +665,40 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 1, "asked more than once");
         let sent = notifier.sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "paged without a prompt: {sent:?}");
+    }
+
+    /// Sub-agents started in one turn ask this gate side by side; their
+    /// prompts must still reach the terminal one at a time.
+    #[tokio::test]
+    async fn prompts_asked_at_the_same_time_are_shown_one_after_the_other() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let open = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let (counter, peak) = (open.clone(), most.clone());
+        let read_line: ReadLine = Box::new(move |_| {
+            let (counter, peak) = (counter.clone(), peak.clone());
+            Box::pin(async move {
+                let now = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Gives the other prompt every chance to open meanwhile.
+                tokio::task::yield_now().await;
+                counter.fetch_sub(1, Ordering::SeqCst);
+                Ok(Some("y".to_string()))
+            })
+        });
+        let (gate, notifications) = prompting(&notifier, read_line);
+
+        let request = secret_request();
+        let (first, second) = tokio::join!(gate.authorize(&request), gate.authorize(&request));
+        notifications.drain(DRAIN_TIMEOUT).await;
+
+        assert_eq!(first.unwrap(), ApprovalDecision::Approve);
+        assert_eq!(second.unwrap(), ApprovalDecision::Approve);
+        assert_eq!(
+            most.load(Ordering::SeqCst),
+            1,
+            "two prompts were on screen at once"
+        );
     }
 
     #[tokio::test]

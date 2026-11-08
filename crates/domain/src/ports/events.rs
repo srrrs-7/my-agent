@@ -107,6 +107,19 @@ pub enum AgentEvent {
         iterations: u32,
         usage: TokenUsage,
     },
+    /// Something a sub-agent did, started by the `spawn_agent` call
+    /// `parent_call_id` of this run.
+    ///
+    /// Wrapped rather than emitted as it is, because the child's events mean
+    /// something else to every reader: its answer is not this run's answer
+    /// (it reaches the model as the call's result, and must never reach
+    /// stdout), its iterations are not this run's, and its tool calls are not
+    /// calls this run's model made. A sink that does not care about
+    /// sub-agents ignores the variant and stays correct.
+    Nested {
+        parent_call_id: ToolCallId,
+        event: Box<AgentEvent>,
+    },
 }
 
 /// Implementations must be cheap and non-blocking: the loop calls this on its

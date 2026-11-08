@@ -186,6 +186,15 @@ pub enum EventDto<'a> {
         iterations: u32,
         usage: UsageDto,
     },
+    /// An event of the sub-agent that the `spawn_agent` call
+    /// `parent_call_id` started, in the same shape as the parent's own (minus
+    /// `v`, which the line already carries). Its `assistant_message` is the
+    /// sub-agent's answer to the parent, not the turn's answer: that is in
+    /// the result.
+    Nested {
+        parent_call_id: &'a str,
+        event: Box<EventDto<'a>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -305,6 +314,13 @@ impl<'a> From<&'a AgentEvent> for EventDto<'a> {
                 reason: reason.into(),
                 iterations: *iterations,
                 usage: usage.into(),
+            },
+            AgentEvent::Nested {
+                parent_call_id,
+                event,
+            } => Self::Nested {
+                parent_call_id: parent_call_id.as_str(),
+                event: Box::new(Self::from(event.as_ref())),
             },
         }
     }
@@ -501,6 +517,23 @@ mod tests {
                 json!({"v": 1, "type": "run_finished", "reason": "max_iterations",
                        "limit": 25, "iterations": 25, "usage": usage_json()}),
             ),
+            (
+                AgentEvent::Nested {
+                    parent_call_id: ToolCallId::new("spawn-1"),
+                    event: Box::new(AgentEvent::ToolCallStarted {
+                        call: ToolCall::new(
+                            ToolCallId::new("c9"),
+                            ToolName::new("glob").unwrap(),
+                            json!({"pattern": "*.rs"}),
+                        ),
+                        safety: ToolSafety::ReadOnly,
+                    }),
+                },
+                json!({"v": 1, "type": "nested", "parent_call_id": "spawn-1",
+                       "event": {"type": "tool_call_started", "call_id": "c9",
+                                 "name": "glob", "arguments": {"pattern": "*.rs"},
+                                 "safety": "read_only"}}),
+            ),
         ]
     }
 
@@ -522,10 +555,11 @@ mod tests {
             AgentEvent::DependencyCheckIncomplete { .. } => 11,
             AgentEvent::PlanUpdated { .. } => 12,
             AgentEvent::RunFinished { .. } => 13,
+            AgentEvent::Nested { .. } => 14,
         }
     }
 
-    const VARIANTS: usize = 14;
+    const VARIANTS: usize = 15;
 
     #[test]
     fn every_event_maps_to_its_documented_line() {

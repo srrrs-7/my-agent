@@ -10,6 +10,7 @@
 //! * [`FixedPromptBuilder`] - an operator-supplied prompt used verbatim.
 //! * [`AppendingPromptBuilder`] - a decorator adding operator instructions to
 //!   whatever the wrapped builder produced.
+//! * [`SubagentPromptBuilder`] - the short, fixed brief of a sub-agent.
 //!
 //! Replacing the prompt does not loosen the sandbox: path confinement is
 //! enforced by `WorkspaceRoot` / `LocalFileSystem`, never by prompt text.
@@ -95,6 +96,52 @@ impl PromptBuilder for AppendingPromptBuilder {
         prompt.push('\n');
         prompt.push_str(&self.extra);
         prompt.push('\n');
+        prompt
+    }
+}
+
+/// What a sub-agent (`spawn_agent`) is told: look, then report back.
+///
+/// Its own short brief rather than the parent's prompt. The parent's is
+/// written for someone talking to a user and changing the workspace; a
+/// sub-agent does neither - its only reader is the model that started it,
+/// and it can only read. Telling it the second up front saves the turns it
+/// would spend finding out, and telling it the first is what keeps its
+/// answer short enough to be worth the delegation. The workspace overview
+/// and project instructions are left out on purpose: the parent put what
+/// matters into the task, and a sub-agent pays for every byte of its
+/// prompt on every request it makes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubagentPromptBuilder;
+
+impl PromptBuilder for SubagentPromptBuilder {
+    fn build(&self, context: &ContextSnapshot, tools: &[ToolDefinition]) -> String {
+        let mut prompt = String::with_capacity(1024);
+        prompt.push_str(
+            "You are a sub-agent of `agent`, a command-line software engineering assistant. \
+             Another agent handed you the task in the next message. Investigate it in the \
+             workspace and reply with a summary of what you found.\n\
+             \n\
+             # Rules\n\
+             - You can only read. Nothing you do changes a file or runs a command; do not \
+             offer to, and do not ask for permission to.\n\
+             - Nobody can answer questions: decide for yourself, and say what you assumed.\n\
+             - Your final message is all the other agent will see. Make it a self-contained \
+             summary: the answer first, then the evidence (file paths, line numbers, short \
+             excerpts). Leave out what you looked at and found irrelevant.\n\
+             - Be brief. Your reply is read by an agent with a limited context budget.\n",
+        );
+        let _ = write!(
+            prompt,
+            "\n# Environment\n- Workspace root: {}\n- Today: {}\n",
+            context.workspace_root, context.today
+        );
+        if !tools.is_empty() {
+            prompt.push_str("- Tools: ");
+            let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+            prompt.push_str(&names.join(", "));
+            prompt.push('\n');
+        }
         prompt
     }
 }

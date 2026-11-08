@@ -297,6 +297,19 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         "max iterations".into(),
         settings.agent_loop.max_iterations.to_string(),
     );
+    description.insert(
+        "subagents".into(),
+        if settings.subagents.enabled {
+            format!(
+                "spawn_agent, read-only; {} iterations, {} history bytes, answers up to {} bytes",
+                settings.subagents.max_iterations,
+                settings.subagents.max_history_bytes,
+                settings.subagents.max_answer_bytes
+            )
+        } else {
+            "disabled".to_string()
+        },
+    );
     for provider in &settings.llm.providers {
         description.insert(
             format!("provider[{}]", provider.id),

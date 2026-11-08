@@ -151,12 +151,13 @@ fn sorted_names(app: &Application) -> Vec<String> {
     names
 }
 
-const DEFAULT_TOOLS: [&str; 7] = [
+const DEFAULT_TOOLS: [&str; 8] = [
     "edit_file",
     "glob",
     "list_directory",
     "read_file",
     "search_files",
+    "spawn_agent",
     "todo_write",
     "write_file",
 ];
@@ -164,7 +165,7 @@ const DEFAULT_TOOLS: [&str; 7] = [
 // --- which tools are offered ---------------------------------------------------
 
 #[tokio::test]
-async fn default_settings_offer_exactly_the_file_and_plan_tools() {
+async fn default_settings_offer_exactly_the_file_plan_and_subagent_tools() {
     let (app, _) = Setup::new().assemble().await.unwrap();
 
     assert_eq!(sorted_names(&app), DEFAULT_TOOLS);
@@ -815,4 +816,153 @@ async fn hooks_under_the_default_sandbox_either_confine_or_stop_startup() {
             assert!(message.contains("AGENT_HOOKS_SANDBOX"), "{message}");
         }
     }
+}
+
+// --- sub-agents -----------------------------------------------------------------
+
+#[tokio::test]
+async fn spawn_agent_is_not_offered_when_the_operator_turns_subagents_off() {
+    let (app, _) = Setup::new()
+        .with("AGENT_SUBAGENTS", "false")
+        .assemble()
+        .await
+        .unwrap();
+
+    let expected: Vec<&str> = DEFAULT_TOOLS
+        .into_iter()
+        .filter(|name| *name != "spawn_agent")
+        .collect();
+    assert_eq!(sorted_names(&app), expected);
+}
+
+const NOTES: &str = "launch codes: 0000";
+
+/// The parent delegates, the sub-agent reads `notes.txt` and answers with
+/// `child_answer`, and the parent answers the user.
+async fn delegating_model(child_answer: &str) -> MockLlmServer {
+    MockLlmServer::start(vec![
+        Response::tool_call(
+            "call_spawn",
+            "spawn_agent",
+            r#"{"task":"What is in notes.txt?"}"#,
+        ),
+        Response::tool_call("call_read", "read_file", r#"{"path":"notes.txt"}"#),
+        Response::assistant_text(child_answer),
+        Response::assistant_text("Done."),
+    ])
+    .await
+}
+
+fn tool_names(request: &Value) -> Vec<String> {
+    let mut names: Vec<String> = request["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Through every decorator `agent` stacks on a tool: the sub-agent is named
+/// after the call that started it - which only works if the call scope
+/// survives the wrapping - and leaves a record that is not a session.
+#[tokio::test]
+async fn a_sub_agent_runs_through_the_real_stack_and_keeps_its_own_record() {
+    let llm = delegating_model("It holds launch codes.").await;
+    let setup = Setup::new().model(&llm).write("notes.txt", NOTES);
+    let (app, _) = setup.assemble().await.unwrap();
+    let mut session = Session::new("composition-test");
+
+    let outcome = app
+        .agent
+        .run(&mut session, "What is in my notes?")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.final_text, "Done.");
+    // Two requests each: 100 + 150 in, 20 + 30 out.
+    assert_eq!(outcome.usage.input_tokens, 500, "{:?}", outcome.usage);
+    assert_eq!(outcome.usage.output_tokens, 100, "{:?}", outcome.usage);
+
+    let directory = app.settings.session_dir();
+    let parent = std::fs::read_to_string(directory.join("composition-test.jsonl")).unwrap();
+    let child = directory.join("subagents/composition-test/call_spawn.jsonl");
+    let child = std::fs::read_to_string(&child)
+        .unwrap_or_else(|_| panic!("no record at {child:?}: {:?}", files_under(&directory)));
+    assert!(child.contains(NOTES), "the sub-agent's record is whole");
+    assert!(
+        !parent.contains(NOTES),
+        "what the sub-agent read is in the parent's record"
+    );
+    assert!(parent.contains("It holds launch codes."));
+
+    let listed: Vec<String> = app
+        .sessions
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|summary| summary.id)
+        .collect();
+    assert_eq!(listed, ["composition-test"]);
+    assert_eq!(
+        app.sessions.latest().await.unwrap().as_deref(),
+        Some("composition-test")
+    );
+
+    let requests = llm.json_requests().await;
+    assert_eq!(
+        tool_names(&requests[1]),
+        [
+            "glob",
+            "list_directory",
+            "read_file",
+            "search_files",
+            "todo_write"
+        ],
+        "the sub-agent is offered the read-only tools, and no spawn_agent"
+    );
+}
+
+#[tokio::test]
+async fn a_sub_agents_calls_meet_the_operators_rules() {
+    let llm = delegating_model("I was not allowed to read it.").await;
+    let setup = Setup::new()
+        .model(&llm)
+        .write("notes.txt", NOTES)
+        .permissions(r#"{"rules": [{"tool": "read_file", "effect": "deny"}]}"#);
+    let (app, _) = setup.assemble().await.unwrap();
+    let mut session = Session::new("composition-test");
+
+    app.agent
+        .run(&mut session, "What is in my notes?")
+        .await
+        .unwrap();
+
+    let child = std::fs::read_to_string(
+        app.settings
+            .session_dir()
+            .join("subagents/composition-test/call_spawn.jsonl"),
+    )
+    .unwrap();
+    assert!(
+        child.contains("permission rule `deny read_file`"),
+        "the sub-agent's read was not refused by the rule: {child}"
+    );
+    assert!(!child.contains(NOTES));
+}
+
+#[tokio::test]
+async fn a_rule_and_a_hook_may_name_spawn_agent() {
+    let setup = Setup::new()
+        .permissions(r#"{"rules": [{"tool": "spawn_agent", "effect": "deny"}]}"#)
+        .hooks(json!({"post_tool_use": [{"match": "spawn_agent", "command": "true"}]}));
+    let (app, _) = setup.assemble().await.unwrap();
+
+    let reason = refusal(decide(&app, "spawn_agent", json!({"task": "look around"})).await);
+    assert!(
+        reason.contains("permission rule `deny spawn_agent`"),
+        "{reason}"
+    );
 }

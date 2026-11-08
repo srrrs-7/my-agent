@@ -257,8 +257,30 @@ impl TerminalRenderer {
                 iterations,
                 usage,
             } => return self.run_finished(reason, *iterations, usage),
+
+            AgentEvent::Nested { event, .. } => return self.nested_line(event),
         };
         Some(line)
+    }
+
+    /// What a sub-agent's `event` prints: its own line, indented under the
+    /// `spawn_agent` call that started it.
+    ///
+    /// Its answer never reaches stdout - it is the call's result, for the
+    /// model, and stdout is the user's answer. Its plan is not drawn, so the
+    /// checklist on screen stays the parent's. Its start and end are left to
+    /// the call's own lines: the `✓`/`✗` of `spawn_agent` already says how it
+    /// went, and the hints in a finished line (`--max-iterations`) are about
+    /// the parent.
+    fn nested_line(&self, event: &AgentEvent) -> Option<String> {
+        match event {
+            AgentEvent::AssistantDelta { .. }
+            | AgentEvent::AssistantMessage { .. }
+            | AgentEvent::PlanUpdated { .. }
+            | AgentEvent::RunStarted { .. }
+            | AgentEvent::RunFinished { .. } => None,
+            other => self.status_line(other).map(|line| indent(&line)),
+        }
     }
 
     fn run_finished(
@@ -295,6 +317,14 @@ impl TerminalRenderer {
         };
         Some(line)
     }
+}
+
+/// `line`, every line of it moved in under the call above it.
+fn indent(line: &str) -> String {
+    line.lines()
+        .map(|part| format!("  {part}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Files listed in a dependency warning before the rest are counted.
@@ -491,6 +521,54 @@ mod tests {
     }
 
     #[test]
+    fn a_subagents_tool_activity_is_indented_and_its_answer_is_never_shown() {
+        use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName, ToolSafety};
+
+        let renderer = TerminalRenderer::new(true, true);
+        let nested = |event| AgentEvent::Nested {
+            parent_call_id: ToolCallId::new("spawn-1"),
+            event: Box::new(event),
+        };
+        let call = ToolCall::new(
+            ToolCallId::new("k1"),
+            ToolName::new("read_file").unwrap(),
+            serde_json::json!({"path": "a.rs"}),
+        );
+
+        assert_eq!(
+            renderer
+                .status_line(&nested(AgentEvent::ToolCallStarted {
+                    call,
+                    safety: ToolSafety::ReadOnly,
+                }))
+                .as_deref(),
+            Some("  → read_file")
+        );
+        for quiet in [
+            AgentEvent::AssistantMessage {
+                text: "the child's answer".into(),
+            },
+            AgentEvent::RunFinished {
+                reason: FinishReason::MaxIterations { limit: 3 },
+                iterations: 3,
+                usage: TokenUsage::default(),
+            },
+        ] {
+            let label = format!("{quiet:?}");
+            assert_eq!(renderer.status_line(&nested(quiet)), None, "{label}");
+        }
+
+        // Empty, so nothing is printed if this regresses - the state says it.
+        renderer.emit(nested(AgentEvent::AssistantDelta {
+            text: String::new(),
+        }));
+        assert!(
+            !renderer.state.lock().unwrap().streaming,
+            "a sub-agent's prose went to stdout"
+        );
+    }
+
+    #[test]
     fn colour_is_suppressed_on_request() {
         let renderer = TerminalRenderer::new(false, true);
         assert_eq!(renderer.paint(RED, "x"), "x");
@@ -584,6 +662,13 @@ mod tests {
                 },
                 iterations: 1,
                 usage: TokenUsage::default(),
+            },
+            AgentEvent::Nested {
+                parent_call_id: ToolCallId::new(EVIL),
+                event: Box::new(AgentEvent::ToolCallDenied {
+                    name: name.clone(),
+                    reason: EVIL.into(),
+                }),
             },
         ];
 

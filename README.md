@@ -341,6 +341,7 @@ make run ARGS="sessions --delete <ID>"    # 記録を消す
 再開したセッションは**記録の全部**を読み込みます（送信直前に切り詰められた形ではなく）。
 予算を超えていれば最初のターンで通常どおり圧縮されるので、中断しなかった場合と同じ状態になります。
 `AGENT_SESSION_LOG=false` で走らせたセッションは記録がないので再開できません。
+サブエージェント（`spawn_agent`）の記録は一覧に出ず、再開の対象にもなりません（§4）。
 
 応答は既定でストリーミング表示されます（生成と同時に流れる）。`AGENT_STREAM=false` で
 従来の一括表示に戻せます。どちらでも stdout に出る内容は同一です。
@@ -415,6 +416,7 @@ make run ARGS="run --output-format json 'テストを直して'" | jq -r .final_
 | `dependency_check_incomplete` | `name`, `limit` |
 | `plan_updated` | `items`（`[{content, status: pending/in_progress/completed}]`、空なら計画の消去） |
 | `run_finished` | `reason`（と結果オブジェクトと同じ追加キー）, `iterations`, `usage` |
+| `nested` | `parent_call_id`（そのサブエージェントを起動した `spawn_agent` の `call_id`）, `event`（サブエージェントのイベント。上の表と同じ形で `v` なし）。中の `assistant_message` はサブエージェントの親への回答で、ターンの回答ではない |
 | `result` | 上の結果オブジェクト。必ず最後の 1 行 |
 
 ### ツール承認（human-in-the-loop）
@@ -707,6 +709,7 @@ jq -s '[.[0].tasks, .[1].tasks] | transpose | map({id: .[0].id, before: .[0].pas
 | `write_file` | mutating | 全文書き込み（親ディレクトリ自動作成） |
 | `edit_file` | mutating | 完全一致の部分置換。一致 0 件／複数件はエラー |
 | `todo_write` | read-only | 作業計画（手順と pending / in_progress / completed）を丸ごと書き換える。ワークスペースには触れない |
+| `spawn_agent` | read-only | 調査をサブエージェントに任せ、要約だけを受け取る。サブエージェントは読み取り専用（下記。`AGENT_SUBAGENTS=false` で無効化） |
 | `web_fetch` | network | URL の内容をテキスト取得（**既定で無効**。`AGENT_WEB_FETCH=true` で有効化） |
 | `web_search` | network | Brave Search API で検索し、タイトル・URL・抜粋を番号付きで返す（最大 10 件。**既定で無効**。`AGENT_WEB_SEARCH=true` と `AGENT_WEB_SEARCH_API_KEY` で有効化） |
 | `run_command` | destructive | シェルコマンドをサンドボックス内で実行（**既定で無効**。`AGENT_SHELL=true` で有効化） |
@@ -729,6 +732,28 @@ jq -s '[.[0].tasks, .[1].tasks] | transpose | map({id: .[0].id, before: .[0].pas
 そのため `chat --resume` では記録から計画が戻り、`/reset` で消えます。履歴が圧縮・刈り込みで
 短くなり計画が見えなくなったときだけ、未完了の計画を「エージェントのメモ」として履歴の末尾に
 1 回だけ追記します（システムプロンプトには入れないので、プロンプトキャッシュは崩れません）。
+
+`spawn_agent` は、多数のファイル読み・検索が要る調査を**サブエージェント**に任せるツールです。
+サブエージェントは空の会話から `task` だけを受け取り、自分の履歴の中で調べて、最終回答だけを
+ツール結果として親に返します。親の履歴が消費するのは要約の分だけで、調査中に読んだファイルの中身は
+親の履歴にも、親のモデルへのリクエストにも入りません。
+
+- **読み取り専用**: 渡すのは `read-only` に分類されたツールだけです（`read_file` / `search_files` /
+  `glob` / `list_directory` / `todo_write` など）。書き込み・コマンド・ネットワーク・`spawn_agent` 自身は
+  渡さないので、入れ子は構造上 1 段に限られます
+- **承認は親と同じゲートを通ります**: プランモード・フック・権限ルール・承認ポリシーは
+  サブエージェントの呼び出しにもそのまま効きます。同じターンに複数のサブエージェントが並列に動いても、
+  承認プロンプトは 1 つずつ出ます
+- **上限は親とは別**: 反復回数（`AGENT_SUBAGENT_MAX_ITERATIONS`）、履歴の予算
+  （`AGENT_SUBAGENT_MAX_HISTORY_BYTES`）、親に返す回答の長さ（`AGENT_SUBAGENT_MAX_ANSWER_BYTES`）。
+  システムプロンプトも親のものではなく、「調べて要約を返す。書き込みはできない」という短い定型です
+- **失敗はツールの失敗です**: 反復切れ・プロバイダ障害は `is_error` の結果として親のモデルに返り、
+  親のターンは続きます。Ctrl-C は親のターンと一緒にサブエージェントも止めます
+- サブエージェントの使用トークンは親のターンの使用量に加算されます（正常に終わった場合。
+  失敗した場合の分は加算されません）。ツール活動は stderr に親の呼び出しの下へ字下げして表示し、
+  回答は stdout に出しません。`stream-json` では `"type":"nested"` の行で届きます
+- 会話はセッションログに**別の記録**として残ります（`.agent/sessions/subagents/<親のID>/<呼び出しID>.jsonl`）。
+  `agent sessions` の一覧・`--resume`・保持件数の対象には入らず、親の記録を消すと一緒に消えます
 
 `web_fetch` は**既定で無効**です。URL はモデルが組み立てる外向きのメッセージであり、
 クエリにワークスペースの内容を載せて送信できてしまうため、有効化は操作者の明示的な
@@ -1360,7 +1385,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 1162 本、外部ネットワークもモデルも不要です。
+テストは 1194 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -1505,6 +1530,10 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_HOOKS_SANDBOX` | `confined` | フックに必須とする封じ込め。`confined` \| `isolated` \| `none`（`AGENT_SHELL_SANDBOX` と同じ意味）。得られなければ起動失敗 |
 | `AGENT_PERMISSIONS` | —（ルールなし） | 権限ルールの JSON（**絶対パス**、ワークスペース外）。§3「権限ルール」参照。ワークスペース内・解釈できないルール・`run_command` の `allow` は起動失敗 |
 | `AGENT_PARALLEL_READ_TOOLS` | `true` | 読み取り系ツールの並列実行 |
+| `AGENT_SUBAGENTS` | `true` | `spawn_agent`（読み取り専用のサブエージェント）の有効化（§4 参照） |
+| `AGENT_SUBAGENT_MAX_ITERATIONS` | `15` | サブエージェント 1 回あたりのモデル往復上限（親の `AGENT_MAX_ITERATIONS` とは独立。`0` は `1` として扱う） |
+| `AGENT_SUBAGENT_MAX_HISTORY_BYTES` | `131072` | サブエージェントの履歴の予算 |
+| `AGENT_SUBAGENT_MAX_ANSWER_BYTES` | `8192` | サブエージェントが親に返す回答の上限。超えた分は切り詰めてその旨を書く |
 
 ### 通知（§3 参照）
 

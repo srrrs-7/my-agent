@@ -88,6 +88,7 @@ impl Tool for RedactingTool {
             Ok(outcome) => Ok(ToolOutcome {
                 content: self.scrub(outcome.content),
                 summary: outcome.summary.map(|summary| self.scrub(summary)),
+                usage: outcome.usage,
             }),
             Err(error) => Err(self.scrub_error(error)),
         }

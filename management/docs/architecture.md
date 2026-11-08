@@ -55,7 +55,7 @@
 | `FileSystem` | `LocalFileSystem` | サンドボックス化された I/O |
 | `FileSearcher` | `IgnoreAwareSearcher` | `.gitignore` 準拠の内容検索 |
 | `ContextProvider` | `WorkspaceContextProvider` | 環境情報とプロジェクト指示の収集 |
-| `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`, `AppendingPromptBuilder` | システムプロンプトの組み立て方針（既定・差し替え・追記） |
+| `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`, `AppendingPromptBuilder`, `SubagentPromptBuilder` | システムプロンプトの組み立て方針（既定・差し替え・追記・サブエージェントの定型。§3.6.3） |
 | `ApprovalGate` | `CliApprovalGate`, `PlanModeGate`・`RuleGate`（装飾、application）, `HookGate`（装飾、infrastructure） | human-in-the-loop。依存の変更は `authorize_dependency_change` で別に問う（§3.6.2）。積み順は外から `PlanModeGate(HookGate(RuleGate(CliApprovalGate)))`（`HookGate` は `AGENT_HOOKS` があるときだけ）で、装飾はどれも依存の問いを内側へそのまま渡す |
 | `WebFetcher` | `GuardedWebFetcher` | 外向き HTTP（SSRF ガード・許可リスト・サイズ上限） |
 | `CommandRunner` | `SandboxedCommandRunner` | 子プロセス実行（OS レベルの封じ込め・egress 許可リスト） |
@@ -266,8 +266,10 @@ pub struct RequestMetadata {
 2. **順序を保つ** — 並列実行したものも要求順に並べ直す
 3. **並列化するのは読み取り系だけ** — 同一ターンの 2 つの書き込みは同じファイルを触りうる
 
-ループ側は `dispatcher.dispatch(&calls, &interrupt).await` の 1 行になり、
-承認・並列化・出力切り詰めの詳細を知りません。
+ループ側は `dispatcher.dispatch_in(&session.id, &calls, &interrupt).await` の 1 行になり、
+承認・並列化・出力切り詰めの詳細を知りません。戻り値の `Dispatched` は結果と、
+呼び出し自身が使ったトークン（`ToolOutcome::usage`。今は `spawn_agent` だけ）の合計で、
+ループがセッションの使用量に積みます。
 
 ### 3.6.1 協調的中断（Ctrl-C）
 
@@ -317,6 +319,33 @@ stdin はランタイム外の専用スレッド + チャネルで読むので�
 
 不変条件（`invariants.md`）には入れていません。保証の強さが経路で違い（ファイルツールは事前、コマンドは事後）、
 「常に成り立つ契約」として書けないためです。
+
+### 3.6.3 サブエージェント（`spawn_agent`）
+
+調査を子のループに任せ、要約だけを親の履歴に入れるツールです（`application/src/tools/agent/`）。
+
+- **循環は構築順で解く。** ループ → レジストリ → ツール → ループの循環を、遅延注入ではなく順序で断ちます。
+  子用のレジストリ（親の装飾済みレジストリから `ToolRegistry::read_only` で読み取り系だけ、`spawn_agent` なし）
+  → 子の `AgentLoop` → `SpawnAgentTool(Arc<AgentLoop>)` → 親のレジストリに登録。子は `spawn_agent` を持たないので
+  入れ子は**構造上 1 段**で、深さを数える設定はありません。application に tokio も `spawn` も入りません
+- **承認ゲートは親と同じインスタンス**（プランモード・フック・ルール・CLI）。そのため承認スタックは
+  `spawn_agent` より先に作られ、`RuleGate` は `spawn_agent` を `BUILT_IN` として名前だけ知っています
+  （`preview` は常に空なので、レジストリになくても判定は変わりません）。並列に走る子のプロンプトは
+  `CliApprovalGate` の async Mutex で 1 つずつにします
+- **どの呼び出しか**は `Tool::execute` に渡りません。ディスパッチャが各呼び出しを `CallScope`
+  （`agent/call_scope.rs`。セッション id と call id）の中で poll し、`spawn_agent` が `call_scope::current()` で読みます。
+  task-local と同じく poll のたびに設定して戻す std だけの仕組みで、同じ引数の呼び出しが 2 つあっても取り違えません
+  （フックが使う `(tool, arguments)` の台帳ではそれが保証できない）。スコープの外では `spawn_agent` は実行を拒否します
+- **子のセッション id は `"{親}.{call_id}"`**（domain の `subagent_session_id` / `parent_session`）。
+  記録は `sessions/subagents/<親>/<call>.jsonl` に書かれ、トップレベルしか読まない一覧・`latest`・保持件数からは外れ、
+  親の記録の削除と一緒に消えます
+- **イベントは `AgentEvent::Nested { parent_call_id, event }` で包む。** 子の回答は親のターンの回答ではない（stdout に
+  出してはいけない）ため、生のまま流すと全シンクに判別の負担がかかります。包んでおけば知らないシンクは無視するだけで
+  正しく、`TerminalRenderer` はツール系だけを字下げして描き、JSON では `"type":"nested"`、eval の計測は数えません
+- **中断は future の drop で伝わる。** 子は毎回 `Interrupt::new()` で動き、親のディスパッチャが呼び出しを放棄すると
+  子のループごと drop されます。子の履歴は捨てるので、§3.6.1 の「drop しない」理由（履歴を壊す）が当たりません
+- **子の失敗はツールの失敗。** 反復切れ・プロバイダ障害は `ToolError` として親のモデルに返り、親は続行します。
+  既知の制約: 失敗した子が使ったトークンは `ToolError` に載らないため親の使用量に入りません
 
 ### 3.7 設定を `EnvSource` 越しに読む
 
@@ -440,4 +469,4 @@ domain の値オブジェクト `Plan` が持ち、違反は直さず拒否し�
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 1162 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 1194 本）。

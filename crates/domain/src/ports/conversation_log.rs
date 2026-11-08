@@ -19,6 +19,37 @@ use async_trait::async_trait;
 
 use crate::error::FsError;
 use crate::model::message::Message;
+use crate::model::tool::ToolCallId;
+
+/// What joins a parent session's id to the call that started a sub-agent,
+/// in the sub-agent's own session id.
+///
+/// The one place the naming rule is written down, because two layers depend
+/// on it: the application names a sub-agent's session with
+/// [`subagent_session_id`], and a store tells a sub-agent's record from a
+/// session someone could resume with [`parent_session`]. A UUID - which is
+/// what a session the CLI starts is called - never contains one.
+pub const SUBAGENT_SEPARATOR: char = '.';
+
+/// The session id of the sub-agent that the call `call_id` of the session
+/// `parent` started: `"{parent}.{call_id}"`.
+///
+/// Derived rather than generated, so the record of a sub-agent can be found
+/// from the parent's record alone - the call that started it is in there -
+/// and this crate needs no source of randomness.
+pub fn subagent_session_id(parent: &str, call_id: &ToolCallId) -> String {
+    format!("{parent}{SUBAGENT_SEPARATOR}{call_id}")
+}
+
+/// `(parent, call id)` when `session_id` names a sub-agent's session, split
+/// at the first [`SUBAGENT_SEPARATOR`]. `None` for any other session -
+/// including an id that starts or ends with the separator, which no
+/// sub-agent is ever given.
+pub fn parent_session(session_id: &str) -> Option<(&str, &str)> {
+    session_id
+        .split_once(SUBAGENT_SEPARATOR)
+        .filter(|(parent, call)| !parent.is_empty() && !call.is_empty())
+}
 
 #[async_trait]
 pub trait ConversationLog: Send + Sync {
@@ -64,5 +95,30 @@ impl ConversationLog for NullConversationLog {
 
     async fn rewind(&self, _session_id: &str, _seq: u64) -> Result<(), FsError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_subagent_session_id_splits_back_into_its_parent_and_call() {
+        let id = subagent_session_id("0f3c-uuid", &ToolCallId::new("call_7"));
+        assert_eq!(id, "0f3c-uuid.call_7");
+        assert_eq!(parent_session(&id), Some(("0f3c-uuid", "call_7")));
+    }
+
+    #[test]
+    fn a_call_id_with_the_separator_in_it_still_names_the_right_parent() {
+        let id = subagent_session_id("parent", &ToolCallId::new("odd.id"));
+        assert_eq!(parent_session(&id), Some(("parent", "odd.id")));
+    }
+
+    #[test]
+    fn an_ordinary_session_has_no_parent() {
+        for id in ["0f3c-uuid", "", ".", "..", ".leading", "trailing."] {
+            assert_eq!(parent_session(id), None, "{id:?}");
+        }
     }
 }

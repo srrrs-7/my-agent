@@ -43,6 +43,24 @@ impl ToolRegistry {
         mapped
     }
 
+    /// The tools that only observe ([`ToolSafety::ReadOnly`]), as they are -
+    /// decorators and all. What a sub-agent is given: it shares the parent's
+    /// approval gate, but a gate can be told to approve everything, and a
+    /// tool that is not in the registry cannot be approved at all.
+    ///
+    /// [`ToolSafety::ReadOnly`]: agent_domain::model::tool::ToolSafety::ReadOnly
+    #[must_use]
+    pub fn read_only(&self) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter(|(_, tool)| tool.definition().safety.is_read_only())
+                .map(|(name, tool)| (name.clone(), tool.clone()))
+                .collect(),
+        }
+    }
+
     pub fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
     }
@@ -68,6 +86,7 @@ impl ToolRegistry {
 mod tests {
     use super::*;
     use crate::tools::plan::TodoWriteTool;
+    use agent_domain::model::tool::ToolSafety;
 
     #[test]
     fn map_hands_each_tool_its_definition_and_keeps_what_it_returns() {
@@ -91,5 +110,51 @@ mod tests {
             Arc::ptr_eq(&kept, &replacement),
             "the returned tool replaces it"
         );
+    }
+
+    #[test]
+    fn read_only_keeps_exactly_the_tools_that_only_observe() {
+        let registry = ToolRegistry::new()
+            .with(Arc::new(TodoWriteTool::new()))
+            .with(Arc::new(Labelled("writer", ToolSafety::Mutating)))
+            .with(Arc::new(Labelled("fetcher", ToolSafety::Network)))
+            .with(Arc::new(Labelled("shell", ToolSafety::Destructive)))
+            .with(Arc::new(Labelled("reader", ToolSafety::ReadOnly)));
+
+        let mut names = registry.read_only().names();
+        names.sort();
+        assert_eq!(names, ["reader", "todo_write"]);
+        assert_eq!(registry.len(), 5, "the original is left as it was");
+    }
+
+    /// A tool that is only a name and a safety class.
+    struct Labelled(&'static str, ToolSafety);
+
+    #[async_trait::async_trait]
+    impl Tool for Labelled {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: ToolName::new(self.0).unwrap(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+                safety: self.1,
+            }
+        }
+
+        async fn preview(
+            &self,
+            _arguments: &serde_json::Value,
+        ) -> Result<Vec<agent_domain::model::tool::PlannedWrite>, agent_domain::error::ToolError>
+        {
+            Ok(Vec::new())
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+        ) -> Result<agent_domain::model::tool::ToolOutcome, agent_domain::error::ToolError>
+        {
+            Ok(agent_domain::model::tool::ToolOutcome::new(""))
+        }
     }
 }

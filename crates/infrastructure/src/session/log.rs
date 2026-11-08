@@ -70,9 +70,12 @@ impl FileConversationLog {
     /// Appends `batch` - whole lines - to the record of `session_id`.
     async fn write_lines(&self, session_id: &str, batch: &str) -> Result<(), FsError> {
         let path = path_for(&self.directory, session_id);
-        tokio::fs::create_dir_all(&self.directory)
+        // The file's own directory: a sub-agent's record is a level or two
+        // below the session directory.
+        let parent = path.parent().unwrap_or(&self.directory);
+        tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|error| io_error(&self.directory, error))?;
+            .map_err(|error| io_error(parent, error))?;
 
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)

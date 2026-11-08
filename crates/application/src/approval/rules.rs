@@ -39,7 +39,17 @@ const PATH_TOOLS: [&str; 6] = [
 /// Built-in tools a rule may name although they are not enabled in this
 /// session: an operator's rules are written once for every session, and
 /// `web_fetch` or `run_command` is off in most of them.
-const BUILT_IN: [&str; 4] = ["todo_write", "web_fetch", "web_search", "run_command"];
+///
+/// `spawn_agent` is here for a second reason: it is never in the registry
+/// this gate is built with. The sub-agent it starts asks this same gate, so
+/// the gate exists before the tool does (see the composition root).
+const BUILT_IN: [&str; 5] = [
+    "todo_write",
+    "web_fetch",
+    "web_search",
+    "run_command",
+    crate::tools::agent::SPAWN_AGENT,
+];
 
 const RUN_COMMAND: &str = "run_command";
 
