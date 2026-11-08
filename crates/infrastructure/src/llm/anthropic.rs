@@ -70,7 +70,13 @@ use super::http;
 const API_VERSION: &str = "2023-06-01";
 /// `max_tokens` is required by the API, so a request without one still needs a
 /// number.
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+///
+/// Sized for agentic turns rather than chat replies: a single turn may write a
+/// whole file, and adaptive thinking spends its tokens out of this same limit,
+/// so a small cap cuts a turn off before it reaches the tool call. 16000 is
+/// the size Anthropic recommends for a non-streaming request; a streamed one
+/// could go higher, but the same default has to serve both.
+pub const DEFAULT_MAX_TOKENS: u32 = 16_000;
 
 /// How long a cached prompt prefix lives (`AGENT_PROMPT_CACHE`).
 ///
@@ -850,6 +856,44 @@ mod tests {
                 "temperature": 0.5
             }),
             "off sends no `thinking` field at all - never `disabled`"
+        );
+    }
+
+    #[test]
+    fn unset_sampling_sends_no_temperature_and_the_default_max_tokens() {
+        let request = ChatRequest::new(vec![Message::user("hi")]);
+        let body = body_with(&request, options(Thinking::Off, None));
+
+        assert_eq!(
+            body,
+            json!({
+                "model": "m",
+                "max_tokens": 16000,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+            }),
+            "current Claude models reject any `temperature` / `top_p`, so none is sent \
+             unless asked for; `max_tokens` is required, so a default is"
+        );
+    }
+
+    #[test]
+    fn an_explicit_temperature_and_max_tokens_are_sent_as_given() {
+        let mut request = ChatRequest::new(vec![Message::user("hi")]);
+        request.params.temperature = Some(0.25); // exact in f32
+        request.params.top_p = Some(0.5);
+        request.params.max_tokens = Some(64_000);
+        let body = body_with(&request, options(Thinking::Off, None));
+
+        assert_eq!(
+            body,
+            json!({
+                "model": "m",
+                "max_tokens": 64000,
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                "temperature": 0.25,
+                "top_p": 0.5
+            }),
+            "the operator asked explicitly, so the adapter does not second-guess the model"
         );
     }
 

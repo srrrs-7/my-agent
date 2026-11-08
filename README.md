@@ -690,7 +690,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 663 本、外部ネットワークもモデルも不要です。
+テストは 669 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -799,8 +799,8 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_APPEND_SYSTEM_PROMPT` | — | 既定プロンプトの**末尾に追記**（プロジェクト指示ファイルよりさらに後ろ）。差し替えと併用時は差し替えた文面に追記 |
 | `AGENT_GLOBAL_INSTRUCTIONS` | — | 操作者のグローバル指示ファイル（**絶対パス**。`~` は展開しない）。ワークスペースの指示ファイルより前に連結される（§4）。指定したのに読めなければ起動失敗。セッション開始時に 1 回読む |
 | `AGENT_STREAM` | `true` | 応答の逐次表示（SSE）。サーバが `stream` / `stream_options` を拒否する場合、一括表示に戻したい場合、リクエスト全体の再試行を有効にしたい場合は `false` |
-| `AGENT_MAX_TOKENS` | `4096` | 生成トークン上限 |
-| `AGENT_TEMPERATURE` | `0.2` | |
+| `AGENT_MAX_TOKENS` | —（Anthropic は `16000`、OpenAI 互換は送らない） | 生成トークン上限。指定すれば全プロバイダにそのまま送る（OpenAI 互換ではフィールド名が `AGENT_OPENAI_MAX_TOKENS_FIELD` / `AGENT_PROVIDER_<別名>_MAX_TOKENS_FIELD` に従う）。未設定時、Anthropic は必須項目なので `16000`（拡張思考の思考トークンもここから消費される）、OpenAI 互換サーバには**送らずサーバに任せる**（文脈長 4K の小さなローカルモデルに大きな上限を送って詰まらせないため） |
+| `AGENT_TEMPERATURE` | —（送らない） | サンプリング温度。未設定ならどのプロバイダにも送らない（履歴圧縮の要約リクエスト、`agent doctor` の疎通確認も同様）。**現行の Claude モデルは `temperature` を HTTP 400 で拒否する**（Opus 5.5 / Opus 5 / Sonnet 5 / 4.7・4.8 系は値に関係なく、Sonnet 5.5 / Haiku 5.5 は既定値以外を、API バージョン `2026-10-21` 以降は全モデルで）。指定すれば Anthropic にも送るが、`agent doctor` が警告を出す。`AGENT_THINKING=adaptive` のときは送らない |
 | `AGENT_REQUEST_TIMEOUT_SECS` | `180` | HTTP リクエストの上限時間 |
 | `AGENT_MAX_RETRIES` | `3` | 一時障害の再試行回数 |
 | `AGENT_PROMPT_CACHE` | `5m` | Anthropic のプロンプトキャッシュ。`5m` \| `1h` \| `off`。ツール定義＋システムプロンプトの末尾と会話の末尾（自動キャッシュ）に印を付け、毎ターン同じ前置きを全額で読み直させない。プロンプトの間に 5 分以上空くことが多いなら `1h`（書き込み単価は 2 倍）、`cache_control` を拒否するゲートウェイ経由なら `off`。OpenAI 互換サーバ側のキャッシュは自動なので影響しない。効果は `-v` と `/usage` の `cache: N read, M written` で確認できる |

@@ -53,8 +53,12 @@ use tracing::{debug, warn};
 
 /// Room for the summary itself. Large enough for the structure the prompt asks
 /// for, small enough that the result cannot itself dominate the budget it was
-/// meant to relieve.
-const SUMMARY_MAX_TOKENS: u32 = 2048;
+/// meant to relieve. The cap also has to cover thinking tokens when the
+/// provider runs adaptive thinking (`AGENT_THINKING=adaptive`), which count
+/// against `max_tokens`; at 2048 a summary could be cut off after the model
+/// had spent most of the budget reasoning. The summary's own length is held
+/// down by the prompt, not by this cap.
+const SUMMARY_MAX_TOKENS: u32 = 8192;
 
 /// Per-block cap for the most recent of the folded messages - with one
 /// exception, [`render_transcript`].
@@ -246,9 +250,10 @@ impl HistoryCompactor {
             .with_system(SUMMARY_INSTRUCTIONS)
             .with_model(self.config.model.clone())
             .with_params(GenerationParams {
-                // A record, not a composition: the same transcript should not
-                // summarise differently on a retry.
-                temperature: Some(0.0),
+                // Not sent, though a record would rather be deterministic:
+                // current Claude models reject any `temperature`, and this is
+                // the one request that must work on every backend.
+                temperature: None,
                 max_tokens: Some(SUMMARY_MAX_TOKENS),
                 top_p: None,
                 stop_sequences: Vec::new(),
@@ -568,7 +573,10 @@ mod tests {
             request.tools.is_empty(),
             "a summary request must not advertise tools"
         );
-        assert_eq!(request.params.temperature, Some(0.0));
+        assert_eq!(
+            request.params.temperature, None,
+            "no temperature unless the operator set one - Claude models reject it"
+        );
         assert_eq!(
             request.messages.len(),
             1,

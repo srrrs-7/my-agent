@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use agent_domain::error::LlmError;
-use agent_domain::model::llm::{ChatRequest, ModelId, ProviderId, StopReason};
+use agent_domain::model::llm::{ChatRequest, GenerationParams, ModelId, ProviderId, StopReason};
 use agent_domain::model::message::Message;
 use agent_domain::model::tool::{ToolDefinition, ToolName, ToolSafety};
 use agent_domain::ports::llm::LlmProvider;
@@ -110,6 +110,70 @@ async fn sends_a_well_formed_request_and_decodes_a_tool_call() {
         json!("path"),
         "the JSON schema must survive verbatim"
     );
+}
+
+const PLAIN_REPLY: &str = r#"{
+    "model": "qwen3:8b",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+}"#;
+
+/// Sends `hi` with `params` through `client` and returns the body that went out.
+async fn sent_body(
+    client: impl Fn(&str) -> OpenAiCompatibleProvider,
+    params: GenerationParams,
+) -> Value {
+    let server = MockLlmServer::start(vec![Response::ok(PLAIN_REPLY)]).await;
+    client(server.base_url())
+        .chat(ChatRequest::new(vec![Message::user("hi")]).with_params(params))
+        .await
+        .unwrap();
+    server.json_requests().await.remove(0)
+}
+
+#[tokio::test]
+async fn unset_sampling_and_limit_are_left_to_the_server() {
+    let sent = sent_body(provider, GenerationParams::default()).await;
+
+    assert_eq!(
+        sent,
+        json!({
+            "model": "qwen3:8b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        }),
+        "no `temperature`, `top_p` or `max_tokens`: a small local model's context \
+         can be smaller than any default worth picking here"
+    );
+}
+
+#[tokio::test]
+async fn explicit_sampling_and_limit_are_sent_under_the_configured_field_name() {
+    let params = GenerationParams {
+        temperature: Some(0.25), // exact in f32
+        max_tokens: Some(8192),
+        top_p: Some(0.5),
+        stop_sequences: Vec::new(),
+    };
+
+    let sent = sent_body(provider, params.clone()).await;
+    assert_eq!(sent["temperature"], json!(0.25));
+    assert_eq!(sent["top_p"], json!(0.5));
+    assert_eq!(sent["max_tokens"], json!(8192));
+
+    let renamed = |base_url: &str| {
+        OpenAiCompatibleProvider::new(
+            ProviderId::new("openai"),
+            base_url,
+            Some("test-key".to_string()),
+            ModelId::new("gpt-x"),
+            "max_completion_tokens",
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let sent = sent_body(renamed, params).await;
+    assert_eq!(sent["max_completion_tokens"], json!(8192));
+    assert!(sent.get("max_tokens").is_none(), "{sent}");
 }
 
 #[tokio::test]

@@ -80,7 +80,9 @@ fn print_sandbox(app: &Application) {
 fn probe() -> ChatRequest {
     ChatRequest::new(vec![Message::user("Reply with the single word: ok")]).with_params(
         GenerationParams {
-            temperature: Some(0.0),
+            // No temperature: current Claude models reject it, and a probe
+            // that fails for its own reasons proves nothing.
+            temperature: None,
             max_tokens: Some(16),
             top_p: None,
             stop_sequences: Vec::new(),

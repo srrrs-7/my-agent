@@ -589,8 +589,12 @@ impl LoopSettings {
             tool_timeout: Duration::from_secs(reader.parsed("AGENT_TOOL_TIMEOUT_SECS", 60)?),
             parallel_read_only_tools: reader.parsed("AGENT_PARALLEL_READ_TOOLS", true)?,
             stream: reader.parsed("AGENT_STREAM", true)?,
-            temperature: Some(reader.optional("AGENT_TEMPERATURE")?.unwrap_or(0.2)),
-            max_tokens: Some(reader.optional("AGENT_MAX_TOKENS")?.unwrap_or(4096)),
+            // Both opt-in. Current Claude models reject `temperature` outright,
+            // so a default would break every request; and a `max_tokens`
+            // default belongs to the adapter, because a size that suits the
+            // Anthropic API overflows a small local model's context.
+            temperature: reader.optional("AGENT_TEMPERATURE")?,
+            max_tokens: reader.optional("AGENT_MAX_TOKENS")?,
         })
     }
 }
@@ -745,6 +749,38 @@ fn names(providers: &[ProviderSettings]) -> String {
         .join(", ")
 }
 
+/// What each provider is sent for `temperature` and `max_tokens`.
+///
+/// Spelled out per wire protocol because "unset" means different things: the
+/// Anthropic API requires `max_tokens` and gets a default, an OpenAI-compatible
+/// server gets nothing and decides for itself.
+fn describe_generation(settings: &Settings) -> String {
+    let anthropic = settings
+        .llm
+        .providers
+        .iter()
+        .any(|provider| provider.kind == ProviderKind::Anthropic);
+    let temperature = match settings.agent_loop.temperature {
+        None => "temperature not sent".to_string(),
+        // Sent anyway: the operator asked, and a model that accepts it may
+        // be configured. The 400 that follows otherwise is a confusing first
+        // failure, hence saying so here.
+        Some(value) if anthropic => format!(
+            "temperature {value} (WARNING: current Claude models reject `temperature` \
+             with HTTP 400 - unset AGENT_TEMPERATURE if requests fail)"
+        ),
+        Some(value) => format!("temperature {value}"),
+    };
+    let max_tokens = match settings.agent_loop.max_tokens {
+        Some(limit) => format!("max_tokens {limit}"),
+        None => format!(
+            "max_tokens {} (anthropic) / server default (openai)",
+            crate::llm::anthropic::DEFAULT_MAX_TOKENS
+        ),
+    };
+    format!("{temperature}; {max_tokens}")
+}
+
 /// Renders the resolved configuration for `agent doctor`, with secrets masked.
 pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
     let mut description = BTreeMap::new();
@@ -868,6 +904,7 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
                 .map_or("not sent", |effort| effort.as_str())
         ),
     );
+    description.insert("generation".into(), describe_generation(settings));
     description.insert(
         "default provider".into(),
         settings.llm.default_provider.to_string(),
@@ -1192,6 +1229,7 @@ mod tests {
             ("AGENT_PARALLEL_READ_TOOLS", "false"),
             ("AGENT_STREAM", "false"),
             ("AGENT_TEMPERATURE", "0.9"),
+            ("AGENT_MAX_TOKENS", "32000"),
         ])
         .unwrap();
 
@@ -1200,6 +1238,52 @@ mod tests {
         assert!(!settings.agent_loop.parallel_read_only_tools);
         assert!(!settings.agent_loop.stream);
         assert_eq!(settings.agent_loop.temperature, Some(0.9));
+        assert_eq!(settings.agent_loop.max_tokens, Some(32000));
+    }
+
+    #[test]
+    fn temperature_and_max_tokens_are_unset_unless_configured() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+
+        assert_eq!(
+            settings.agent_loop.temperature, None,
+            "a default would be sent, and current Claude models reject it"
+        );
+        assert_eq!(
+            settings.agent_loop.max_tokens, None,
+            "the default belongs to each adapter, not to the configuration"
+        );
+        assert_eq!(
+            describe(&settings)["generation"],
+            "temperature not sent; max_tokens 16000 (anthropic) / server default (openai)"
+        );
+    }
+
+    #[test]
+    fn doctor_warns_when_a_temperature_will_reach_an_anthropic_provider() {
+        let anthropic = settings(&[
+            ("AGENT_PROVIDER", "anthropic"),
+            ("AGENT_API_KEY", "sk-ant-test"),
+            ("AGENT_MODEL", "claude-sonnet-5-5"),
+            ("AGENT_TEMPERATURE", "0.5"),
+        ])
+        .unwrap();
+        let rendered = &describe(&anthropic)["generation"];
+        assert!(
+            rendered.starts_with("temperature 0.5 (WARNING"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("AGENT_TEMPERATURE"), "{rendered}");
+
+        let local = settings(&[("AGENT_MODEL", "m"), ("AGENT_TEMPERATURE", "0.5")]).unwrap();
+        assert!(
+            !describe(&local)["generation"].contains("WARNING"),
+            "OpenAI-compatible servers accept a temperature"
+        );
+
+        let bad = settings(&[("AGENT_MODEL", "m"), ("AGENT_TEMPERATURE", "warm")])
+            .expect_err("an unparsable value must abort startup, not fall back");
+        assert!(bad.to_string().contains("AGENT_TEMPERATURE"), "{bad}");
     }
 
     #[test]

@@ -62,8 +62,10 @@ impl Default for AgentLoopConfig {
         Self {
             model: None,
             params: GenerationParams {
-                temperature: Some(0.2),
-                max_tokens: Some(4096),
+                // Unset means "not sent": each adapter, or the server behind
+                // it, picks its own default.
+                temperature: None,
+                max_tokens: None,
                 top_p: None,
                 stop_sequences: Vec::new(),
             },
