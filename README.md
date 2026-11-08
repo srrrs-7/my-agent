@@ -490,3 +490,4 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 ---
 
 今後の計画は [`management/issues/`](management/issues/) で管理しています。
+# OtaS
