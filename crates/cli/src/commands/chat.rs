@@ -6,11 +6,12 @@
 use std::process::ExitCode;
 
 use agent_application::agent::Session;
+use agent_domain::model::llm::ModelId;
 use anyhow::Result;
 
 use crate::args::Resume;
 use crate::commands::turn::run_turn;
-use crate::commands::{checkpoint, plan_mode, tools};
+use crate::commands::{checkpoint, context, plan_mode, tools};
 use crate::composition::Application;
 use crate::ctrl_c::{CtrlC, Sigint, TurnEnd};
 use crate::input::prompt_line;
@@ -22,6 +23,9 @@ const HELP: &str = "  /reset  start a new conversation\n  \
                       /usage  tokens used so far\n  \
                       /plan   the model's current work plan\n  \
                       /plan-mode on|off  let the model only read and plan, or act again\n  \
+                      /model [ref]  show the model, or switch (`alias/model` also picks the provider)\n  \
+                      /compact  fold older history into a summary now\n  \
+                      /context  what the next request carries, and the last request's usage\n  \
                       /undo   put back the files the last turn changed (the conversation stays)\n  \
                       /rewind [n]  take files and conversation back to before the last n turns\n  \
                       /tools  list the tools the model can call\n  \
@@ -36,6 +40,10 @@ enum Input {
     Undo,
     /// `/rewind [n]`, or why its argument was not understood.
     Rewind(Result<usize, String>),
+    /// `/model [ref]`, or why its argument was not understood.
+    Model(Result<Option<ModelId>, String>),
+    Compact,
+    Context,
     Prompt,
 }
 
@@ -92,8 +100,24 @@ async fn repl(app: &Application, resume: Resume) -> Result<ExitCode> {
                 checkpoint::rewind(app, &mut session, turns).await;
                 continue;
             }
-            Input::Rewind(Err(message)) => {
+            Input::Rewind(Err(message)) | Input::Model(Err(message)) => {
                 eprintln!("  {message}");
+                continue;
+            }
+            Input::Model(Ok(wanted)) => {
+                context::model(app, &mut session, wanted);
+                continue;
+            }
+            Input::Compact => {
+                if let Some(code) =
+                    context::compact(app, &mut session, &mut sigint, &mut keys).await
+                {
+                    return Ok(code);
+                }
+                continue;
+            }
+            Input::Context => {
+                context::context(app, &session);
                 continue;
             }
             Input::Prompt => {}
@@ -179,13 +203,25 @@ fn classify(line: &str) -> Input {
         "/plan" => Input::Meta("plan"),
         "/tools" => Input::Meta("tools"),
         "/undo" => Input::Undo,
-        _ => match line.strip_prefix("/rewind") {
-            Some(rest) if rest.is_empty() || rest.starts_with(' ') => {
+        "/compact" => Input::Compact,
+        "/context" => Input::Context,
+        _ => {
+            if let Some(rest) = command_argument(line, "/rewind") {
                 Input::Rewind(rewind_turns(rest.trim()))
+            } else if let Some(rest) = command_argument(line, "/model") {
+                Input::Model(context::model_argument(rest))
+            } else {
+                Input::Prompt
             }
-            _ => Input::Prompt,
-        },
+        }
     }
+}
+
+/// What follows `command` on `line`, when `line` is that command - not a
+/// word that merely starts like it.
+fn command_argument<'a>(line: &'a str, command: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(command)?;
+    (rest.is_empty() || rest.starts_with(' ')).then_some(rest)
 }
 
 fn rewind_turns(argument: &str) -> Result<usize, String> {
@@ -250,6 +286,22 @@ mod tests {
         assert!(matches!(classify("/tools"), Input::Meta("tools")));
         assert!(matches!(classify("/plan"), Input::Meta("plan")));
         assert!(matches!(classify("/undo"), Input::Undo));
+        assert!(matches!(classify("/compact"), Input::Compact));
+        assert!(matches!(classify("/context"), Input::Context));
+    }
+
+    #[test]
+    fn model_takes_an_optional_reference() {
+        assert!(matches!(classify("/model"), Input::Model(Ok(None))));
+        assert!(matches!(
+            classify("/model cloud/claude-sonnet-5-5"),
+            Input::Model(Ok(Some(model))) if model.as_str() == "cloud/claude-sonnet-5-5"
+        ));
+        assert!(matches!(classify("/model a b"), Input::Model(Err(_))));
+        assert!(
+            matches!(classify("/models are what?"), Input::Prompt),
+            "only the command itself, not a word that starts like it"
+        );
     }
 
     #[test]

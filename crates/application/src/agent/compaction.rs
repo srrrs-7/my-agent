@@ -190,6 +190,20 @@ pub struct CompactionReport {
     pub usage: TokenUsage,
 }
 
+/// How a compaction asked for by hand (`/compact`) ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualCompaction {
+    Compacted(CompactionReport),
+    /// Too little history behind the verbatim tail to be worth a summary.
+    /// No request was made.
+    NothingToFold,
+    /// The summary could not be produced; the history is as it was. The
+    /// reason went to the log, as it does for an automatic compaction.
+    Failed,
+    /// Interrupted while the summary was being written. Nothing changed.
+    Interrupted,
+}
+
 pub struct HistoryCompactor {
     llm: Arc<dyn LlmProvider>,
     config: CompactionConfig,
@@ -213,15 +227,41 @@ impl HistoryCompactor {
         if !self.config.enabled {
             return None;
         }
+        self.fold(session_id, conversation, self.config.model.clone())
+            .await
+    }
 
-        let split = conversation.compaction_split_within(
-            self.config.keep_recent_messages,
-            self.config.keep_recent_bytes,
-        )?;
+    /// Whether [`Self::compact`] does anything at all.
+    pub fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Whether `conversation` has enough history behind the verbatim tail for
+    /// a fold to be worth a request.
+    pub fn has_foldable(&self, conversation: &Conversation) -> bool {
+        self.split(conversation).is_some()
+    }
+
+    /// [`Self::compact`] whether or not compaction is switched on, asking
+    /// `model` for the summary.
+    ///
+    /// The switch is about the loop folding history on its own initiative;
+    /// someone who asked for a compaction by hand has already decided it is
+    /// worth the request. The model is the caller's because a session may be
+    /// running on a model other than the configured one (`/model`), and the
+    /// summary should come from the model the session is actually using.
+    pub async fn fold(
+        &self,
+        session_id: &str,
+        conversation: &mut Conversation,
+        model: Option<ModelId>,
+    ) -> Option<CompactionReport> {
+        let split = self.split(conversation)?;
         let before_bytes = conversation.approx_bytes();
         let transcript = render_transcript(conversation, split);
 
-        let (summary, usage) = match self.llm.chat(self.request(session_id, transcript)).await {
+        let request = self.request(session_id, transcript, model);
+        let (summary, usage) = match self.llm.chat(request).await {
             Ok(response) => (response.message.text(), response.usage),
             Err(error) => {
                 warn!(%error, "history compaction failed; falling back to trimming");
@@ -245,6 +285,13 @@ impl HistoryCompactor {
         })
     }
 
+    fn split(&self, conversation: &Conversation) -> Option<usize> {
+        conversation.compaction_split_within(
+            self.config.keep_recent_messages,
+            self.config.keep_recent_bytes,
+        )
+    }
+
     /// The transcript arrives as one user message rather than as the original
     /// messages.
     ///
@@ -253,10 +300,10 @@ impl HistoryCompactor {
     /// accepting - and this is the one request that must work on every backend,
     /// since it runs when the session is already in trouble. Flattening also
     /// makes the clipping above possible, which replaying does not.
-    fn request(&self, session_id: &str, transcript: String) -> ChatRequest {
+    fn request(&self, session_id: &str, transcript: String, model: Option<ModelId>) -> ChatRequest {
         ChatRequest::new(vec![Message::user(transcript)])
             .with_system(SUMMARY_INSTRUCTIONS)
-            .with_model(self.config.model.clone())
+            .with_model(model)
             .with_params(GenerationParams {
                 // Not sent, though a record would rather be deterministic:
                 // current Claude models reject any `temperature`, and this is

@@ -29,7 +29,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::message::{Message, Role};
+use super::message::{ContentBlock, Message, Role};
 
 /// Below this, folding a prefix into a summary is not worth a model
 /// round-trip: one message replaced by one message saves nothing.
@@ -194,6 +194,31 @@ impl Conversation {
         Some(dropped)
     }
 
+    /// Removes every [`ContentBlock::Opaque`] block, returning how many went.
+    ///
+    /// For a change of model mid-session. Those blocks are one provider's
+    /// private state for one model - a thinking block's signature is checked
+    /// against the model that wrote it - and handing them to another model
+    /// gets the request rejected, or at best ignored. The prompt cache is
+    /// lost on a model change anyway, so dropping them costs nothing there.
+    ///
+    /// Text, tool calls and tool results are untouched, so every call keeps
+    /// its result. An assistant message that held nothing but opaque blocks
+    /// is removed entirely, since providers reject a message with no content;
+    /// it carried no tool call, so no result is orphaned by its going.
+    pub fn drop_opaque(&mut self) -> usize {
+        let mut dropped = 0;
+        for message in &mut self.messages {
+            let before = message.content.len();
+            message
+                .content
+                .retain(|block| !matches!(block, ContentBlock::Opaque { .. }));
+            dropped += before - message.content.len();
+        }
+        self.messages.retain(|message| !message.content.is_empty());
+        dropped
+    }
+
     /// Where a compaction may cut, keeping `keep_recent` messages verbatim, or
     /// `None` when folding what is left would not be worth a model round-trip.
     ///
@@ -336,7 +361,6 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::message::ContentBlock;
     use crate::model::tool::{ToolCall, ToolCallId, ToolName, ToolResult};
     use serde_json::json;
 
@@ -690,5 +714,62 @@ mod tests {
         conversation.replace_prefix(split, Message::user("SUMMARY"));
 
         assert_eq!(conversation.messages()[0].role, Role::User);
+    }
+
+    fn thinking(text: &str) -> ContentBlock {
+        ContentBlock::Opaque {
+            dialect: "anthropic".into(),
+            data: json!({"type": "thinking", "thinking": text, "signature": "sig"}),
+        }
+    }
+
+    #[test]
+    fn dropping_opaque_blocks_keeps_every_call_with_its_result() {
+        let call = call();
+        let mut conversation = Conversation::from_messages(vec![
+            Message::user("go"),
+            Message::assistant(vec![thinking("plan"), ContentBlock::ToolCall(call.clone())]),
+            Message::tool_results(vec![ToolResult::ok(&call, "contents")]),
+            Message::assistant(vec![thinking("wrap up"), ContentBlock::text("done")]),
+        ]);
+
+        assert_eq!(conversation.drop_opaque(), 2);
+
+        let messages = conversation.messages();
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(
+            messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .all(|block| !matches!(block, ContentBlock::Opaque { .. })),
+            "{messages:?}"
+        );
+        assert_eq!(messages[1].tool_calls().next(), Some(&call));
+        assert!(matches!(
+            &messages[2].content[..],
+            [ContentBlock::ToolResult(result)] if result.call_id == call.id
+        ));
+        assert_eq!(messages[3].text(), "done");
+    }
+
+    #[test]
+    fn a_message_left_empty_by_dropping_opaque_blocks_goes_with_them() {
+        let mut conversation = Conversation::from_messages(vec![
+            Message::user("think about it"),
+            Message::assistant(vec![thinking("hmm")]),
+            Message::user("well?"),
+        ]);
+
+        assert_eq!(conversation.drop_opaque(), 1);
+        let texts: Vec<String> = conversation.messages().iter().map(Message::text).collect();
+        assert_eq!(texts, ["think about it", "well?"]);
+    }
+
+    #[test]
+    fn a_history_without_opaque_blocks_is_left_as_it_is() {
+        let mut conversation = with_a_tool_turn();
+        let before = conversation.clone();
+        assert_eq!(conversation.drop_opaque(), 0);
+        assert_eq!(conversation, before);
     }
 }

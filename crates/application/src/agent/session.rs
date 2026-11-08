@@ -1,5 +1,5 @@
 use agent_domain::model::conversation::Conversation;
-use agent_domain::model::llm::TokenUsage;
+use agent_domain::model::llm::{ModelId, TokenUsage};
 use agent_domain::model::plan::Plan;
 
 use crate::tools::plan::latest_plan;
@@ -45,6 +45,20 @@ pub struct Session {
     /// In the user message rather than the system prompt, which stays fixed
     /// for the session so the provider's prompt cache keeps matching.
     pub(crate) notes: Vec<(u64, String)>,
+    /// The model chosen with `/model`, preferred over the configured one by
+    /// every request this session makes. `None` runs on the configuration.
+    ///
+    /// Set only between turns, through [`Self::switch_model`], so a turn runs
+    /// on one model from start to finish. Not carried into a resumed session:
+    /// the record says what was said, not which model was listening.
+    pub(crate) model_override: Option<ModelId>,
+    /// What the newest model response of the agent loop cost - unlike
+    /// [`Self::usage`], not a running total. Its input side is how big the
+    /// last request was, which is what `/context` wants to show. Summary
+    /// requests are left out: they carry a transcript, not this context.
+    pub(crate) last_usage: Option<TokenUsage>,
+    /// How many times the history was folded into a summary in this process.
+    pub(crate) compactions: u32,
 }
 
 impl Session {
@@ -56,6 +70,9 @@ impl Session {
             system_prompt: None,
             plan: None,
             notes: Vec::new(),
+            model_override: None,
+            last_usage: None,
+            compactions: 0,
         }
     }
 
@@ -110,5 +127,41 @@ impl Session {
     /// The model's current work plan, if it has one.
     pub fn plan(&self) -> Option<&Plan> {
         self.plan.as_ref()
+    }
+
+    /// The model chosen for this session, if one was; see
+    /// [`AgentLoop::model`](super::AgentLoop::model) for the one in effect.
+    pub fn model_override(&self) -> Option<&ModelId> {
+        self.model_override.as_ref()
+    }
+
+    /// Runs every later request of this session on `model`, returning how
+    /// many opaque blocks were dropped from the history for it.
+    ///
+    /// Those blocks are the previous model's private state - a thinking
+    /// block's signature is checked against the model that wrote it - so they
+    /// cannot follow the conversation to another one (see
+    /// [`Conversation::drop_opaque`]). The system prompt is left exactly as
+    /// it is: the switch already costs the provider's prompt cache, and
+    /// rebuilding the prompt would also change what the model is told.
+    pub fn switch_model(&mut self, model: ModelId) -> usize {
+        self.model_override = Some(model);
+        self.conversation.drop_opaque()
+    }
+
+    /// What the newest model response cost, or `None` before the first one.
+    pub fn last_usage(&self) -> Option<TokenUsage> {
+        self.last_usage
+    }
+
+    /// How many times the history was folded into a summary so far.
+    pub fn compactions(&self) -> u32 {
+        self.compactions
+    }
+
+    /// The system prompt the session sends, or `None` before its first turn
+    /// rendered it.
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
     }
 }
