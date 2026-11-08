@@ -21,7 +21,8 @@ pub mod ports;
 pub mod text;
 
 pub use error::{
-    ApprovalError, CommandError, DomainError, FetchError, FsError, LlmError, NotifyError, ToolError,
+    ApprovalError, CommandError, DomainError, FetchError, FsError, LlmError, NotifyError,
+    PlanError, ToolError,
 };
 pub use model::{
     access::{AccessPolicy, FileAccess, PathPattern},
@@ -32,6 +33,7 @@ pub use model::{
         RequestMetadata, StopReason, TaskKind, TokenUsage,
     },
     message::{ContentBlock, Message, Role},
+    plan::{Plan, PlanItem, PlanStatus},
     tool::{ToolCall, ToolCallId, ToolDefinition, ToolName, ToolOutcome, ToolResult, ToolSafety},
     workspace::{WorkspacePath, WorkspaceRoot},
 };

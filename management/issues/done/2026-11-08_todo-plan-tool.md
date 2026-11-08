@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: medium
 importance: high
 priority: P1
+started: 2026-11-08
+completed: 2026-11-08
 scope: [domain, application, infrastructure, cli, docs]
 ---
 
@@ -54,15 +56,15 @@ scope: [domain, application, infrastructure, cli, docs]
 
 ## 達成条件
 
-- [ ] モデルが計画を書き、更新できる。更新のたびに stderr に現在の計画が表示され、stdout は汚れない
-- [ ] `read-only` ポリシーでも、計画の更新で承認プロンプトが出ない
-- [ ] 圧縮・刈り込みの後のリクエストにも最新の計画が含まれることを、送出リクエストを検査する
+- [x] モデルが計画を書き、更新できる。更新のたびに stderr に現在の計画が表示され、stdout は汚れない
+- [x] `read-only` ポリシーでも、計画の更新で承認プロンプトが出ない
+- [x] 圧縮・刈り込みの後のリクエストにも最新の計画が含まれることを、送出リクエストを検査する
       ループのテストで固定する
-- [ ] 同じターンに複数の更新が来ても、最後に要求された計画が残る（並列実行を有効にした状態で）
-- [ ] `--resume` で中断時点の計画が戻ることをテストで固定する。`/reset` で計画が消える
-- [ ] 規則に反する入力が `is_error` の `tool_result` で返り、ループが続く
-- [ ] `README.md` §4 のツール表に載っている
-- [ ] `make check` が緑
+- [x] 同じターンに複数の更新が来ても、最後に要求された計画が残る（並列実行を有効にした状態で）
+- [x] `--resume` で中断時点の計画が戻ることをテストで固定する。`/reset` で計画が消える
+- [x] 規則に反する入力が `is_error` の `tool_result` で返り、ループが続く
+- [x] `README.md` §4 のツール表に載っている
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -97,3 +99,5 @@ scope: [domain, application, infrastructure, cli, docs]
 - 再開: `Session::resumed(id, conversation)` で全履歴から射影して復元
 - 安全分類は `ReadOnly`（並列でも結果が要求順なので「最後が勝つ」で決まる）
 - composition 登録と README §4 更新を忘れない（合成ルートにテストがない）
+
+- 2026-11-08 完了。設計からの差分: (1) 計画が残っている間は fit_history の予算からメモの大きさを差し引く（メモで再び予算超過→毎回刈り込み、を防ぐ）。(2) メモは「最新の todo_write も同一メモも履歴に見えないとき」だけ追記（keep_recent の下限で予算超過が続くと毎イテレーション追記される問題をテストで発見）。/plan コマンド追加。既知: 要約役がメモを user 発言として要約しうる（後続の短縮で再ピンされるので影響は限定的）

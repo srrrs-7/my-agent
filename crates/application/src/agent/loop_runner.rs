@@ -41,6 +41,7 @@ use tracing::{debug, warn};
 use super::compaction::{CompactionConfig, HistoryCompactor};
 use super::config::AgentLoopConfig;
 use super::dispatch::{DispatchConfig, ToolDispatcher};
+use super::plan;
 use super::session::Session;
 use crate::error::AppError;
 use crate::tools::registry::ToolRegistry;
@@ -198,6 +199,11 @@ impl AgentLoop {
             let results = self.dispatcher.dispatch(&calls).await;
             session.conversation.push(Message::tool_results(results));
             self.record(session, 1).await;
+            // The call and its result, read now: by the next shortening the
+            // call that wrote the plan may already be gone.
+            if let Some(plan) = plan::refresh(session, 2) {
+                self.events.emit(AgentEvent::PlanUpdated { plan });
+            }
         }
 
         // The model kept asking for tools until the budget ran out. Report what
@@ -319,13 +325,28 @@ impl AgentLoop {
     /// that landed on top of a tail already filling the budget, still has to be
     /// dealt with. In that second case trimming will drop the summary itself -
     /// the budget is a hard limit and something has to go.
+    ///
+    /// When either stage shortened the history and the model has unfinished
+    /// work it can no longer see, its plan is appended once as a note (see
+    /// [`super::plan`]). Room for that note is reserved in the budget up
+    /// front, whenever there is unfinished work: without the reservation the
+    /// note would push a history trimmed to exactly the budget back over it,
+    /// and the next iteration would trim again just to make room for it.
     async fn fit_history(&self, session: &mut Session) {
-        if session.conversation.approx_bytes() > self.config.max_history_bytes
+        let reminder = plan::reminder(session.plan());
+        let budget = self
+            .config
+            .max_history_bytes
+            .saturating_sub(reminder.as_ref().map_or(0, Message::approx_bytes));
+        let mut shortened = false;
+
+        if session.conversation.approx_bytes() > budget
             && let Some(report) = self
                 .compactor
                 .compact(&session.id, &mut session.conversation)
                 .await
         {
+            shortened = true;
             self.events.emit(AgentEvent::HistoryCompacted {
                 folded_messages: report.folded_messages,
                 before_bytes: report.before_bytes,
@@ -333,14 +354,22 @@ impl AgentLoop {
             });
         }
 
-        let dropped = session.conversation.trim_to_budget(
-            self.config.max_history_bytes,
-            self.config.keep_recent_messages,
-        );
+        let dropped = session
+            .conversation
+            .trim_to_budget(budget, self.config.keep_recent_messages);
         if dropped > 0 {
+            shortened = true;
             self.events.emit(AgentEvent::HistoryTrimmed {
                 dropped_messages: dropped,
             });
+        }
+
+        if shortened
+            && let Some(reminder) = reminder
+            && !plan::still_visible(session, &reminder)
+        {
+            session.conversation.push(reminder);
+            self.record(session, 1).await;
         }
     }
 

@@ -275,6 +275,22 @@ Anthropic アダプタはこの前置きにキャッシュの印を付けます�
 履歴は毎イテレーション前に `Conversation::trim_to_budget` で刈り込まれ、
 末尾 `keep_recent_messages` 件は必ず残ります。
 
+### 作業計画の置き場所
+
+`todo_write` の計画は**会話が真実**です。現在の計画は「成功した最後の `todo_write` 呼び出しの引数」
+であり、ツール自体は状態を持ちません（`application/src/tools/plan/`）。規則（作業中は 1 つまで、
+20 項目・各 1 行 200 バイトまで）は domain の値オブジェクト `Plan` が持ち、違反は直さず拒否します。
+
+`Session.plan` はその射影のキャッシュです。履歴が短くなると計画を書いた呼び出し自体が消えるため、
+ループはツール結果を積むたびに最新ターンだけを射影して更新し、変わったときだけ
+`AgentEvent::PlanUpdated` を出します。再開時は `Session::resumed` が記録全体から射影し直します。
+
+計画をモデルに見せ直すのは `fit_history` が履歴を短くした直後だけで、未完了の項目があり、
+かつ計画がもう履歴から見えないときに user ロールのメモを 1 回だけ末尾に追記・記録します。
+システムプロンプト・`PromptBuilder`・`ContextProvider` には入れません。前置きが毎回変わり
+キャッシュが外れるうえ、`FixedPromptBuilder` で差し替えると消えるためです。メモの分は
+刈り込みの予算から先に差し引くので、メモ自体が次の刈り込みを誘発することはありません。
+
 ## 5. テスト戦略
 
 | 層 | 手法 | 例 |
@@ -286,9 +302,10 @@ Anthropic アダプタはこの前置きにキャッシュの印を付けます�
 | infrastructure | 生 TCP のモックサーバ | ステータス写像、実際に送出される JSON |
 | 全体 | E2E（`crates/cli/tests/end_to_end.rs`） | HTTP → ループ → 実ファイル書き込み |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/notify_e2e.rs`） | 合成ルート → `run` / `chat` → 終了処理。Webhook 通知の到達・中身・終了コード |
+| 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/plan_e2e.rs`） | `todo_write` の登録・承認なしでの実行・stderr への表示・`--resume` での復元・`/reset` |
 
 モックサーバは `crates/test-support` に置いて infrastructure と cli の
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 476 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 511 本）。

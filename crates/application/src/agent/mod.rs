@@ -5,6 +5,7 @@ pub mod compaction;
 pub mod config;
 pub mod dispatch;
 pub mod loop_runner;
+mod plan;
 pub mod prompt;
 pub mod session;
 

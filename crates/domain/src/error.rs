@@ -27,6 +27,51 @@ impl DomainError {
     }
 }
 
+/// Why a [`crate::model::plan::Plan`] was refused.
+///
+/// Items are named by their 1-based position, the way the model counts them in
+/// the list it just wrote. Each message says what to change, because the one
+/// reader who can act on it is the model that sent the plan.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PlanError {
+    #[error(
+        "the plan has {count} items, more than the limit of {limit}. Merge small steps into \
+         larger ones"
+    )]
+    TooManyItems { count: usize, limit: usize },
+
+    #[error("item {number} is blank. Every item needs a short description of the step")]
+    BlankItem { number: usize },
+
+    #[error("item {number} spans several lines. Write each step as a single line")]
+    MultiLineItem { number: usize },
+
+    #[error(
+        "item {number} is {bytes} bytes, more than the limit of {limit}. Shorten it to one \
+         brief line"
+    )]
+    ItemTooLong {
+        number: usize,
+        bytes: usize,
+        limit: usize,
+    },
+
+    #[error(
+        "items {} are all `in_progress`, but only one step can be in progress at a time. Mark \
+         the others `pending` or `completed`",
+        list_numbers(.numbers)
+    )]
+    SeveralInProgress { numbers: Vec<usize> },
+}
+
+fn list_numbers(numbers: &[usize]) -> String {
+    numbers
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Failures produced by [`crate::ports::llm::LlmProvider`] implementations.
 #[derive(Debug, Error, Clone)]
 pub enum LlmError {

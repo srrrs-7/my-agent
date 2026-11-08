@@ -8,11 +8,12 @@ use crate::commands::tools;
 use crate::composition::Application;
 use crate::input::prompt_line;
 use crate::notify::DRAIN_TIMEOUT;
-use crate::render::describe_usage;
+use crate::render::{describe_plan, describe_usage};
 use crate::session_id;
 
 const HELP: &str = "  /reset  start a new conversation\n  \
                       /usage  tokens used so far\n  \
+                      /plan   the model's current work plan\n  \
                       /tools  list the tools the model can call\n  \
                       /exit   quit";
 
@@ -106,8 +107,14 @@ async fn start(app: &Application, resume: Resume) -> Session {
             eprintln!("resuming {id} ({} messages)", conversation.len());
             // The same id, so the log carries on in the same file rather than
             // forking the record in two.
-            let mut session = Session::new(id);
-            session.conversation = conversation;
+            let session = Session::resumed(id, conversation);
+            if let Some(plan) = session.plan() {
+                eprintln!(
+                    "  with a plan of {} step(s), {} completed",
+                    plan.items().len(),
+                    plan.completed()
+                );
+            }
             session
         }
         Err(error) => {
@@ -124,6 +131,7 @@ fn classify(line: &str) -> Input {
         "/help" => Input::Meta("help"),
         "/reset" => Input::Meta("reset"),
         "/usage" => Input::Meta("usage"),
+        "/plan" => Input::Meta("plan"),
         "/tools" => Input::Meta("tools"),
         _ => Input::Prompt,
     }
@@ -141,6 +149,7 @@ fn run_meta(app: &Application, session: &mut Session, command: &str) {
             describe_usage(&session.usage),
             session.turns()
         ),
+        "plan" => eprintln!("{}", describe_plan(session.plan())),
         "tools" => tools::execute(app),
         other => eprintln!("  unknown command `{other}`"),
     }
@@ -173,6 +182,7 @@ mod tests {
         assert!(matches!(classify("/quit"), Input::Quit));
         assert!(matches!(classify("/reset"), Input::Meta("reset")));
         assert!(matches!(classify("/tools"), Input::Meta("tools")));
+        assert!(matches!(classify("/plan"), Input::Meta("plan")));
     }
 
     #[test]

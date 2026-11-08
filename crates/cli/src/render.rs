@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use agent_domain::model::llm::TokenUsage;
+use agent_domain::model::plan::{Plan, PlanStatus};
 use agent_domain::ports::events::{AgentEvent, EventSink, FinishReason};
 
 const RESET: &str = "\x1b[0m";
@@ -60,6 +61,10 @@ impl TerminalRenderer {
         let mut stderr = std::io::stderr();
         let _ = writeln!(stderr, "{}", line.as_ref());
         let _ = stderr.flush();
+    }
+
+    fn checklist(&self, plan: &Plan) -> String {
+        draw_plan(plan, &|style, text| self.paint(style, text))
     }
 
     /// Prints one streamed fragment, without a newline, flushed immediately.
@@ -185,6 +190,8 @@ impl EventSink for TerminalRenderer {
                 self.status(self.paint(YELLOW, &format!("⊘ {name} denied: {reason}")));
             }
 
+            AgentEvent::PlanUpdated { plan } => self.status(self.checklist(&plan)),
+
             AgentEvent::RunFinished {
                 reason,
                 iterations,
@@ -216,6 +223,40 @@ impl EventSink for TerminalRenderer {
                 }
             },
         }
+    }
+}
+
+/// The plan as a checklist, one item per line, the step in progress
+/// highlighted. Always the whole plan: the event only fires when it changed,
+/// and a diff would leave the reader to assemble it.
+fn draw_plan(plan: &Plan, paint: &dyn Fn(&'static str, &str) -> String) -> String {
+    if plan.is_empty() {
+        return paint(DIM, "☐ plan cleared");
+    }
+    let mut lines = vec![paint(
+        BOLD,
+        &format!(
+            "☐ plan ({}/{} completed)",
+            plan.completed(),
+            plan.items().len()
+        ),
+    )];
+    for item in plan.items() {
+        lines.push(match item.status {
+            PlanStatus::Completed => paint(DIM, &format!("  [x] {}", item.content)),
+            PlanStatus::InProgress => paint(CYAN, &format!("  [>] {}", item.content)),
+            PlanStatus::Pending => format!("  [ ] {}", item.content),
+        });
+    }
+    lines.join("\n")
+}
+
+/// The session's plan for `/plan`, uncoloured, in the same shape the renderer
+/// draws it in.
+pub fn describe_plan(plan: Option<&Plan>) -> String {
+    match plan {
+        Some(plan) => draw_plan(plan, &|_, text| text.to_string()),
+        None => "no plan".to_string(),
     }
 }
 
@@ -255,6 +296,7 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_domain::model::plan::PlanItem;
 
     #[test]
     fn durations_switch_units() {
@@ -281,6 +323,24 @@ mod tests {
             describe_usage(&cached),
             "4050 in / 7 out tokens (cache: 3000 read, 1000 written)"
         );
+    }
+
+    #[test]
+    fn a_plan_is_drawn_as_a_checklist_with_progress() {
+        let renderer = TerminalRenderer::new(false, true);
+        let plan = Plan::new(vec![
+            PlanItem::new("read the parser", PlanStatus::Completed),
+            PlanItem::new("handle CRLF", PlanStatus::InProgress),
+            PlanItem::new("run the tests", PlanStatus::Pending),
+        ])
+        .unwrap();
+        assert_eq!(
+            renderer.checklist(&plan),
+            "☐ plan (1/3 completed)\n  [x] read the parser\n  [>] handle CRLF\n  [ ] run the tests"
+        );
+        assert_eq!(renderer.checklist(&Plan::default()), "☐ plan cleared");
+        assert_eq!(describe_plan(Some(&plan)), renderer.checklist(&plan));
+        assert_eq!(describe_plan(None), "no plan");
     }
 
     #[test]

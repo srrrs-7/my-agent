@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use crate::model::llm::{ModelId, ProviderId, StopReason, TokenUsage};
+use crate::model::plan::Plan;
 use crate::model::tool::{ToolCall, ToolCallId, ToolName, ToolSafety};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,12 @@ pub enum AgentEvent {
     ToolCallDenied {
         name: ToolName,
         reason: String,
+    },
+    /// The model's work plan changed. Emitted only when it differs from the
+    /// one already shown, so a sink can redraw it unconditionally. An empty
+    /// plan means the model cleared it.
+    PlanUpdated {
+        plan: Plan,
     },
     RunFinished {
         reason: FinishReason,
