@@ -82,12 +82,15 @@ crates/test-support   (agent-test-support)   統合テスト用モック LLM サ
 | `crates/domain/src/model/conversation.rs` | 履歴を短くするときの規則。対を壊さない境界と、何を残すかの重み付け |
 | `crates/cli/src/composition.rs` | 具象と抽象が結線される唯一の場所 |
 
-**`crates/cli` は bin only で、`composition.rs` にはテストがありません。**
-`tests/end_to_end.rs` は `agent_cli` を import せず配線を自前で組み直しているため
-（本物は 7 ツール + 装飾子 3 種、`tests/end_to_end.rs` は 2 ツール素のまま。実バイナリを起動する `*_e2e.rs` は配線の一部を踏む）、composition の間違い —
-ツールの登録漏れ、ポートの取り違え、設定分岐 — は**どのテストからも見えません**。
-ここを触ったら手で確かめてください。足場を作る issue は
-`management/issues/todo/2026-08-14_composition-root-test-harness.md`（P1）。
+**`crates/cli` は lib + 薄い bin です。** すべてのサブコマンドの配線は
+`composition::assemble(settings, wiring)` を通ります（`build` は環境と CLI 引数から
+`Settings` を作ってこれを呼ぶだけ）。`crates/cli/tests/composition.rs` がこれを
+`MapEnv` で設定を注入して直接呼び、登録ツールの集合・設定による条件付き登録・
+装飾子（伏せ字・タイムアウト・依存監視）・承認ゲート・会話ログ・サンドボックス不成立時の
+起動失敗を固定しています。実バイナリを起動する `*_e2e.rs` も同じ配線を通ります。
+
+ただし `tests/end_to_end.rs` はまだ配線を自前で組み直しています（2 ツール素のまま）。
+そこで通っても composition の正しさの証拠にはなりません。
 
 構造の詳細・各ポートの実装対応・設計判断の根拠は `.claude/rules/architecture.md` と
 `management/docs/architecture.md` にあります。
