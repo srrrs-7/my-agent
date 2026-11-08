@@ -11,17 +11,8 @@
 //!   a shell's grandchildren running; putting the child in its own group and
 //!   signalling the group is what actually stops `sh -c 'sleep 1000 &'`.
 //! * **So does being abandoned.** When the caller drops the future - the turn
-//!   was interrupted - `kill_on_drop` alone would stop only the direct child.
-//!   A guard kills the group first, while the child is still unreaped, so the
-//!   group id cannot yet belong to anyone else.
-//!
-//! The child is detached into its own *session*, which does both jobs at once
-//! and closes a hole that a process group alone leaves open: a child sharing
-//! our session keeps the controlling terminal, and `/dev/tty` reaches it
-//! directly - past the pipes we capture. Writing there would let a command
-//! print whatever it liked to the user's terminal, including an imitation of
-//! the approval prompt; reading there would hand it the user's keystrokes.
-//! Without a controlling terminal, opening `/dev/tty` simply fails.
+//!   was interrupted - the group is killed as well, not only the direct child
+//!   (see [`super::process`]).
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -30,6 +21,8 @@ use agent_domain::error::CommandError;
 use agent_domain::ports::command::CommandOutput;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+
+use super::process::{GuardedChild, kill_group};
 
 /// Runs `command` to completion under the cap and the timeout.
 ///
@@ -43,45 +36,22 @@ pub(crate) async fn run_capped(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    // Its own session: a new process group (so the timeout can take the whole
-    // tree down) *and* no controlling terminal. `setsid` rather than
-    // `process_group(0)` because it delivers both, and because calling it
-    // after the child is already a group leader would fail with EPERM.
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+        .stderr(Stdio::piped());
 
     let started = Instant::now();
-    let mut child = command.spawn().map_err(|error| CommandError::SpawnFailed {
-        message: error.to_string(),
-    })?;
+    let mut guarded = GuardedChild::spawn(command)?;
 
-    let pid = child.id();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    // Declared after `child`, so it is dropped before it: the group is killed
-    // while the child is at worst a zombie, which keeps its pid - and with it
-    // the group id - from being handed to an unrelated process.
-    let mut group = GroupGuard { pid };
+    let pid = guarded.child.id();
+    let stdout = guarded.child.stdout.take();
+    let stderr = guarded.child.stderr.take();
 
     // Each stream gets half the budget, so a chatty stderr cannot crowd out
     // the stdout the model is usually after.
     let half = max_output_bytes / 2;
     let capture = async {
         let (out, err) = tokio::join!(read_capped(stdout, half), read_capped(stderr, half));
-        let status = child.wait().await;
-        // Reaped: from here on the pid may be reused, and signalling its
-        // group could hit a stranger.
-        group.disarm();
+        let status = guarded.child.wait().await;
+        guarded.group.disarm();
         (out, err, status)
     };
 
@@ -138,34 +108,6 @@ async fn read_capped<R: AsyncRead + Unpin>(reader: Option<R>, limit: usize) -> (
 
     (String::from_utf8_lossy(&kept).into_owned(), truncated)
 }
-
-/// Kills the child's process group when dropped, unless disarmed first.
-struct GroupGuard {
-    pid: Option<u32>,
-}
-
-impl GroupGuard {
-    fn disarm(&mut self) {
-        self.pid = None;
-    }
-}
-
-impl Drop for GroupGuard {
-    fn drop(&mut self) {
-        kill_group(self.pid.take());
-    }
-}
-
-#[cfg(unix)]
-fn kill_group(pid: Option<u32>) {
-    if let Some(pid) = pid {
-        // Negative pid signals the whole process group.
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_group(_pid: Option<u32>) {}
 
 #[cfg(all(test, unix))]
 mod tests {
