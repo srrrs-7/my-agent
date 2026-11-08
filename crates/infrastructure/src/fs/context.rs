@@ -34,6 +34,8 @@ use async_trait::async_trait;
 use ignore::WalkBuilder;
 use tracing::warn;
 
+use super::resolve::ResolvedWorkspace;
+
 /// Instruction files, in precedence order. The first one found in a directory
 /// wins - this is the convention Claude Code and Codex established, and
 /// following it means an existing repository needs no new file to steer this
@@ -209,21 +211,12 @@ fn instruction_file_permitted(
     root: &WorkspaceRoot,
     requested: &WorkspacePath,
 ) -> Result<(), FsError> {
-    let real_root = super::canonical_root(root)?;
+    let workspace = ResolvedWorkspace::new(root)?;
     let real = std::fs::canonicalize(root.absolute(requested)).map_err(|error| FsError::Io {
         path: requested.display(),
         message: error.to_string(),
     })?;
-    let real = real_root.relativize(&real)?;
-
-    if root.permits(requested, FileAccess::Read) && real_root.permits(&real, FileAccess::Read) {
-        Ok(())
-    } else {
-        Err(FsError::AccessDenied {
-            path: requested.display(),
-            access: FileAccess::Read,
-        })
-    }
+    workspace.check(requested, &real, FileAccess::Read)
 }
 
 /// Paths of the instruction files in subdirectories, sorted, at most

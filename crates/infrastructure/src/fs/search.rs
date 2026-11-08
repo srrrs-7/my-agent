@@ -28,6 +28,8 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use regex::RegexBuilder;
 
+use super::resolve::ResolvedWorkspace;
+
 /// Files larger than this are skipped: a match inside a multi-megabyte blob is
 /// not useful to the model and reading it is pure latency.
 const MAX_SEARCHED_FILE_BYTES: u64 = 1024 * 1024;
@@ -76,7 +78,7 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
 
     let WalkStart {
         base,
-        real_root,
+        workspace,
         real_base,
     } = walk_start(root, &query.root)?;
 
@@ -116,7 +118,7 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
             continue;
         };
         // Decided before the file is opened: a refused file is never read.
-        if !permitted(root, &path, &real_root, &base, &real_base, entry.path()) {
+        if !permitted(&workspace, &path, &base, &real_base, entry.path()) {
             continue;
         }
 
@@ -151,7 +153,7 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
 /// filesystem really resolves it.
 struct WalkStart {
     base: PathBuf,
-    real_root: WorkspaceRoot,
+    workspace: ResolvedWorkspace,
     real_base: PathBuf,
 }
 
@@ -167,28 +169,16 @@ fn walk_start(root: &WorkspaceRoot, subtree: &WorkspacePath) -> Result<WalkStart
     // of the search is resolved and checked like any other path: a link to a
     // directory outside the workspace, or to a protected one, would otherwise
     // be searched in full.
-    let real_root = super::canonical_root(root)?;
+    let workspace = ResolvedWorkspace::new(root)?;
     let real_base = std::fs::canonicalize(&base).map_err(|error| FsError::Io {
         path: subtree.display(),
         message: error.to_string(),
     })?;
-    let real_subtree = real_root
-        .relativize(&real_base)
-        .map_err(|_| FsError::OutsideWorkspace {
-            path: subtree.display(),
-        })?;
-    if !root.permits(subtree, FileAccess::Read)
-        || !real_root.permits(&real_subtree, FileAccess::Read)
-    {
-        return Err(FsError::AccessDenied {
-            path: subtree.display(),
-            access: FileAccess::Read,
-        });
-    }
+    workspace.check(subtree, &real_base, FileAccess::Read)?;
 
     Ok(WalkStart {
         base,
-        real_root,
+        workspace,
         real_base,
     })
 }
@@ -199,7 +189,7 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
 
     let WalkStart {
         base,
-        real_root,
+        workspace,
         real_base,
     } = walk_start(root, &query.root)?;
 
@@ -243,7 +233,7 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
         let Ok(path) = root.relativize(entry.path()) else {
             continue;
         };
-        if !permitted(root, &path, &real_root, &base, &real_base, entry.path()) {
+        if !permitted(&workspace, &path, &base, &real_base, entry.path()) {
             continue;
         }
         let modified = entry
@@ -311,16 +301,12 @@ fn names_a_hidden_entry(pattern: &str) -> bool {
 /// is the resolved start plus the same tail - no syscall per file. Anything
 /// that does not fit that shape is refused rather than guessed at.
 fn permitted(
-    root: &WorkspaceRoot,
+    workspace: &ResolvedWorkspace,
     path: &WorkspacePath,
-    real_root: &WorkspaceRoot,
     base: &Path,
     real_base: &Path,
     found: &Path,
 ) -> bool {
-    if !root.permits(path, FileAccess::Read) {
-        return false;
-    }
     let Ok(tail) = found.strip_prefix(base) else {
         return false;
     };
@@ -329,9 +315,7 @@ fn permitted(
     } else {
         real_base.join(tail)
     };
-    real_root
-        .relativize(&real)
-        .is_ok_and(|real| real_root.permits(&real, FileAccess::Read))
+    workspace.check(path, &real, FileAccess::Read).is_ok()
 }
 
 #[cfg(test)]

@@ -784,16 +784,11 @@ fn lexically_normal(path: &Path) -> PathBuf {
 }
 
 /// `path` with symlinks resolved, including when it does not exist yet - the
-/// session directory is only created by the first session. The deepest
-/// existing ancestor is resolved and the rest appended as written.
+/// session directory is only created by the first session.
 fn resolved(path: &Path) -> Option<PathBuf> {
-    let path = lexically_normal(path);
-    let mut existing = path.as_path();
-    while std::fs::symlink_metadata(existing).is_err() {
-        existing = existing.parent()?;
-    }
-    let tail = path.strip_prefix(existing).ok()?;
-    Some(std::fs::canonicalize(existing).ok()?.join(tail))
+    crate::fs::resolve::resolve_leniently(&lexically_normal(path))
+        .ok()
+        .map(|resolution| resolution.path)
 }
 
 /// `0` reads as "no limit" for every retention setting.

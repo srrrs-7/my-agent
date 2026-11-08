@@ -14,7 +14,7 @@
 //! see in any directory listing, and never contents.
 
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_domain::error::FsError;
@@ -23,102 +23,26 @@ use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::file_system::{DirEntry, EntryKind, FileSystem};
 use async_trait::async_trait;
 
-use super::canonical_root;
+use super::resolve::ResolvedWorkspace;
 
 pub struct LocalFileSystem {
-    root: Arc<WorkspaceRoot>,
-    canonical_root: WorkspaceRoot,
+    workspace: ResolvedWorkspace,
     max_file_bytes: u64,
 }
 
 impl LocalFileSystem {
     pub fn new(root: Arc<WorkspaceRoot>, max_file_bytes: u64) -> Result<Self, FsError> {
-        let canonical_root = canonical_root(&root)?;
         Ok(Self {
-            root,
-            canonical_root,
+            workspace: ResolvedWorkspace::new(&root)?,
             max_file_bytes,
         })
     }
 
-    /// Absolute, symlink-resolved location of `path`, or
-    /// [`FsError::OutsideWorkspace`] if it leaves the sandbox, or
-    /// [`FsError::AccessDenied`] if `access` is given and the policy refuses
-    /// either the path or what it resolves to.
-    ///
-    /// Works for paths that do not exist yet (needed for `write_file`): the
-    /// deepest existing ancestor is canonicalised and the remaining, purely
-    /// lexical tail - which contains no `..` - is appended.
+    /// Absolute, symlink-resolved location of `path`, checked against the
+    /// policy for `access` when one is given (see
+    /// [`ResolvedWorkspace::resolve`]).
     fn guard(&self, path: &WorkspacePath, access: Option<FileAccess>) -> Result<PathBuf, FsError> {
-        // Lexical pass: `.env -> config/app.env` is refused here, since its
-        // target has an innocent name.
-        if let Some(access) = access {
-            refuse_unless(self.root.permits(path, access), path, access)?;
-        }
-
-        let absolute = self.root.absolute(path);
-        let existing = nearest_existing_ancestor(&absolute);
-
-        let canonical = std::fs::canonicalize(&existing).map_err(|error| FsError::Io {
-            path: path.display(),
-            message: if error.kind() == ErrorKind::NotFound {
-                // `existing` was found by `lstat`, so short of a race, only a
-                // symlink whose target is missing gets here. Writing through
-                // it would create whatever it names, inside the workspace or
-                // not.
-                "it is a symbolic link to a path that does not exist, so it was not followed - \
-                 use a regular path instead"
-                    .to_string()
-            } else {
-                error.to_string()
-            },
-        })?;
-
-        if !canonical.starts_with(self.canonical_root.as_path()) {
-            return Err(FsError::OutsideWorkspace {
-                path: path.display(),
-            });
-        }
-
-        let tail = absolute.strip_prefix(&existing).unwrap_or(Path::new(""));
-        if tail.as_os_str().is_empty() {
-            // Joining an empty path appends a trailing separator, and a
-            // trailing slash on a regular file makes every syscall fail with
-            // ENOTDIR. The path already exists, so there is nothing to append.
-            return self.authorize_resolved(path, canonical, access);
-        }
-        self.authorize_resolved(path, canonical.join(tail), access)
-    }
-
-    /// Canonical pass: `notes -> .env` is refused here, since the name it
-    /// was asked for by is innocent. The error still names `requested`, not
-    /// where the link leads.
-    fn authorize_resolved(
-        &self,
-        requested: &WorkspacePath,
-        resolved: PathBuf,
-        access: Option<FileAccess>,
-    ) -> Result<PathBuf, FsError> {
-        if let Some(access) = access {
-            let real = self.canonical_root.relativize(&resolved)?;
-            refuse_unless(
-                self.canonical_root.permits(&real, access),
-                requested,
-                access,
-            )?;
-        }
-        Ok(resolved)
-    }
-}
-
-fn refuse_unless(permitted: bool, path: &WorkspacePath, access: FileAccess) -> Result<(), FsError> {
-    if permitted {
-        Ok(())
-    } else {
-        Err(FsError::AccessDenied {
-            path: path.display(),
-            access,
-        })
+        self.workspace.resolve(path, access)
     }
 }
 
@@ -245,23 +169,7 @@ impl FileSystem for LocalFileSystem {
         // The same resolution a write performs, so the answer names the file
         // the write would reach - not a second, possibly different, opinion.
         let target = self.guard(path, None)?;
-        Ok(self.canonical_root.relativize(&target)?)
-    }
-}
-
-/// `lstat` rather than `exists`: `exists` follows symlinks, so a symlink
-/// whose target is missing would count as absent and be written *through* -
-/// creating its target wherever it points.
-fn nearest_existing_ancestor(path: &Path) -> PathBuf {
-    let mut current = path;
-    loop {
-        if std::fs::symlink_metadata(current).is_ok() {
-            return current.to_path_buf();
-        }
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => return PathBuf::from("/"),
-        }
+        Ok(self.workspace.real_root().relativize(&target)?)
     }
 }
 
