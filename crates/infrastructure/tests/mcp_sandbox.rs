@@ -112,7 +112,7 @@ fn landlock() -> SandboxKind {
 }
 
 async fn start(fixture: &Fixture, config: &ServerConfig) -> McpServer {
-    McpServer::start("probe", config, landlock(), &fixture.workspace)
+    McpServer::start("probe", config, landlock(), &fixture.workspace, &[])
         .await
         .expect("the probe server starts")
 }
@@ -366,7 +366,15 @@ async fn a_crashed_server_fails_every_later_call() {
 async fn start_failure(fixture: &Fixture, script: &str) -> McpStartError {
     let path = fixture.script.with_file_name("broken.sh");
     std::fs::write(&path, script).unwrap();
-    match McpServer::start("broken", &config(&path), landlock(), &fixture.workspace).await {
+    match McpServer::start(
+        "broken",
+        &config(&path),
+        landlock(),
+        &fixture.workspace,
+        &[],
+    )
+    .await
+    {
         Ok(_) => panic!("the server must not start"),
         Err(error) => error,
     }
@@ -414,7 +422,7 @@ read -r line
 #[tokio::test]
 async fn an_empty_configuration_starts_nothing_and_needs_no_sandbox() {
     let config = McpConfig::parse(r#"{"servers": {}}"#).unwrap();
-    let servers = start_servers(&config, SandboxRequirement::Isolated, Path::new("/"))
+    let servers = start_servers(&config, SandboxRequirement::Isolated, Path::new("/"), &[])
         .await
         .unwrap();
     assert!(servers.is_empty());
@@ -430,9 +438,14 @@ async fn a_requirement_the_platform_cannot_meet_fails_before_any_server_runs() {
     .unwrap();
 
     // Stronger than Landlock; not implemented on any platform yet.
-    let error = start_servers(&config, SandboxRequirement::Isolated, &fixture.workspace)
-        .await
-        .err()
-        .expect("must refuse to run with less confinement than required");
+    let error = start_servers(
+        &config,
+        SandboxRequirement::Isolated,
+        &fixture.workspace,
+        &[],
+    )
+    .await
+    .err()
+    .expect("must refuse to run with less confinement than required");
     assert!(matches!(error, McpStartError::Sandbox { .. }), "{error:?}");
 }

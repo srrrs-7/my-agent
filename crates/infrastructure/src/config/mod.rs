@@ -580,17 +580,14 @@ impl Settings {
             .find_map(|root| spellings(&dir).find_map(|dir| root.relativize(&dir).ok()))
     }
 
-    /// Every secret value this process holds, for the redactor that scrubs
-    /// tool output and notifications: the provider keys, the webhook URL, and
-    /// the value of every variable in `environment` whose name the command
-    /// sandbox would keep from a child process.
+    /// The secrets the operator configured: every provider key and the parts
+    /// of the webhook URL that grant access.
     ///
-    /// The environment is passed in (`SystemEnv.vars()` in production) for
-    /// the same reason the settings are read through an [`EnvSource`]. It
-    /// matters beyond the variables this program reads: `.env` is loaded into
-    /// the process environment at startup, so whatever else it holds - a
-    /// `GITHUB_TOKEN`, a database password - is in there too.
-    pub fn secrets(&self, environment: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+    /// Besides being redacted, these are withheld from child processes by
+    /// value - whichever variable holds one - so that a setting such as
+    /// `AGENT_NOTIFY_WEBHOOK_URL` needs no second list of names to stay out of
+    /// a command's environment.
+    pub fn configured_secrets(&self) -> Vec<String> {
         let mut secrets: Vec<String> = self
             .llm
             .providers
@@ -600,6 +597,22 @@ impl Settings {
         if let Some(url) = &self.notify.webhook {
             secrets.extend(url.secrets(self.notify.format));
         }
+        secrets
+    }
+
+    /// Every secret value this process holds, for the redactor that scrubs
+    /// tool output and notifications: [`Self::configured_secrets`], and the
+    /// value of every variable in `environment` whose name the command sandbox
+    /// would keep from a child process - when the value itself looks like a
+    /// secret (see `exec::env::secret_values`).
+    ///
+    /// The environment is passed in (`SystemEnv.vars()` in production) for
+    /// the same reason the settings are read through an [`EnvSource`]. It
+    /// matters beyond the variables this program reads: `.env` is loaded into
+    /// the process environment at startup, so whatever else it holds - a
+    /// `GITHUB_TOKEN`, a database password - is in there too.
+    pub fn secrets(&self, environment: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+        let mut secrets = self.configured_secrets();
         secrets.extend(crate::exec::env::secret_values(environment));
         secrets
     }
@@ -1767,6 +1780,44 @@ mod tests {
         for secret in ["LOCALKEY", "CLOUDKEY", "private-topic"] {
             assert!(!shown.contains(secret), "`{secret}` survived: {shown}");
         }
+    }
+
+    #[test]
+    fn a_configured_key_is_redacted_but_a_guessed_dictionary_word_is_not() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            // Short and plain, but the operator said it is a key.
+            ("AGENT_API_KEY", "abcdefgh"),
+        ])
+        .unwrap();
+        let environment = [
+            ("POSTGRES_PASSWORD", "postgres"),
+            ("OPENAI_API_KEY", "sk-proj-AbC123dEf456"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+
+        let redactor = crate::tools::Redactor::new(settings.secrets(environment));
+        assert_eq!(
+            redactor.redact("key abcdefgh, db postgres, other sk-proj-AbC123dEf456"),
+            "key [REDACTED], db postgres, other [REDACTED]",
+        );
+    }
+
+    #[test]
+    fn configured_secrets_hold_the_webhook_but_nothing_from_the_environment() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            (
+                "AGENT_NOTIFY_WEBHOOK_URL",
+                "https://ntfy.sh/private-topic-789",
+            ),
+        ])
+        .unwrap();
+        let configured = settings.configured_secrets();
+        assert!(
+            configured.contains(&"https://ntfy.sh/private-topic-789".to_string()),
+            "{configured:?}"
+        );
     }
 
     #[test]

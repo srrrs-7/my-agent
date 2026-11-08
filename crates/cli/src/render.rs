@@ -244,6 +244,14 @@ impl TerminalRenderer {
                 self.paint(YELLOW, &describe_dependency_files(&name.to_string(), files))
             }
 
+            AgentEvent::DependencyCheckIncomplete { name, limit } => self.paint(
+                YELLOW,
+                &format!(
+                    "! {name}: dependency check incomplete - the workspace scan stopped \
+                     after {limit} entries, so a dependency change may have gone unreported"
+                ),
+            ),
+
             AgentEvent::RunFinished {
                 reason,
                 iterations,

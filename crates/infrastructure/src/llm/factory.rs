@@ -14,7 +14,7 @@ use super::{
     RetryingProvider, RoutingProvider, StaticRouter, TaskKindRouter,
 };
 
-/// Assembles `Route({ id: Failover(Retry(client), [Retry(fallback)...]) })`.
+/// Assembles `Route({ id: Failover(Retry(client), [Retry(fallback)...]).with_probe(client) })`.
 ///
 /// Each client is retried on its own, so failover (see
 /// [`super::failover`]) crosses destinations only once a destination's own
@@ -31,17 +31,17 @@ pub fn build_provider(settings: &LlmSettings) -> Result<Arc<dyn LlmProvider>, Ll
         ));
     }
 
-    let retried = settings
+    let clients = settings
         .providers
         .iter()
         .map(|provider| {
-            let client = build_client(provider, settings)?;
+            let bare = build_client(provider, settings)?;
             let retried: Arc<dyn LlmProvider> =
-                Arc::new(RetryingProvider::new(client, settings.max_retries));
-            Ok((provider.id.clone(), retried))
+                Arc::new(RetryingProvider::new(bare.clone(), settings.max_retries));
+            Ok((provider.id.clone(), Client { retried, bare }))
         })
         .collect::<Result<BTreeMap<_, _>, LlmError>>()?;
-    let destinations = with_failover(&retried, settings)?;
+    let destinations = with_failover(&clients, settings)?;
 
     let router: Arc<dyn LlmRouter> = match settings.router {
         RouterKind::Static => Arc::new(StaticRouter::new(settings.default_provider.clone())),
@@ -65,10 +65,17 @@ pub fn build_provider(settings: &LlmSettings) -> Result<Arc<dyn LlmProvider>, Ll
     Ok(Arc::new(RoutingProvider::new(destinations, router)))
 }
 
+/// One provider's client, with and without its retry layer.
+struct Client {
+    retried: Arc<dyn LlmProvider>,
+    /// For the failover probe, which must not pay for retries.
+    bare: Arc<dyn LlmProvider>,
+}
+
 /// One destination per provider, each backed by the failover chain minus
 /// itself. A destination with nothing to fail over to stays unwrapped.
 fn with_failover(
-    retried: &BTreeMap<ProviderId, Arc<dyn LlmProvider>>,
+    clients: &BTreeMap<ProviderId, Client>,
     settings: &LlmSettings,
 ) -> Result<Vec<Arc<dyn LlmProvider>>, LlmError> {
     let chain = settings
@@ -76,28 +83,34 @@ fn with_failover(
         .failover
         .iter()
         .map(|id| {
-            retried.get(id).cloned().ok_or_else(|| {
-                LlmError::Configuration(format!("failover provider `{id}` is not configured"))
-            })
+            clients
+                .get(id)
+                .map(|client| client.retried.clone())
+                .ok_or_else(|| {
+                    LlmError::Configuration(format!("failover provider `{id}` is not configured"))
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(retried
+    Ok(clients
         .iter()
-        .map(|(id, primary)| {
+        .map(|(id, client)| {
             let fallbacks: Vec<_> = chain
                 .iter()
                 .filter(|fallback| fallback.id() != *id)
                 .cloned()
                 .collect();
             if fallbacks.is_empty() {
-                primary.clone()
+                client.retried.clone()
             } else {
-                Arc::new(FailoverProvider::new(
-                    primary.clone(),
-                    fallbacks,
-                    settings.routing.failover_cooldown,
-                )) as Arc<dyn LlmProvider>
+                Arc::new(
+                    FailoverProvider::new(
+                        client.retried.clone(),
+                        fallbacks,
+                        settings.routing.failover_cooldown,
+                    )
+                    .with_probe(client.bare.clone()),
+                ) as Arc<dyn LlmProvider>
             }
         })
         .collect())

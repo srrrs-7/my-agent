@@ -25,7 +25,7 @@ use agent_domain::model::context::ContextSnapshot;
 use agent_domain::model::llm::ModelId;
 use agent_domain::ports::command::CommandRunner;
 use agent_domain::ports::events::{EventSink, NullEventSink};
-use agent_infrastructure::config::{ApprovalPolicy, Settings, ShellSettings, SystemEnv};
+use agent_infrastructure::config::{ApprovalPolicy, Settings, SystemEnv};
 use agent_infrastructure::exec::{ExecConfig, SandboxRequirement, SandboxedCommandRunner};
 use agent_infrastructure::fs::{LocalFileSystem, ScratchDir};
 use anyhow::{Context, Result};
@@ -67,7 +67,7 @@ pub async fn execute(cli: &Cli, args: &EvalArgs) -> Result<ExitCode> {
         .iter()
         .any(|prepared| prepared.task.has_command_checks());
     let plan = Plan {
-        checks: has_command_checks.then(|| check_config(&settings.shell)),
+        checks: has_command_checks.then(|| check_config(&settings)),
         settings,
         model: cli.model.as_deref().map(ModelId::new),
         environment: SystemEnv.vars(),
@@ -215,7 +215,8 @@ fn adapt_settings(settings: &mut Settings, out: &Path) -> Result<()> {
 /// would. `none` is raised to `confined` rather than honoured: it is a
 /// statement about the model's own commands, made by an operator who trusts
 /// the container, and a check is not an occasion to extend it.
-fn check_config(shell: &ShellSettings) -> ExecConfig {
+fn check_config(settings: &Settings) -> ExecConfig {
+    let shell = &settings.shell;
     ExecConfig {
         sandbox: match shell.sandbox {
             SandboxRequirement::Disabled => SandboxRequirement::Confined,
@@ -223,6 +224,7 @@ fn check_config(shell: &ShellSettings) -> ExecConfig {
         },
         extra_writable: shell.extra_writable.clone(),
         allowed_domains: shell.allowed_domains.clone(),
+        withheld: settings.configured_secrets(),
     }
 }
 

@@ -42,6 +42,9 @@ pub(crate) struct ConfinementPolicy {
     /// Loopback port of this child's egress proxy. `None` means no network:
     /// no proxy variables, and no connectable port.
     pub proxy_port: Option<u16>,
+    /// The operator's configured secrets. A variable holding one is removed
+    /// from the child's environment whatever it is called.
+    pub withheld: Vec<String>,
 }
 
 /// Confines `command`, which the caller has already given its program,
@@ -56,7 +59,7 @@ pub(crate) fn confine_command(
     mut command: Command,
     policy: &ConfinementPolicy,
 ) -> Result<Command, CommandError> {
-    env::scrub(&mut command);
+    env::scrub(&mut command, &policy.withheld);
 
     // Point every temp convention at the scratch directory the sandbox
     // actually allows, or the first thing a toolchain does is fail.
@@ -153,6 +156,7 @@ wait
             writable: vec![own.to_path_buf()],
             scratch: own.to_path_buf(),
             proxy_port: None,
+            withheld: Vec::new(),
         };
         let mut command = Command::new("/bin/sh");
         command

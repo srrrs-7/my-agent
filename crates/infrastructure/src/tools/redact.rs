@@ -29,6 +29,11 @@ pub const REDACTED: &str = "[REDACTED]";
 /// Values shorter than this are not treated as secrets: they would also
 /// match ordinary text, and a redactor that mangles every third word gets
 /// turned off.
+///
+/// This is the floor for secrets the operator configured. Values merely
+/// *guessed* to be secrets from a variable's name face a stricter test before
+/// they get here (`exec::env::secret_values`), because a guess is often an
+/// ordinary word.
 pub const MIN_SECRET_CHARS: usize = 8;
 
 /// A set of known secret values and the replacement of them in text.

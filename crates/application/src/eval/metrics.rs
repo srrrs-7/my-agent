@@ -78,6 +78,7 @@ impl EventSink for MetricsSink {
             | AgentEvent::AssistantDelta { .. }
             | AgentEvent::AssistantMessage { .. }
             | AgentEvent::DependenciesChanged { .. }
+            | AgentEvent::DependencyCheckIncomplete { .. }
             | AgentEvent::PlanUpdated { .. }
             | AgentEvent::RunFinished { .. } => {}
         }
