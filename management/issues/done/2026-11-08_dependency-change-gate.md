@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: medium
 importance: high
 priority: P1
+started: 2026-11-08
+completed: 2026-11-08
 scope: [domain, application, infrastructure, cli, docs]
 ---
 
@@ -53,16 +55,16 @@ scope: [domain, application, infrastructure, cli, docs]
 
 ## 達成条件
 
-- [ ] 対象エコシステム（最初にどれに対応するかは設計で決める。少なくとも Cargo）のマニフェストを
+- [x] 対象エコシステム（最初にどれに対応するかは設計で決める。少なくとも Cargo）のマニフェストを
       `write_file` / `edit_file` で変えると、追加・削除される依存の一覧つきで承認が求められる
-- [ ] `auto` ポリシーでも、`a`（以降すべて許可）と答えた後でも、その承認が出る
-- [ ] 依存の集合が変わらない編集（コメントや無関係なフィールド）では専用の承認が出ない
-- [ ] 拒否するとファイルは変わらず、理由が `is_error` の `tool_result` でモデルに返る
-- [ ] `run_command` の前後でマニフェスト・ロックファイルが変わると、変更内容の警告が stderr と
+- [x] `auto` ポリシーでも、`a`（以降すべて許可）と答えた後でも、その承認が出る
+- [x] ~~依存の集合が変わらない編集（コメントや無関係なフィールド）では専用の承認が出ない~~ → 設計確認で変更: 分類されたファイルの内容が変われば**必ず**聞く（パーサの読み落としを抜け穴にしないため）。依存エントリに差が無いときはその旨を承認画面に表示する
+- [x] 拒否するとファイルは変わらず、理由が `is_error` の `tool_result` でモデルに返る
+- [x] `run_command` の前後でマニフェスト・ロックファイルが変わると、変更内容の警告が stderr と
       モデルへの結果の両方に出る（実プロセスで固定）
-- [ ] 非対話（`agent run`）での扱いが決まっていて、テストで固定されている
-- [ ] 脆弱性照会は既定で無効で、無効のとき外向きの通信が一切ない。有効時の照会と表示をモックサーバで固定
-- [ ] `make check` が緑
+- [x] 非対話（`agent run`）での扱いが決まっていて、テストで固定されている
+- [x] ~~脆弱性照会は既定で無効~~ → v1 の範囲外（設計確認で別 issue 送り。外向き通信で社内パッケージ名が漏れうるため）。照会は既定で一切行わないで、無効のとき外向きの通信が一切ない。有効時の照会と表示をモックサーバで固定
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -96,3 +98,5 @@ scope: [domain, application, infrastructure, cli, docs]
 - run_command 経由は infrastructure の装飾子 `DependencyWatchTool` を **TimeoutTool の外側**に置き、前後ハッシュ比較（node_modules/target/.git/.venv/vendor は除外、上限超過は注記）。注記は tool_result の**先頭**、端末へは `AgentEvent::DependenciesChanged`。これは検知であり防止ではない、と README に正直に書く
 - OSV 照会は v1 から外し別 issue（既定 Null 実装の形で）
 - root 決定: invariants.md には載せず README / architecture に範囲付きで記載。CI 用の逃げ道は `AGENT_ALLOW_DEPENDENCY_CHANGES=true`（既定 false、ApprovalPolicy とは別）。ask/read-only での二重プロンプトは v1 では許容。シンボリックリンク別名は v1 の既知の穴として記録
+
+- 2026-11-08 完了。逸脱: run_command 経由の注記はファイル名のみ（infrastructure から application のパーサを呼べないため、差分の中身は出ない）。依存承認は Enter=拒否・`a` なし。監視は名前でなく `ToolSafety::Destructive` で選ぶ（将来の MCP ツールも対象）。順序は Redacting(Watch(Timeout(tool)))。既知の穴: シンボリック/ハードリンクの別名、run_command 中の Ctrl-C は事後スキャンを飛ばす、preview と execute の間の TOCTOU

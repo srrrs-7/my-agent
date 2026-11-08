@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use agent_domain::error::ToolError;
-use agent_domain::model::tool::{ToolDefinition, ToolName, ToolOutcome, ToolSafety};
+use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::search::{FileSearcher, SearchQuery};
 use agent_domain::ports::tool::Tool;
@@ -86,6 +86,11 @@ impl Tool for SearchFilesTool {
             }),
             safety: ToolSafety::ReadOnly,
         }
+    }
+
+    async fn preview(&self, _arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+        // Reads only.
+        Ok(Vec::new())
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {

@@ -33,12 +33,12 @@
 |---|---|
 | `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider`, `FailoverProvider` |
 | `LlmRouter` | `StaticRouter`, `ModelPrefixRouter`, `TaskKindRouter` |
-| `Tool` | `application/src/tools/{file,web,exec}/*`（実装）, `TimeoutTool`・`RedactingTool`（装飾） |
+| `Tool` | `application/src/tools/{file,web,exec,plan}/*`（実装）, `TimeoutTool`・`RedactingTool`・`DependencyWatchTool`（装飾） |
 | `FileSystem` | `LocalFileSystem` |
 | `FileSearcher` | `IgnoreAwareSearcher` |
 | `ContextProvider` | `WorkspaceContextProvider` |
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`（差し替え）, `AppendingPromptBuilder`（追記・装飾） |
-| `ApprovalGate` | `CliApprovalGate` |
+| `ApprovalGate` | `CliApprovalGate`（`authorize_dependency_change` は既定で拒否） |
 | `WebFetcher` | `GuardedWebFetcher`（SSRF ガード付き・既定無効） |
 | `CommandRunner` | `SandboxedCommandRunner`（Linux: Landlock + egress プロキシ・既定無効） |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` |
@@ -68,6 +68,22 @@ Arc<dyn LlmProvider>
 「どこで切ってよいか」は `tool_call` / `tool_result` の対を壊さないという不変条件
 （`invariants.md` §4）そのものだからです。**要約の中身を決めるコードを domain に置かないでください** —
 それはユースケースです。
+
+## `Tool::preview` と依存の承認
+
+`Tool::preview` は「この引数で書き込むファイルと、書き込み後の内容」を返します。**既定実装はありません。**
+
+- ファイルを書くツールは、`execute` と同じ計算（共通の関数）で予定を返す。承認された内容と書かれる内容がずれないように
+- 書かないツール（読み取り・コマンド・ネットワーク）は空の `Vec` を返す
+- **装飾子は必ず内側に転送する**。空を返すと、その装飾子越しの書き込みが依存の承認を素通りする
+  （`composition.rs` のテストが Redacting(Timeout(write_file)) で固定）
+
+ディスパッチャは Phase 2 の各 invoke 直前に `preview` を呼び、依存ファイル（`ManifestKind::classify`）の
+中身が変わるなら `ApprovalGate::authorize_dependency_change` を呼びます。差分の説明は
+`application/src/supply_chain/` です。**説明の成否で承認を飛ばす分岐を書かないでください。**
+
+コマンド経由の変更は `DependencyWatchTool`（infrastructure）が事後に検知します。包む対象は
+**安全区分が `Destructive` のツールすべて**で、名前では選びません。`TimeoutTool` の外側・`RedactingTool` の内側に置きます。
 
 ## ループとディスパッチャの分割
 

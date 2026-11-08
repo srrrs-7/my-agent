@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use agent_application::AppError;
 use agent_application::agent::AgentOutcome;
 use agent_domain::error::LlmError;
-use agent_domain::ports::approval::ApprovalRequest;
+use agent_domain::ports::approval::{ApprovalRequest, DependencyApprovalRequest};
 use agent_domain::ports::events::FinishReason;
 use agent_domain::ports::notify::{Notification, NotificationEvent, NotificationKind, Notifier};
 use agent_infrastructure::config::NotifySettings;
@@ -80,6 +80,22 @@ impl NotifyPolicy {
 /// (up to several kilobytes of file contents, a shell command, a URL), and
 /// none of that should reach a chat channel unread.
 pub fn approval_pending(session_id: &str, request: &ApprovalRequest) -> Notification {
+    Notification {
+        session_id: session_id.to_string(),
+        event: NotificationEvent::ApprovalPending {
+            tool: request.call.name.clone(),
+            safety: request.safety,
+        },
+    }
+}
+
+/// The notification for a dependency-change prompt. The same event as any
+/// other prompt, with the same omission: the dependency list names packages
+/// and file paths, and stays on this machine.
+pub fn dependency_approval_pending(
+    session_id: &str,
+    request: &DependencyApprovalRequest,
+) -> Notification {
     Notification {
         session_id: session_id.to_string(),
         event: NotificationEvent::ApprovalPending {
@@ -241,6 +257,12 @@ impl Notifications {
     pub fn approval_pending(&self, request: &ApprovalRequest) {
         let session_id = lock(&self.session_id).clone();
         self.send(approval_pending(&session_id, request));
+    }
+
+    /// A dependency-change prompt is about to wait for the human.
+    pub fn dependency_approval_pending(&self, request: &DependencyApprovalRequest) {
+        let session_id = lock(&self.session_id).clone();
+        self.send(dependency_approval_pending(&session_id, request));
     }
 
     /// The loop returned.

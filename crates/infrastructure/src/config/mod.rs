@@ -362,6 +362,11 @@ fn patterns(reader: &Reader<'_>, key: &str) -> Result<Vec<PathPattern>, ConfigEr
 pub struct Settings {
     pub workspace: PathBuf,
     pub approval: ApprovalPolicy,
+    /// Lets changes to dependency files through without asking. Separate from
+    /// `approval` on purpose: `auto` approves tool calls, and a dependency
+    /// change is a different question that no policy answers by itself. For
+    /// unattended runs (CI) whose operator has decided that ahead of time.
+    pub allow_dependency_changes: bool,
     pub llm: LlmSettings,
     pub agent_loop: LoopSettings,
     pub session: SessionSettings,
@@ -393,6 +398,7 @@ impl Settings {
         Ok(Self {
             workspace,
             approval: reader.parsed("AGENT_APPROVAL", ApprovalPolicy::ReadOnlyAuto)?,
+            allow_dependency_changes: reader.parsed("AGENT_ALLOW_DEPENDENCY_CHANGES", false)?,
             llm: LlmSettings::read(&reader)?,
             agent_loop: LoopSettings::read(&reader)?,
             session: SessionSettings {
@@ -712,6 +718,14 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
     description.insert("workspace".into(), settings.workspace.display().to_string());
     description.insert("approval".into(), settings.approval.as_str().into());
     description.insert(
+        "dependency changes".into(),
+        if settings.allow_dependency_changes {
+            "ALLOWED without asking (AGENT_ALLOW_DEPENDENCY_CHANGES)".to_string()
+        } else {
+            "asked every time, whatever the approval policy".to_string()
+        },
+    );
+    description.insert(
         "web fetch".into(),
         if !settings.web_fetch.enabled {
             "disabled".to_string()
@@ -980,6 +994,23 @@ mod tests {
         let error = settings(&[("AGENT_MODEL", "m"), ("AGENT_SHELL_SANDBOX", "nome")])
             .expect_err("an unknown sandbox setting must abort startup");
         assert!(error.to_string().contains("AGENT_SHELL_SANDBOX"), "{error}");
+    }
+
+    #[test]
+    fn dependency_changes_are_asked_about_unless_explicitly_allowed() {
+        let default = settings(&[("AGENT_MODEL", "m"), ("AGENT_APPROVAL", "auto")]).unwrap();
+        assert!(
+            !default.allow_dependency_changes,
+            "`auto` alone must not let dependency changes through"
+        );
+
+        let allowed = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_ALLOW_DEPENDENCY_CHANGES", "true"),
+        ])
+        .unwrap();
+        assert!(allowed.allow_dependency_changes);
+        assert!(describe(&allowed)["dependency changes"].contains("ALLOWED"));
     }
 
     #[test]

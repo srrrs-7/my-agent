@@ -37,7 +37,7 @@ use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceCo
 use agent_infrastructure::llm::build_provider;
 use agent_infrastructure::notify::WebhookNotifier;
 use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
-use agent_infrastructure::tools::{RedactingTool, Redactor, TimeoutTool};
+use agent_infrastructure::tools::{DependencyWatchTool, RedactingTool, Redactor, TimeoutTool};
 use agent_infrastructure::web::{GuardedWebFetcher, WebFetchConfig};
 use anyhow::{Context, Result};
 
@@ -121,11 +121,10 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             .with_redactor(redactor.clone()),
     );
 
-    let approval: Arc<dyn ApprovalGate> = Arc::new(CliApprovalGate::new(
-        settings.approval,
-        interactive,
-        notifications.clone(),
-    ));
+    let approval: Arc<dyn ApprovalGate> = Arc::new(
+        CliApprovalGate::new(settings.approval, interactive, notifications.clone())
+            .with_dependency_changes_allowed(settings.allow_dependency_changes),
+    );
     let events: Arc<dyn EventSink> = Arc::new(TerminalRenderer::new(cli.verbose, cli.no_color));
 
     let mut tools = build_tools(
@@ -177,7 +176,11 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         None
     };
 
-    // Last, so that a tool registered above can never be missed.
+    // After every tool is registered, so none can be missed. Unconditional:
+    // AGENT_ALLOW_DEPENDENCY_CHANGES skips the question, not the report.
+    let tools = watch_destructive(&tools, &workspace, &events);
+    // Last, so that a tool registered above can never be missed - and so the
+    // dependency note is redacted like the rest of the output.
     let tools = redact_all(&tools, &redactor);
 
     // --- the loop ------------------------------------------------------------
@@ -336,6 +339,28 @@ fn build_tools(
     )
 }
 
+/// Every destructive tool, wrapped so that a change it makes to dependency
+/// files is reported. Chosen by safety rather than by name (see
+/// [`DependencyWatchTool::watches`]), and wrapped outside the timeout so a
+/// call cut off by it is still compared.
+fn watch_destructive(
+    tools: &ToolRegistry,
+    workspace: &Arc<WorkspaceRoot>,
+    events: &Arc<dyn EventSink>,
+) -> Arc<ToolRegistry> {
+    let mut watched = ToolRegistry::new();
+    for definition in tools.definitions() {
+        if let Some(tool) = tools.get(&definition.name) {
+            watched.register(if DependencyWatchTool::watches(&definition) {
+                DependencyWatchTool::wrap(tool, workspace.clone(), events.clone())
+            } else {
+                tool
+            });
+        }
+    }
+    Arc::new(watched)
+}
+
 /// Every registered tool, wrapped so that a known secret never reaches the
 /// model through its output. Outermost, so it also covers the timeout's
 /// error.
@@ -483,6 +508,46 @@ mod tests {
             !prompt.contains("Project rules here."),
             "a replaced prompt carries none of the default sections"
         );
+    }
+
+    /// `preview` has no default, so every decorator must forward it. One that
+    /// answered "no writes" instead would let every manifest edit through it
+    /// skip the dependency approval; this runs the real wrapping.
+    #[tokio::test]
+    async fn a_write_through_every_decorator_still_previews_the_manifest_change() {
+        use agent_domain::model::tool::ToolName;
+        use agent_domain::ports::events::NullEventSink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(canonical.join("Cargo.toml"), "[dependencies]\n").unwrap();
+        let workspace = Arc::new(WorkspaceRoot::new(canonical).unwrap());
+        let file_system = Arc::new(LocalFileSystem::new(workspace.clone(), 1024 * 1024).unwrap());
+        let searcher = Arc::new(IgnoreAwareSearcher::new(workspace.clone()));
+        let events: Arc<dyn EventSink> = Arc::new(NullEventSink);
+
+        let tools = build_tools(
+            file_system,
+            searcher,
+            workspace.clone(),
+            std::time::Duration::from_secs(5),
+        );
+        let tools = watch_destructive(&tools, &workspace, &events);
+        let tools = redact_all(&tools, &Arc::new(Redactor::new(Vec::new())));
+
+        let write = tools.get(&ToolName::new("write_file").unwrap()).unwrap();
+        let planned = write
+            .preview(&serde_json::json!({
+                "path": "Cargo.toml",
+                "content": "[dependencies]\nserde = \"1\"\n",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(planned.len(), 1, "{planned:?}");
+        assert_eq!(planned[0].path.display(), "Cargo.toml");
+        assert_eq!(planned[0].before.as_deref(), Some("[dependencies]\n"));
+        assert!(planned[0].after.contains("serde"));
     }
 
     #[test]

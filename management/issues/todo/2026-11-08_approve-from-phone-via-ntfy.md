@@ -83,3 +83,15 @@ scope: [domain, infrastructure, cli, test-support, docs]
   - `progress/2026-11-08_secret-file-protection.md`（A）
   - `todo/2026-11-08_interrupt-turn-with-ctrl-c.md` — 取り消せる入力待ち
   - `todo/2026-11-08_dependency-change-gate.md`（E）— 依存変更の承認を遠隔でどう見せるか
+
+### 設計確認の結論（2026-11-08 domain-specialist → root 決定）
+
+- **なりすまし対策の本質は「通知トピックを誰が読めるか」**。ntfy の標準アプリのボタンは固定文字列を送るだけなので、承認ごとの HMAC は 1 回限りトークン以上に何も守らない（採らない）
+- v1 必須: ntfy アクセストークン（無ければ起動失敗）+ **起動時に匿名で通知トピックが読めないこと・返信トピックに匿名で書けないことを実際に試して実証**（通らなければ起動失敗。§2「黙って弱くならない」の承認版）。承認ごとトークンは 128bit 以上（/dev/urandom）、定数時間比較・1 回で破棄・期限付き
+- ボタンに載せる書き込みトークンは購読用と分けることを推奨（同一なら起動時に警告）
+- **新ポート `RemoteApprover`**（domain、Null 実装は解決しない future）+ ntfy 実装は infrastructure。競合は `CliApprovalGate::authorize` の「人に聞くと決まった後」で `tokio::select!`。装飾子にしない（承認要否の判定が 2 箇所になる）。トークン等は infrastructure 内に閉じる。`NotificationEvent` に引数・トークンを足さない
+- detail は cli の純粋関数で「伏せ字 → 切り詰め」の順、上限付き。遠隔有効時は `approval_pending` の代わりに `remote.ask` が通知（二重に鳴らさない）
+- 遠隔側の失敗・購読切れ・不正な返事は warn して端末待ちを続ける（拒否にしない）。Ctrl-C は既存の plan ごと drop で正しく動く
+- 購読は通知の前に開始（または since 指定）。長いポーリングには全体 timeout の無い別 client
+- root 決定: 自由文の拒否理由は v1 で削る（偽造理由がプロンプトインジェクションになる）。遠隔有効時は `AGENT_NOTIFY_EVENTS` に関係なく承認待ちを送る。**依存承認は端末のみ**（スマホには「端末で待っています」通知だけ）。「a（以降すべて）」は遠隔不可。時間切れはトークン失効のみ（自動拒否しない）。非対話 `run` は対象外のまま。safety 区分による制限はしない
+- ntfy トークンと返信トピックを Redactor の秘密に加える。README に脅威モデル（承認できるのは通知トピックを読める人、ntfy サーバは信頼前提）

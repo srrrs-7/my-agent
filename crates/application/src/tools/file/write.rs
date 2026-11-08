@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use agent_domain::error::ToolError;
-use agent_domain::model::tool::{ToolDefinition, ToolName, ToolOutcome, ToolSafety};
-use agent_domain::model::workspace::WorkspaceRoot;
+use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
+use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::file_system::FileSystem;
 use agent_domain::ports::tool::Tool;
 use async_trait::async_trait;
@@ -31,6 +31,23 @@ impl WriteFileTool {
 
     fn name() -> ToolName {
         ToolName::new("write_file").expect("static tool name is valid")
+    }
+
+    /// The validated destination and contents. Shared by `preview` and
+    /// `execute` so that what is approved is what gets written.
+    fn target(&self, arguments: Value) -> Result<(WorkspacePath, String), ToolError> {
+        let name = Self::name();
+        let input: Input = parse_arguments(&name, arguments)?;
+
+        let path = self.root.resolve(&input.path).for_tool(&name)?;
+
+        if path.is_root() {
+            return Err(ToolError::invalid_input(
+                &name,
+                "`path` must name a file, not the root",
+            ));
+        }
+        Ok((path, input.content))
     }
 }
 
@@ -62,29 +79,32 @@ impl Tool for WriteFileTool {
         }
     }
 
+    async fn preview(&self, arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+        let (path, content) = self.target(arguments.clone())?;
+        // Missing and unreadable look the same here, and both count as
+        // "different from what will be written" - never as "unchanged".
+        let before = self.file_system.read_to_string(&path).await.ok();
+        Ok(vec![PlannedWrite {
+            path,
+            before,
+            after: content,
+        }])
+    }
+
     async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {
         let name = Self::name();
-        let input: Input = parse_arguments(&name, arguments)?;
-
-        let path = self.root.resolve(&input.path).for_tool(&name)?;
-
-        if path.is_root() {
-            return Err(ToolError::invalid_input(
-                &name,
-                "`path` must name a file, not the root",
-            ));
-        }
+        let (path, content) = self.target(arguments)?;
 
         let existed = self.file_system.exists(&path).await.for_tool(&name)?;
 
         self.file_system
-            .write(&path, &input.content)
+            .write(&path, &content)
             .await
             .for_tool(&name)?;
 
         let action = if existed { "Updated" } else { "Created" };
-        let size = human_bytes(input.content.len() as u64);
-        let lines = input.content.lines().count();
+        let size = human_bytes(content.len() as u64);
+        let lines = content.lines().count();
 
         Ok(
             ToolOutcome::new(format!("{action} `{path}` ({size}, {lines} lines)."))

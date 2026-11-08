@@ -18,7 +18,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use agent_domain::error::ToolError;
-use agent_domain::model::tool::{ToolDefinition, ToolOutcome};
+use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolOutcome};
 use agent_domain::ports::tool::Tool;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -159,6 +159,13 @@ impl Tool for RedactingTool {
         self.inner.definition()
     }
 
+    /// Passed through untouched: a preview goes to the dependency approval
+    /// prompt on this machine's terminal, never to the model, and a secret
+    /// replaced in it would make the shown change differ from the written one.
+    async fn preview(&self, arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+        self.inner.preview(arguments).await
+    }
+
     async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {
         match self.inner.execute(arguments).await {
             Ok(outcome) => Ok(ToolOutcome {
@@ -192,6 +199,10 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 safety: ToolSafety::ReadOnly,
             }
+        }
+
+        async fn preview(&self, _arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+            Ok(Vec::new())
         }
 
         async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {

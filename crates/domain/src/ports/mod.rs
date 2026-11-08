@@ -19,7 +19,7 @@ pub mod session_store;
 pub mod tool;
 pub mod web;
 
-pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
+pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest};
 pub use command::{CommandOutput, CommandRequest, CommandRunner, SandboxKind};
 pub use context::ContextProvider;
 pub use conversation_log::{ConversationLog, NullConversationLog};

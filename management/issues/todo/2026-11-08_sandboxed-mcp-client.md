@@ -95,3 +95,16 @@ CLI を叩く回避策がある（重要度 `medium`）。設定ファイルの�
   - `todo/2026-11-08_interrupt-turn-with-ctrl-c.md` — 実行中の `tools/call` の取り消し
   - `todo/2026-11-08_dependency-change-gate.md`（E）
   - `todo/2026-08-14_composition-root-test-harness.md` — 登録の配線は無テスト
+
+### 設計確認の結論（2026-11-08 domain-specialist → root 決定）
+
+- **最重要: サーバにワークスペースへの書き込みを既定で渡さない**。常駐サーバは呼び出しの合間にも動けるので、AccessPolicy も E の事後検知も迂回して Cargo.toml や .git/hooks を書ける。既定はサーバごとの作業ディレクトリのみ書き込み可、ワークスペース書き込みはサーバ設定で明示したときだけ（その場合 E の監視対象に入る）。読み取りは閉じられない（.env・セッションログを読める）ことを README に明記
+- ポート: domain に中立名の **`ToolServer`**（`server_name` / `sandbox()`＝実際に効いているもの / `tools()`＝起動時固定 / `call`）。stdio + JSON-RPC は `infrastructure/src/mcp/`（内部型は外に出さない、応答は id で振り分け、取り消しは future の drop → `notifications/cancelled`）。Tool としてのアダプタと方針（名前空間・安全分類・無害化・衝突検出）は application（テスト可能な関数に）
+- 名前は `mcp__<server>__<tool>`（サーバ名 `[a-z0-9-]{1,16}`、ツール名は文字種置換・64 文字、呼び出しは生の名前を保持）。**変換後の名前の衝突は起動時に失敗**（registry は黙って上書きするため）
+- 安全分類は一律 `Destructive`（readOnlyHint 等の自己申告は無視）。`preview` は明示的に `Ok(vec![])`
+- 説明文・スキーマは信頼できない入力: 制御文字除去、説明 1 KiB・スキーマサイズ・サーバごと 64 ツールの上限、説明に `[MCP server <name>]` の出所を付ける。出力は v1 で text のみ、`redact_all` の前に登録し `TimeoutTool` で包む
+- サンドボックス: `linux::confine` / `env::scrub` / `EgressProxy` / setsid / `GroupGuard` を流用。**先に refactor-agent で「サンドボックス付き Command の組み立て」を共通関数に切り出す**（`capture::run_capped` は 1 回実行専用）。サーバごとに EgressProxy。得られなければエージェント全体の起動を失敗。macOS は起動失敗（Linux 限定）
+- ライフサイクル: 起動時に initialize → tools/list を 1 回（タイムアウト付き）で固定、`list_changed` は無視。クラッシュ後は以後の call を Execution エラー（v1 は再起動しない）。stderr は読み捨て続ける。1 メッセージ 4 MiB 上限。Drop で stdin を閉じ killpg。ハンドルは Application に保持
+- 秘密: サーバに渡す値は設定で明示し、Redactor の秘密に加える
+- root 決定: `AGENT_MCP_CONFIG` がワークスペース内を指したら起動失敗。起動バイナリがワークスペース内なら起動失敗。initialize 失敗はエージェント全体の起動失敗。MCP のサンドボックス要求は `AGENT_SHELL_SANDBOX` と分け、v1 では none を許さない。名前は中立（ToolServer）。C の遠隔承認の対象に含める
+- v1 で削る: HTTP/SSE、list_changed 追従、自動再起動、text 以外、resources/prompts/sampling、安全分類の上書き、macOS

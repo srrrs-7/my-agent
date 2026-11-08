@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::ToolError;
-use crate::model::tool::{ToolDefinition, ToolOutcome};
+use crate::model::tool::{PlannedWrite, ToolDefinition, ToolOutcome};
 
 /// A capability the agent can offer to the model.
 ///
@@ -14,6 +14,20 @@ use crate::model::tool::{ToolDefinition, ToolOutcome};
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+
+    /// The files `arguments` would make this tool write, and what each would
+    /// contain afterwards - without writing anything.
+    ///
+    /// Tools that write no files through the workspace (readers, commands,
+    /// network calls) return an empty list. There is deliberately no default:
+    /// a decorator that forgot to forward this would otherwise answer "no
+    /// writes" for the tool it wraps, and every write through it would skip
+    /// the dependency approval without a trace. Without a default, the
+    /// omission is a compile error.
+    ///
+    /// An error means "could not tell"; the dispatcher then runs the call,
+    /// which fails the same way for the same reason.
+    async fn preview(&self, arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError>;
 
     /// `arguments` is the raw JSON produced by the model; implementations are
     /// responsible for validating it and returning

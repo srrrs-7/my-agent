@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use agent_domain::error::{FetchError, ToolError};
-use agent_domain::model::tool::{ToolDefinition, ToolName, ToolOutcome, ToolSafety};
+use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
 use agent_domain::ports::tool::Tool;
 use agent_domain::ports::web::WebFetcher;
 use async_trait::async_trait;
@@ -58,6 +58,11 @@ impl Tool for WebFetchTool {
             }),
             safety: ToolSafety::Network,
         }
+    }
+
+    async fn preview(&self, _arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+        // Writes nothing to the workspace.
+        Ok(Vec::new())
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {

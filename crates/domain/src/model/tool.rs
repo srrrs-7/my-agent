@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::DomainError;
+use crate::model::workspace::WorkspacePath;
 
 /// A validated tool name.
 ///
@@ -193,6 +194,26 @@ impl ToolOutcome {
     pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
         self.summary = Some(summary.into());
         self
+    }
+}
+
+/// A file a tool call would write, worked out without writing it.
+///
+/// The dispatcher asks for these right before running a call, so that a
+/// write to a dependency manifest can be shown - and refused - before it
+/// happens. `before` is the file as it is now; `None` when it does not exist
+/// or could not be read, which is treated as "different" rather than "same".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedWrite {
+    pub path: WorkspacePath,
+    pub before: Option<String>,
+    pub after: String,
+}
+
+impl PlannedWrite {
+    /// Whether carrying it out would leave the file as it already is.
+    pub fn is_no_op(&self) -> bool {
+        self.before.as_deref() == Some(self.after.as_str())
     }
 }
 

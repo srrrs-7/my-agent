@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use agent_domain::error::ToolError;
-use agent_domain::model::tool::{ToolDefinition, ToolName, ToolOutcome, ToolSafety};
-use agent_domain::model::workspace::WorkspaceRoot;
+use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
+use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::file_system::FileSystem;
 use agent_domain::ports::tool::Tool;
 use async_trait::async_trait;
@@ -39,47 +39,12 @@ impl EditFileTool {
     fn name() -> ToolName {
         ToolName::new("edit_file").expect("static tool name is valid")
     }
-}
 
-#[async_trait]
-impl Tool for EditFileTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::name(),
-            description: "Replace an exact excerpt in an existing file.\n\
-                          `old_string` must match the file byte for byte and must be unique \
-                          unless `replace_all` is true, so include enough surrounding context. \
-                          Copy it from `read_file` output without the line-number prefix."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path relative to the workspace root."
-                    },
-                    "old_string": {
-                        "type": "string",
-                        "description": "Exact text to replace, including indentation."
-                    },
-                    "new_string": {
-                        "type": "string",
-                        "description": "Replacement text."
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Replace every occurrence instead of requiring a unique match."
-                    }
-                },
-                "required": ["path", "old_string", "new_string"],
-                "additionalProperties": false
-            }),
-            safety: ToolSafety::Mutating,
-        }
-    }
-
-    async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {
+    /// Reads the file and works out the edit without writing it. Shared by
+    /// `preview` and `execute`, so the content a human approves is the
+    /// content that is written, and a call that would fail does so the same
+    /// way in both.
+    async fn plan(&self, arguments: Value) -> Result<Edit, ToolError> {
         let name = Self::name();
         let input: Input = parse_arguments(&name, arguments)?;
 
@@ -132,20 +97,93 @@ impl Tool for EditFileTool {
         } else {
             content.replacen(&input.old_string, &input.new_string, 1)
         };
+        let replaced = if input.replace_all { occurrences } else { 1 };
+        let line = line_of(&content, &input.old_string);
+
+        Ok(Edit {
+            path,
+            before: content,
+            after: updated,
+            replaced,
+            line,
+        })
+    }
+}
+
+/// An edit worked out but not yet written.
+struct Edit {
+    path: WorkspacePath,
+    before: String,
+    after: String,
+    replaced: usize,
+    line: Option<usize>,
+}
+
+#[async_trait]
+impl Tool for EditFileTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::name(),
+            description: "Replace an exact excerpt in an existing file.\n\
+                          `old_string` must match the file byte for byte and must be unique \
+                          unless `replace_all` is true, so include enough surrounding context. \
+                          Copy it from `read_file` output without the line-number prefix."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the workspace root."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace, including indentation."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Replace every occurrence instead of requiring a unique match."
+                    }
+                },
+                "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+            safety: ToolSafety::Mutating,
+        }
+    }
+
+    async fn preview(&self, arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+        let edit = self.plan(arguments.clone()).await?;
+        Ok(vec![PlannedWrite {
+            path: edit.path,
+            before: Some(edit.before),
+            after: edit.after,
+        }])
+    }
+
+    async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {
+        let name = Self::name();
+        let edit = self.plan(arguments).await?;
+        let path = &edit.path;
 
         self.file_system
-            .write(&path, &updated)
+            .write(path, &edit.after)
             .await
             .for_tool(&name)?;
 
-        let replaced = if input.replace_all { occurrences } else { 1 };
-        let line = line_of(&content, &input.old_string);
-        let location = line
+        let location = edit
+            .line
             .map(|line| format!(" at line {line}"))
             .unwrap_or_default();
 
         Ok(ToolOutcome::new(format!(
-            "Replaced {replaced} occurrence(s) in `{path}`{location}."
+            "Replaced {} occurrence(s) in `{path}`{location}.",
+            edit.replaced
         ))
         .with_summary(format!("edited {path}{location}")))
     }

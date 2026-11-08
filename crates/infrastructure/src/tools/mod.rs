@@ -5,8 +5,10 @@
 //! why the application layer can stay executor independent - or that needs to
 //! know this process's configuration, such as which values are secrets.
 
+pub mod dependency_watch;
 pub mod redact;
 pub mod timeout;
 
+pub use dependency_watch::DependencyWatchTool;
 pub use redact::{RedactingTool, Redactor};
 pub use timeout::TimeoutTool;

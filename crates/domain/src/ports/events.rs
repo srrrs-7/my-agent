@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::model::dependency::DependencyFileChange;
 use crate::model::llm::{ModelId, ProviderId, StopReason, TokenUsage};
 use crate::model::plan::Plan;
 use crate::model::tool::{ToolCall, ToolCallId, ToolName, ToolSafety};
@@ -77,6 +78,14 @@ pub enum AgentEvent {
     ToolCallDenied {
         name: ToolName,
         reason: String,
+    },
+    /// A tool call changed dependency files without going through the file
+    /// tools - a command such as `cargo add` or `npm install`. Found by
+    /// comparing the workspace before and after, so it is a report, not a
+    /// question: the change has already happened.
+    DependenciesChanged {
+        name: ToolName,
+        files: Vec<DependencyFileChange>,
     },
     /// The model's work plan changed. Emitted only when it differs from the
     /// one already shown, so a sink can redraw it unconditionally. An empty

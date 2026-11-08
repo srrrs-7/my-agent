@@ -1,6 +1,6 @@
 use agent_domain::error::ToolError;
 use agent_domain::model::plan::{Plan, PlanItem};
-use agent_domain::model::tool::{ToolDefinition, ToolName, ToolOutcome, ToolSafety};
+use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
 use agent_domain::ports::tool::Tool;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -90,6 +90,11 @@ impl Tool for TodoWriteTool {
             }),
             safety: ToolSafety::ReadOnly,
         }
+    }
+
+    async fn preview(&self, _arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+        // The plan lives in the conversation, not in a file.
+        Ok(Vec::new())
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {

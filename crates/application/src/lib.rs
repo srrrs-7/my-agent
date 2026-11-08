@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod error;
+pub mod supply_chain;
 pub mod tools;
 
 pub use agent::{

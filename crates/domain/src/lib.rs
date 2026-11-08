@@ -28,17 +28,24 @@ pub use model::{
     access::{AccessPolicy, FileAccess, PathPattern},
     context::ContextSnapshot,
     conversation::Conversation,
+    dependency::{
+        DependencyChange, DependencyChangeDescription, DependencyFileChange, FileChange,
+        ManifestChange, ManifestKind,
+    },
     llm::{
         ChatRequest, ChatResponse, GenerationParams, ModelId, ProviderCapabilities, ProviderId,
         RequestMetadata, StopReason, TaskKind, TokenUsage,
     },
     message::{ContentBlock, Message, Role},
     plan::{Plan, PlanItem, PlanStatus},
-    tool::{ToolCall, ToolCallId, ToolDefinition, ToolName, ToolOutcome, ToolResult, ToolSafety},
+    tool::{
+        PlannedWrite, ToolCall, ToolCallId, ToolDefinition, ToolName, ToolOutcome, ToolResult,
+        ToolSafety,
+    },
     workspace::{WorkspacePath, WorkspaceRoot},
 };
 pub use ports::{
-    approval::{ApprovalDecision, ApprovalGate, ApprovalRequest},
+    approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest},
     command::{CommandOutput, CommandRequest, CommandRunner, SandboxKind},
     context::ContextProvider,
     conversation_log::{ConversationLog, NullConversationLog},

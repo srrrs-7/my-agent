@@ -48,12 +48,12 @@
 |---|---|---|
 | `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider`, `FailoverProvider` | チャット補完 |
 | `LlmRouter` | `StaticRouter`, `ModelPrefixRouter`, `TaskKindRouter` | 委譲先の選択 |
-| `Tool` | `ReadFileTool` ほか（application）, `TimeoutTool`・`RedactingTool`（装飾） | モデルに公開する能力 |
+| `Tool` | `ReadFileTool` ほか（application）, `TimeoutTool`・`RedactingTool`・`DependencyWatchTool`（装飾） | モデルに公開する能力。`preview` で書き込み予定を返す（§3.6.2） |
 | `FileSystem` | `LocalFileSystem` | サンドボックス化された I/O |
 | `FileSearcher` | `IgnoreAwareSearcher` | `.gitignore` 準拠の内容検索 |
 | `ContextProvider` | `WorkspaceContextProvider` | 環境情報とプロジェクト指示の収集 |
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`, `AppendingPromptBuilder` | システムプロンプトの組み立て方針（既定・差し替え・追記） |
-| `ApprovalGate` | `CliApprovalGate` | human-in-the-loop |
+| `ApprovalGate` | `CliApprovalGate` | human-in-the-loop。依存の変更は `authorize_dependency_change` で別に問う（§3.6.2） |
 | `WebFetcher` | `GuardedWebFetcher` | 外向き HTTP（SSRF ガード・許可リスト・サイズ上限） |
 | `CommandRunner` | `SandboxedCommandRunner` | 子プロセス実行（OS レベルの封じ込め・egress 許可リスト） |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` | 進捗の可観測性 |
@@ -258,6 +258,33 @@ cli 側（`cli/src/ctrl_c.rs`）は「プロンプト待ち → 終了(0) / タ�
 stdin はランタイム外の専用スレッド + チャネルで読むので、中断で放棄した承認プロンプトが次の 1 行を飲み込みません。
 `run_command` の子は drop guard（`infrastructure/src/exec/capture.rs`）が reap 前にプロセスグループごと止めます。
 
+### 3.6.2 依存ファイルの変更を別に承認する
+
+マニフェストとロックファイルへの変更は、次のビルドで実行される第三者のコードを決めます。
+`auto` や「以降すべて許可」の後でも素通りさせないため、通常の承認とは別の問いにしています。
+
+- **判定は domain**（`model/dependency.rs` の `ManifestKind::classify`）。ファイル名を ASCII 小文字で比較し、
+  ディレクトリは問わない。大文字小文字を無視しないファイルシステムでも同じファイルを指しうるため
+- **承認はディスパッチャの Phase 2、各 invoke の直前**。`Tool::preview` で書き込み予定（パス・現在の内容・書き込み後の内容）
+  を受け取り、依存ファイルの中身が変わるなら `ApprovalGate::authorize_dependency_change` を呼ぶ。
+  Phase 1 ではなくここに置くのは、同じターンの先行する書き込みを反映した差分を見せるため。
+  `TimeoutTool` の内側（ツールの execute）に置かないのは、人の応答待ちがツールのタイムアウトで打ち切られるため。
+  中断は通常の承認と同じく「実行していない」になる
+- **`preview` に既定実装はない**。装飾子が転送を忘れると「書き込みなし」と答えて承認を素通りさせるので、
+  忘れたらコンパイルエラーになるようにしている。失敗した `preview` はそのまま invoke に進む（同じ理由で失敗し、何も変えない）
+- **`authorize_dependency_change` の既定は拒否**。この問いを知らないゲートが「全部通す」ゲートにならないため。
+  CLI の実装は対話ならポリシーも approve-all も見ずに必ず聞き、非対話は拒否。`AGENT_ALLOW_DEPENDENCY_CHANGES` は
+  `ApprovalPolicy` とは独立した明示的な逃げ道
+- **聞くかどうかは「分類されたパス + 内容の不一致」だけで決まる**。差分の説明は application の `supply_chain/`
+  （行ベースと serde_json。TOML / YAML のパーサは足さない）が作るが、読めなくても変わった行を見せて必ず聞く
+- **`run_command` は事後検知**。infrastructure の `DependencyWatchTool` が `Destructive` のツールを
+  `TimeoutTool` の外側から包み、前後で依存ファイルのハッシュを比べる。変化は結果の先頭への注記と
+  `AgentEvent::DependenciesChanged` で知らせる。止めるものではない
+- 既知の穴: シンボリックリンク／ハードリンクによる別名。脆弱性 DB の照会は未実装
+
+不変条件（`invariants.md`）には入れていません。保証の強さが経路で違い（ファイルツールは事前、コマンドは事後）、
+「常に成り立つ契約」として書けないためです。
+
 ### 3.7 設定を `EnvSource` 越しに読む
 
 `Settings::from_source(&dyn EnvSource)` が本体で、`from_env()` はその薄いラッパです。
@@ -324,10 +351,11 @@ Anthropic アダプタはこの前置きにキャッシュの印を付けます�
 | 全体 | E2E（`crates/cli/tests/end_to_end.rs`） | HTTP → ループ → 実ファイル書き込み |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/notify_e2e.rs`） | 合成ルート → `run` / `chat` → 終了処理。Webhook 通知の到達・中身・終了コード |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/plan_e2e.rs`） | `todo_write` の登録・承認なしでの実行・stderr への表示・`--resume` での復元・`/reset` |
+| 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/dependency_gate_e2e.rs`） | 非対話の `auto` で `Cargo.toml` の編集が拒否されファイルが変わらない、`AGENT_ALLOW_DEPENDENCY_CHANGES` で通る |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/interrupt_e2e.rs`） | SIGINT で `run` が 130、`chat` はターンだけ止まりプロンプトに戻る、プロンプト待ちの Ctrl-C は 0 |
 
 モックサーバは `crates/test-support` に置いて infrastructure と cli の
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 569 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 632 本）。

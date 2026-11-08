@@ -8,6 +8,7 @@ use std::io::{IsTerminal, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use agent_domain::model::dependency::DependencyFileChange;
 use agent_domain::model::llm::TokenUsage;
 use agent_domain::model::plan::{Plan, PlanStatus};
 use agent_domain::ports::events::{AgentEvent, EventSink, FinishReason};
@@ -206,6 +207,13 @@ impl EventSink for TerminalRenderer {
 
             AgentEvent::PlanUpdated { plan } => self.status(self.checklist(&plan)),
 
+            AgentEvent::DependenciesChanged { name, files } => {
+                self.status(self.paint(
+                    YELLOW,
+                    &describe_dependency_files(&name.to_string(), &files),
+                ));
+            }
+
             AgentEvent::RunFinished {
                 reason,
                 iterations,
@@ -250,6 +258,47 @@ impl TerminalRenderer {
             }
         }
     }
+}
+
+/// Files listed in a dependency warning before the rest are counted.
+const MAX_FILES_SHOWN: usize = 10;
+
+/// The warning for dependency files a call changed without approval.
+fn describe_dependency_files(tool: &str, files: &[DependencyFileChange]) -> String {
+    let mut shown: Vec<String> = files
+        .iter()
+        .take(MAX_FILES_SHOWN)
+        .map(|file| {
+            format!(
+                "{} ({} {})",
+                printable(&file.path),
+                file.kind.label(),
+                file.change.label()
+            )
+        })
+        .collect();
+    if files.len() > MAX_FILES_SHOWN {
+        shown.push(format!("and {} more", files.len() - MAX_FILES_SHOWN));
+    }
+    format!(
+        "! {tool} changed dependency files without approval: {}",
+        shown.join(", ")
+    )
+}
+
+/// `text` with everything that could act on the terminal instead of being
+/// shown replaced by `?`: control characters (escape sequences, carriage
+/// returns that redraw a line, newlines that push the question off screen)
+/// and the bidirectional overrides that make text read differently from what
+/// it is. Used for what came from the model or from a file, wherever a human
+/// decides on the strength of it.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let bidi = matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+            if c.is_control() || bidi { '?' } else { c }
+        })
+        .collect()
 }
 
 /// The plan as a checklist, one item per line, the step in progress
@@ -323,6 +372,34 @@ fn format_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
     use agent_domain::model::plan::PlanItem;
+
+    #[test]
+    fn nothing_that_drives_the_terminal_survives_printable() {
+        let shown = printable("evil\x1b[2J\r\nsafe\u{202E}gnp.exe");
+        assert_eq!(shown, "evil?[2J??safe?gnp.exe");
+    }
+
+    #[test]
+    fn a_dependency_warning_names_the_tool_and_every_file_up_to_a_limit() {
+        use agent_domain::model::dependency::{FileChange, ManifestKind};
+        let files: Vec<DependencyFileChange> = (0..MAX_FILES_SHOWN + 2)
+            .map(|n| DependencyFileChange {
+                path: format!("crate{n}/Cargo.lock"),
+                kind: ManifestKind::CargoLock,
+                change: FileChange::Modified,
+            })
+            .collect();
+        let shown = describe_dependency_files("run_command", &files);
+        assert!(
+            shown.starts_with("! run_command changed dependency files"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("crate0/Cargo.lock (lockfile modified)"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("and 2 more"), "{shown}");
+    }
 
     #[test]
     fn durations_switch_units() {

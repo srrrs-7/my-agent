@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_domain::error::{CommandError, ToolError};
-use agent_domain::model::tool::{ToolDefinition, ToolName, ToolOutcome, ToolSafety};
+use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
 use agent_domain::model::workspace::WorkspacePath;
 use agent_domain::ports::command::{CommandOutput, CommandRequest, CommandRunner};
 use agent_domain::ports::tool::Tool;
@@ -117,6 +117,13 @@ impl Tool for RunCommandTool {
             // nothing about the arguments says whether this one does.
             safety: ToolSafety::Destructive,
         }
+    }
+
+    async fn preview(&self, _arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+        // What a command writes cannot be read off its arguments. Its changes to
+        // dependency files are found afterwards, by comparing the workspace (see
+        // `DependencyWatchTool` in the infrastructure layer).
+        Ok(Vec::new())
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {

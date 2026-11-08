@@ -17,18 +17,31 @@
 //!   finished, and an error saying what happened for the rest. A call that was
 //!   never started and one that was cut off half-way get different texts,
 //!   because only the second can have left something behind.
+//! * **A change to a dependency file is approved on its own, right before it
+//!   is made.** The first approval looks at the call; this one looks at what
+//!   the call would do to `Cargo.toml` or `package-lock.json`, worked out
+//!   against the files as they are when the call is about to run - after
+//!   every earlier call in the turn has run. No policy and no earlier
+//!   "approve everything" answers it for the human (see
+//!   [`ApprovalGate::authorize_dependency_change`]). Only calls that run in
+//!   sequence are checked: the concurrent ones are read-only, and a read-only
+//!   tool plans no writes by definition.
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use agent_domain::model::dependency::{ManifestChange, ManifestKind};
 use agent_domain::model::tool::{ToolCall, ToolDefinition, ToolResult, ToolSafety};
-use agent_domain::ports::approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
+use agent_domain::ports::approval::{
+    ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest,
+};
 use agent_domain::ports::events::{AgentEvent, EventSink};
 use agent_domain::ports::tool::Tool;
 use agent_domain::text;
 use futures::future::join_all;
 
 use super::interrupt::Interrupt;
+use crate::supply_chain;
 use crate::tools::registry::ToolRegistry;
 
 /// What the model is told about a call the interrupt reached before it
@@ -150,7 +163,18 @@ impl ToolDispatcher {
         }
 
         for (index, tool, safety) in sequential {
-            results[index] = Some(self.invoke(tool, &calls[index], safety, interrupt).await);
+            let call = &calls[index];
+            // Guarded like the first approval: an interrupt while this prompt
+            // is open means the human never answered, so nothing runs.
+            let result = match interrupt
+                .guard(self.confirm_dependencies(tool.as_ref(), call, safety))
+                .await
+            {
+                None => ToolResult::error(call, NOT_STARTED),
+                Some(Err(refused)) => refused,
+                Some(Ok(())) => self.invoke(tool, call, safety, interrupt).await,
+            };
+            results[index] = Some(result);
         }
 
         results
@@ -203,6 +227,82 @@ impl ToolDispatcher {
             Err(error) => Plan::Short(ToolResult::error(
                 call,
                 format!("Could not obtain approval for this call: {error}"),
+            )),
+        }
+    }
+
+    /// Asks for the dependency approval if `call` would change a dependency
+    /// file. `Err` carries the result to hand back instead of running it.
+    ///
+    /// Whether to ask depends only on which files change - a classified path
+    /// whose content would differ. The parsed description is what the human
+    /// reads; a file that fails to parse is still asked about.
+    async fn confirm_dependencies(
+        &self,
+        tool: &dyn Tool,
+        call: &ToolCall,
+        safety: ToolSafety,
+    ) -> Result<(), ToolResult> {
+        // A call whose effects cannot be worked out fails the same way when it
+        // runs, and then it has changed nothing - so running it is safe and
+        // gives the model the real error.
+        let Ok(writes) = tool.preview(&call.arguments).await else {
+            return Ok(());
+        };
+
+        let changes: Vec<ManifestChange> = writes
+            .into_iter()
+            .filter(|write| !write.is_no_op())
+            .filter_map(|write| {
+                let kind = ManifestKind::classify(&write.path)?;
+                let description =
+                    supply_chain::describe(kind, write.before.as_deref(), &write.after);
+                Some(ManifestChange {
+                    path: write.path,
+                    kind,
+                    created: write.before.is_none(),
+                    description,
+                })
+            })
+            .collect();
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        let files = changes
+            .iter()
+            .map(|change| format!("`{}`", change.path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let request = DependencyApprovalRequest {
+            call: call.clone(),
+            safety,
+            changes,
+        };
+        match self.approval.authorize_dependency_change(&request).await {
+            Ok(ApprovalDecision::Approve) => Ok(()),
+            Ok(ApprovalDecision::Deny { reason }) => {
+                self.events.emit(AgentEvent::ToolCallDenied {
+                    name: call.name.clone(),
+                    reason: reason.clone(),
+                });
+                Err(ToolResult::error(
+                    call,
+                    format!(
+                        "Not executed: this call changes dependency files ({files}), and the \
+                         change was not approved: {reason}. Nothing was written. Do not retry \
+                         it or make the same change another way (another tool, a command) - \
+                         continue without the new dependency, or tell the user which \
+                         dependencies you need and why, and let them decide."
+                    ),
+                ))
+            }
+            Err(error) => Err(ToolResult::error(
+                call,
+                format!(
+                    "Not executed: this call changes dependency files ({files}), and approval \
+                     for that could not be obtained: {error}. Nothing was written."
+                ),
             )),
         }
     }

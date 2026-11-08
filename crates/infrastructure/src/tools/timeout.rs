@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_domain::error::ToolError;
-use agent_domain::model::tool::{ToolDefinition, ToolOutcome};
+use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolOutcome};
 use agent_domain::ports::tool::Tool;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -35,13 +35,28 @@ impl Tool for TimeoutTool {
         self.inner.definition()
     }
 
+    /// Bounded like `execute`: working out an edit reads the file, and a read
+    /// that hangs would otherwise hang the turn before the call even starts.
+    async fn preview(&self, arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+        match tokio::time::timeout(self.timeout, self.inner.preview(arguments)).await {
+            Ok(result) => result,
+            Err(_) => Err(self.timed_out()),
+        }
+    }
+
     async fn execute(&self, arguments: Value) -> Result<ToolOutcome, ToolError> {
         match tokio::time::timeout(self.timeout, self.inner.execute(arguments)).await {
             Ok(result) => result,
-            Err(_) => Err(ToolError::Timeout {
-                tool: self.inner.definition().name,
-                seconds: self.timeout.as_secs(),
-            }),
+            Err(_) => Err(self.timed_out()),
+        }
+    }
+}
+
+impl TimeoutTool {
+    fn timed_out(&self) -> ToolError {
+        ToolError::Timeout {
+            tool: self.inner.definition().name,
+            seconds: self.timeout.as_secs(),
         }
     }
 }
@@ -63,6 +78,10 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 safety: ToolSafety::ReadOnly,
             }
+        }
+
+        async fn preview(&self, _arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
+            Ok(Vec::new())
         }
 
         async fn execute(&self, _arguments: Value) -> Result<ToolOutcome, ToolError> {
