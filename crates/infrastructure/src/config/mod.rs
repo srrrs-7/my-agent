@@ -16,6 +16,7 @@ mod access;
 mod describe;
 pub mod env;
 pub mod kinds;
+mod permissions;
 pub mod routes;
 
 use std::path::{Path, PathBuf};
@@ -36,6 +37,9 @@ pub use access::AccessSettings;
 pub use describe::describe;
 pub use env::{EnvSource, MapEnv, SystemEnv};
 pub use kinds::{ApprovalPolicy, ProviderKind, RouterKind};
+pub use permissions::{
+    MAX_PERMISSIONS_BYTES, MAX_RULES, PermissionsError, load_permissions, parse_permissions,
+};
 pub use routes::RoutingSettings;
 
 use env::{Reader, provider_from_env};
@@ -587,6 +591,10 @@ pub struct Settings {
     pub web_search: WebSearchSettings,
     pub shell: ShellSettings,
     pub mcp: McpSettings,
+    /// `AGENT_PERMISSIONS`: the absolute path of the operator's permission
+    /// rules, read at startup (see [`load_permissions`]). `None`: no rules,
+    /// the approval policy alone decides.
+    pub permissions: Option<PathBuf>,
     pub notify: NotifySettings,
     pub access: AccessSettings,
     /// Largest file the read tool will load.
@@ -649,6 +657,7 @@ impl Settings {
                     .collect(),
             },
             mcp: McpSettings::read(&reader)?,
+            permissions: permissions::read_permissions_path(&reader)?,
             notify: NotifySettings::read(&reader)?,
             access: AccessSettings::read(&reader)?,
             max_file_bytes: reader.parsed("AGENT_MAX_FILE_BYTES", 2 * 1024 * 1024)?,
@@ -944,6 +953,24 @@ mod tests {
         assert_eq!(
             settings.mcp.config,
             Some(PathBuf::from("/etc/agent/mcp.json"))
+        );
+    }
+
+    #[test]
+    fn the_permission_rules_are_off_by_default_and_need_an_absolute_path() {
+        assert_eq!(settings(&[("AGENT_MODEL", "m")]).unwrap().permissions, None);
+        let error =
+            settings(&[("AGENT_MODEL", "m"), ("AGENT_PERMISSIONS", "rules.json")]).unwrap_err();
+        assert!(error.to_string().contains("AGENT_PERMISSIONS"), "{error}");
+
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_PERMISSIONS", "/etc/agent/permissions.json"),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.permissions,
+            Some(PathBuf::from("/etc/agent/permissions.json"))
         );
     }
 

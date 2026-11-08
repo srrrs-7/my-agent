@@ -208,6 +208,18 @@ impl PathPattern {
         &self.raw
     }
 
+    /// Whether `path` is one this pattern covers, compared the way an
+    /// [`AccessPolicy`] compares it (folded, everything below a matching
+    /// directory included). For rules that reuse the pattern language
+    /// without being part of the access policy.
+    pub fn covers(&self, path: &WorkspacePath) -> bool {
+        let components: Vec<String> = components(path)
+            .iter()
+            .map(|name| file_name::fold(name))
+            .collect();
+        self.matches(&components)
+    }
+
     /// `components` must already be folded.
     fn matches(&self, components: &[String]) -> bool {
         if self.anchored {

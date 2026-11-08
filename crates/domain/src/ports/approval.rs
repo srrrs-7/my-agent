@@ -21,6 +21,11 @@ pub struct ApprovalRequest {
     /// through [`crate::text::printable`] first - there, at the point of
     /// display, so that it happens once and cannot be forgotten upstream.
     pub summary: String,
+    /// A human must answer this one: no approval policy (`auto`, read-only
+    /// auto) and no earlier "approve everything" may answer it for them. Set
+    /// by a gate further out - an operator's `ask` rule - and honoured by the
+    /// gate that talks to the human. The dispatcher always starts it `false`.
+    pub must_ask: bool,
 }
 
 /// A call that is about to change one or more dependency files.

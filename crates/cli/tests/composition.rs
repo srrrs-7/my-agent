@@ -12,13 +12,14 @@ use std::sync::{Arc, Mutex};
 
 use agent_application::agent::Session;
 use agent_cli::composition::{self, Application, Wiring};
-use agent_domain::model::tool::ToolName;
+use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName};
+use agent_domain::ports::approval::{ApprovalDecision, ApprovalRequest};
 use agent_domain::ports::command::CommandRunner as _;
 use agent_domain::ports::events::{AgentEvent, EventSink};
 use agent_domain::ports::tool::Tool;
 use agent_infrastructure::config::{MapEnv, Settings};
 use agent_test_support::{MockLlmServer, RecordingServer, Response};
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// Distinctive, and long enough for the redactor to take it as a secret.
@@ -53,6 +54,8 @@ impl EventSink for RecordingSink {
 /// the agent is assembled.
 struct Setup {
     workspace: TempDir,
+    /// Where operator files go: never inside the workspace.
+    outside: TempDir,
     env: MapEnv,
 }
 
@@ -69,7 +72,12 @@ impl Setup {
             ("AGENT_MAX_RETRIES", "0"),
         ]);
         env.set("AGENT_WORKSPACE", &workspace.path().display().to_string());
-        Self { workspace, env }
+        let outside = tempfile::tempdir().expect("a directory outside the workspace");
+        Self {
+            workspace,
+            outside,
+            env,
+        }
     }
 
     fn with(mut self, key: &str, value: &str) -> Self {
@@ -84,6 +92,15 @@ impl Setup {
 
     fn path(&self) -> &Path {
         self.workspace.path()
+    }
+
+    /// Writes `rules` to a file outside the workspace and points
+    /// `AGENT_PERMISSIONS` at it.
+    fn permissions(self, rules: &str) -> Self {
+        let path = self.outside.path().join("permissions.json");
+        std::fs::write(&path, rules).unwrap();
+        let path = path.display().to_string();
+        self.with("AGENT_PERMISSIONS", &path)
     }
 
     fn write(self, name: &str, contents: &str) -> Self {
@@ -419,4 +436,196 @@ async fn the_session_log_records_a_turn_when_on() {
 async fn the_session_log_writes_nothing_when_off() {
     let files = session_files_after_one_turn("false").await;
     assert!(files.is_empty(), "{files:?}");
+}
+
+// --- the approval stack ---------------------------------------------------------
+
+/// What the whole approval stack says about one call of a registered tool.
+async fn decide(app: &Application, name: &str, arguments: Value) -> ApprovalDecision {
+    let request = ApprovalRequest {
+        call: ToolCall::new(
+            ToolCallId::new("1"),
+            ToolName::new(name).unwrap(),
+            arguments,
+        ),
+        safety: tool(app, name).definition().safety,
+        summary: name.to_string(),
+        must_ask: false,
+    };
+    app.approval.authorize(&request).await.unwrap()
+}
+
+fn refusal(decision: ApprovalDecision) -> String {
+    match decision {
+        ApprovalDecision::Deny { reason } => reason,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+const ALLOW_ALL_WRITES: &str = r#"{"rules": [{"tool": "write_file", "effect": "allow"}]}"#;
+
+#[tokio::test]
+async fn plan_mode_is_outside_the_rules_so_an_allow_cannot_get_past_it() {
+    let setup = Setup::new().permissions(ALLOW_ALL_WRITES);
+    let (app, _) = setup.assemble().await.unwrap();
+    let write = json!({"path": "a.txt", "content": "x"});
+
+    assert!(
+        decide(&app, "write_file", write.clone())
+            .await
+            .is_approved(),
+        "the rule approves without asking, although nobody could be asked"
+    );
+
+    app.plan_mode.set(&mut Session::new("s"), true);
+    let reason = refusal(decide(&app, "write_file", write).await);
+    assert!(reason.contains("plan mode is on"), "{reason}");
+    assert!(
+        decide(&app, "read_file", json!({"path": "a.txt"}))
+            .await
+            .is_approved(),
+        "reading goes on to the ordinary policy, which approves it"
+    );
+}
+
+#[tokio::test]
+async fn an_ask_rule_reaches_the_human_gate_even_under_auto_approval() {
+    let setup = Setup::new()
+        .with("AGENT_APPROVAL", "auto")
+        .permissions(r#"{"rules": [{"tool": "read_file", "path": "private/", "effect": "ask"}]}"#);
+    let (app, _) = setup.assemble().await.unwrap();
+
+    let reason = refusal(decide(&app, "read_file", json!({"path": "private/a.txt"})).await);
+    assert!(
+        reason.contains("permission rules require a human"),
+        "auto approval answered for nobody: {reason}"
+    );
+    assert!(
+        decide(&app, "read_file", json!({"path": "public/a.txt"}))
+            .await
+            .is_approved()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_deny_rule_follows_a_link_to_the_file_it_protects() {
+    let setup = Setup::new().with("AGENT_APPROVAL", "auto").permissions(
+        r#"{"rules": [{"tool": "write_file", "path": "protected/", "effect": "deny"}]}"#,
+    );
+    std::fs::create_dir(setup.path().join("protected")).unwrap();
+    std::fs::write(setup.path().join("protected/real.txt"), "keep").unwrap();
+    std::os::unix::fs::symlink("protected/real.txt", setup.path().join("notes.txt")).unwrap();
+    let (app, _) = setup.assemble().await.unwrap();
+
+    let reason = refusal(
+        decide(
+            &app,
+            "write_file",
+            json!({"path": "notes.txt", "content": "overwritten"}),
+        )
+        .await,
+    );
+    assert!(
+        reason.contains("deny write_file path `protected/`"),
+        "{reason}"
+    );
+    assert!(
+        decide(
+            &app,
+            "write_file",
+            json!({"path": "other.txt", "content": "x"})
+        )
+        .await
+        .is_approved()
+    );
+}
+
+#[tokio::test]
+async fn the_dependency_question_passes_through_every_layer_to_the_human_gate() {
+    let llm = MockLlmServer::start(vec![
+        Response::tool_call("call_1", "edit_file", ADD_TOKIO),
+        Response::assistant_text("Done."),
+    ])
+    .await;
+    let setup = Setup::new()
+        .model(&llm)
+        .with("AGENT_ALLOW_DEPENDENCY_CHANGES", "true")
+        .permissions(r#"{"rules": [{"tool": "edit_file", "effect": "allow"}]}"#)
+        .write("Cargo.toml", MANIFEST);
+    let (app, _) = setup.assemble().await.unwrap();
+
+    app.agent
+        .run(&mut Session::new("composition-test"), "add tokio")
+        .await
+        .unwrap();
+
+    let manifest = std::fs::read_to_string(setup.path().join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains("tokio = \"1\""),
+        "only the innermost gate knows the operator allowed it: {manifest}"
+    );
+}
+
+#[tokio::test]
+async fn a_rules_file_inside_the_workspace_stops_startup() {
+    let setup = Setup::new().write("permissions.json", ALLOW_ALL_WRITES);
+    let inside = setup.path().join("permissions.json").display().to_string();
+    let error = setup
+        .with("AGENT_PERMISSIONS", &inside)
+        .assemble()
+        .await
+        .err()
+        .expect("refused");
+    let message = format!("{error:#}");
+    assert!(message.contains("inside the workspace"), "{message}");
+}
+
+#[tokio::test]
+async fn a_rule_that_allows_commands_stops_startup() {
+    let error = Setup::new()
+        .permissions(r#"{"rules": [{"tool": "run_command", "command": "ls", "effect": "allow"}]}"#)
+        .assemble()
+        .await
+        .err()
+        .expect("refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("only be denied or asked about"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_deny_rules_also_refuse_a_redirect() {
+    let server = MockLlmServer::start(vec![Response::redirect(
+        "302 Found",
+        "http://mirror.blocked.example/copy",
+    )])
+    .await;
+    let setup = Setup::new()
+        .with("AGENT_WEB_FETCH", "true")
+        // The mock is on loopback.
+        .with("AGENT_WEB_FETCH_ALLOW_PRIVATE", "true")
+        .permissions(
+            r#"{"rules": [{"tool": "web_fetch", "domain": "blocked.example", "effect": "deny"}]}"#,
+        );
+    let (app, _) = setup.assemble().await.unwrap();
+
+    let reason = refusal(
+        decide(
+            &app,
+            "web_fetch",
+            json!({"url": "https://blocked.example/"}),
+        )
+        .await,
+    );
+    assert!(reason.contains("blocked.example"), "{reason}");
+
+    // The gate never sees the redirect; the fetcher does.
+    let error = tool(&app, "web_fetch")
+        .execute(json!({"url": server.base_url()}))
+        .await
+        .expect_err("the redirect is refused");
+    assert!(error.to_string().contains("permission rules"), "{error}");
 }

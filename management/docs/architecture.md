@@ -56,7 +56,7 @@
 | `FileSearcher` | `IgnoreAwareSearcher` | `.gitignore` 準拠の内容検索 |
 | `ContextProvider` | `WorkspaceContextProvider` | 環境情報とプロジェクト指示の収集 |
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`, `AppendingPromptBuilder` | システムプロンプトの組み立て方針（既定・差し替え・追記） |
-| `ApprovalGate` | `CliApprovalGate` | human-in-the-loop。依存の変更は `authorize_dependency_change` で別に問う（§3.6.2） |
+| `ApprovalGate` | `CliApprovalGate`, `PlanModeGate`・`RuleGate`（装飾、application） | human-in-the-loop。依存の変更は `authorize_dependency_change` で別に問う（§3.6.2）。積み順は外から `PlanModeGate(HookGate(RuleGate(CliApprovalGate)))`（`HookGate` は未実装）で、装飾はどれも依存の問いを内側へそのまま渡す |
 | `WebFetcher` | `GuardedWebFetcher` | 外向き HTTP（SSRF ガード・許可リスト・サイズ上限） |
 | `CommandRunner` | `SandboxedCommandRunner` | 子プロセス実行（OS レベルの封じ込め・egress 許可リスト） |
 | `ToolServer` | `McpServer` | 長寿命のツールサーバ（MCP over stdio）。サーバは封じ込めの中で動き、ツール一覧は起動時に固定（§3.2.4） |
@@ -438,4 +438,4 @@ domain の値オブジェクト `Plan` が持ち、違反は直さず拒否し�
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 1016 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 1063 本）。

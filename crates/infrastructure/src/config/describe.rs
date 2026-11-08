@@ -174,6 +174,13 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
             ),
         },
     );
+    description.insert(
+        "permission rules".into(),
+        match &settings.permissions {
+            None => "none".to_string(),
+            Some(path) => format!("from {}", path.display()),
+        },
+    );
     description.insert("notify".into(), describe_notify(&settings.notify));
     description.insert(
         "remote approval".into(),

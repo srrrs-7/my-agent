@@ -43,6 +43,9 @@ pub const DENIED: &[&str] = &[
     // Who approves.
     "AGENT_APPROVAL",
     "AGENT_ALLOW_DEPENDENCY_CHANGES",
+    // Which calls go through without asking (an `allow` rule), from a file
+    // outside the workspace.
+    "AGENT_PERMISSIONS",
     // Messages that leave the machine.
     "AGENT_WEB_FETCH",
     "AGENT_WEB_FETCH_ALLOW",
@@ -312,6 +315,7 @@ mod tests {
             "AGENT_WEB_FETCH_ALLOW",
             "AGENT_WEB_FETCH_ALLOW_PRIVATE",
             "AGENT_ALLOW_DEPENDENCY_CHANGES",
+            "AGENT_PERMISSIONS",
             "AGENT_GLOBAL_INSTRUCTIONS",
             "AGENT_SYSTEM_PROMPT_FILE",
             "AGENT_APPEND_SYSTEM_PROMPT",

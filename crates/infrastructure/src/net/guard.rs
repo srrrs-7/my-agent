@@ -195,7 +195,7 @@ impl HostPolicy {
 }
 
 /// `docs.rs` admits `docs.rs` and `foo.docs.rs`, never `evildocs.rs`.
-fn matches_any(host: &str, allowed: &[String]) -> bool {
+pub(crate) fn matches_any(host: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|entry| {
         let entry = entry.trim_start_matches('.').to_ascii_lowercase();
         !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))

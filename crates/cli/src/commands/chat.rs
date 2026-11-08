@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use crate::args::Resume;
 use crate::commands::turn::run_turn;
-use crate::commands::{checkpoint, tools};
+use crate::commands::{checkpoint, plan_mode, tools};
 use crate::composition::Application;
 use crate::ctrl_c::{CtrlC, Sigint, TurnEnd};
 use crate::input::prompt_line;
@@ -21,6 +21,7 @@ use crate::session_id;
 const HELP: &str = "  /reset  start a new conversation\n  \
                       /usage  tokens used so far\n  \
                       /plan   the model's current work plan\n  \
+                      /plan-mode on|off  let the model only read and plan, or act again\n  \
                       /undo   put back the files the last turn changed (the conversation stays)\n  \
                       /rewind [n]  take files and conversation back to before the last n turns\n  \
                       /tools  list the tools the model can call\n  \
@@ -73,6 +74,9 @@ async fn repl(app: &Application, resume: Resume) -> Result<ExitCode> {
         };
         let line = line.trim();
 
+        if plan_mode::handle(app, &mut session, line) {
+            continue;
+        }
         match classify(line) {
             Input::Skip => continue,
             Input::Quit => break,

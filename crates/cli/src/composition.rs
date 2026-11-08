@@ -12,6 +12,7 @@ use agent_application::agent::{
     AgentDependencies, AgentLoop, AgentLoopConfig, AppendingPromptBuilder, DefaultPromptBuilder,
     FixedPromptBuilder,
 };
+use agent_application::approval::{PlanMode, PlanModeGate, RuleGate};
 use agent_application::checkpoint::{CheckpointJournal, CheckpointingTool};
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::exec::RunCommandTool;
@@ -22,6 +23,7 @@ use agent_application::tools::plan::TodoWriteTool;
 use agent_application::tools::server::server_tools;
 use agent_application::tools::web::{WebFetchTool, WebSearchTool};
 use agent_domain::model::llm::{GenerationParams, ModelId};
+use agent_domain::model::permission::{Effect, PermissionRules, SubjectPattern};
 use agent_domain::model::tool::ToolSafety;
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::ApprovalGate;
@@ -36,6 +38,7 @@ use agent_domain::ports::tool::Tool;
 use agent_domain::ports::tool_server::ToolServer;
 use agent_infrastructure::config::{
     ApprovalPolicy, NotifySettings, PromptSettings, Settings, ShellSettings, SystemEnv,
+    load_permissions,
 };
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
@@ -85,6 +88,11 @@ pub struct Application {
     /// What `/undo` and `/rewind` take back. The loop holds it too; `chat`
     /// clears it when the conversation starts over.
     pub checkpoints: Arc<CheckpointJournal>,
+    /// The switch `/plan-mode` flips; the outermost approval gate reads it.
+    pub plan_mode: PlanMode,
+    /// The whole approval stack the loop asks, outermost first:
+    /// `PlanModeGate(RuleGate(CliApprovalGate))` (see `approval_stack`).
+    pub approval: Arc<dyn ApprovalGate>,
 }
 
 /// What differs between the callers of [`assemble`].
@@ -230,11 +238,18 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     );
 
     let remote_approval = remote_approver(&settings.notify, interactive).await?;
-    let approval: Arc<dyn ApprovalGate> = Arc::new(
+    let asks: Arc<dyn ApprovalGate> = Arc::new(
         CliApprovalGate::new(settings.approval, interactive, notifications.clone())
             .with_dependency_changes_allowed(settings.allow_dependency_changes)
             .with_remote(remote_approval.clone()),
     );
+    // Read before any tool is built: `web_fetch`'s deny rules go into the
+    // fetcher as well, where redirects are seen.
+    let permissions = match &settings.permissions {
+        None => PermissionRules::default(),
+        Some(path) => load_permissions(path, workspace.as_path())
+            .context("AGENT_PERMISSIONS cannot be used. Fix the file, or unset the variable")?,
+    };
 
     let checkpoints = Arc::new(CheckpointJournal::new(file_system.clone()));
     let mut tools = build_tools(
@@ -249,6 +264,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     if settings.web_fetch.enabled {
         let fetcher = GuardedWebFetcher::new(WebFetchConfig {
             allowed_domains: settings.web_fetch.allowed_domains.clone(),
+            denied_domains: denied_domains(&permissions, "web_fetch"),
             allow_private: settings.web_fetch.allow_private,
             max_bytes: settings.web_fetch.max_bytes,
             timeout: settings.web_fetch.timeout,
@@ -315,6 +331,11 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     // dependency note is redacted like the rest of the output.
     let tools = Arc::new(redact_all(tools, &redactor));
 
+    // After the last decorator, so a rule previews a write through exactly
+    // the tools the dispatcher runs.
+    let plan_mode = PlanMode::new();
+    let approval = approval_stack(asks, permissions, &tools, &workspace, &plan_mode)?;
+
     // --- the loop ------------------------------------------------------------
     // Disabled means `NullConversationLog`, not a flag the loop checks: there
     // is no "logging is off" branch anywhere above this line.
@@ -336,7 +357,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         AgentDependencies {
             llm: provider.clone(),
             tools: tools.clone(),
-            approval,
+            approval: approval.clone(),
             events,
             context,
             prompt,
@@ -376,7 +397,42 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         tool_servers,
         redactor,
         checkpoints,
+        plan_mode,
+        approval,
     })
+}
+
+/// The approval gates, outermost first: plan mode refuses before anything
+/// else is consulted, then the operator's hooks (not built yet; they go
+/// between the two), then the operator's rules decide whether `asks` - the
+/// gate that puts the question to a human - is consulted at all. Every
+/// layer forwards the dependency question to `asks` untouched.
+fn approval_stack(
+    asks: Arc<dyn ApprovalGate>,
+    permissions: PermissionRules,
+    tools: &Arc<ToolRegistry>,
+    workspace: &Arc<WorkspaceRoot>,
+    plan_mode: &PlanMode,
+) -> Result<Arc<dyn ApprovalGate>> {
+    let rules: Arc<dyn ApprovalGate> = Arc::new(
+        RuleGate::new(asks, permissions, tools.clone(), workspace.clone())
+            .context("AGENT_PERMISSIONS cannot be used. Fix the rule, or unset the variable")?,
+    );
+    Ok(Arc::new(PlanModeGate::new(rules, plan_mode.clone())))
+}
+
+/// The domains `tool`'s `deny` rules name, for an adapter that enforces them
+/// too.
+fn denied_domains(permissions: &PermissionRules, tool: &str) -> Vec<String> {
+    permissions
+        .rules()
+        .iter()
+        .filter(|rule| rule.tool.as_str() == tool && rule.effect == Effect::Deny)
+        .filter_map(|rule| match &rule.subject {
+            Some(SubjectPattern::Domain(domain)) => Some(domain.as_str().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The MCP configuration, when `AGENT_MCP_CONFIG` names one. Checked against

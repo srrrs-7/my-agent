@@ -121,7 +121,7 @@ make eval TASKS=evals/tasks.json > report.json  # タスク集合で評価（下
 make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 ```
 
-`chat` 内のコマンド: `/reset` `/usage` `/plan` `/undo` `/rewind [n]` `/tools` `/help` `/exit`
+`chat` 内のコマンド: `/reset` `/usage` `/plan` `/plan-mode on|off` `/undo` `/rewind [n]` `/tools` `/help` `/exit`
 
 **Ctrl-C** は「今どこにいるか」で意味が変わります（押す速さではなく状態で決まります）。
 
@@ -161,6 +161,69 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 記録はプロセスのメモリ上にだけあります。終了すると消え、`--resume` したセッションでは再開前のターンは
 取り消せません。`/reset` でも消えます。git は使いません（ワークスペース内の `.git/config` 経由で
 サンドボックス外のコードが動きうるため）。履歴の圧縮で要約に畳まれたターンへは `/rewind` できません。
+
+### 計画だけさせる（`/plan-mode`）
+
+`chat` で `/plan-mode on` にすると、モデルは**読む・調べることだけ**ができる状態になります。
+`/plan-mode off` で元に戻ります（引数なしの `/plan-mode` は現在の状態を表示）。
+
+| 種類 | プランモード中 |
+|---|---|
+| 読み取り系（`read_file` / `search_files` / `glob` / `list_directory` / `todo_write`） | 通常どおり |
+| ネットワーク（`web_fetch` / `web_search`） | 通常どおり（通常の承認は出る） |
+| 書き込み・コマンド・MCP ツール | **拒否**。「プランモード中なので計画を示し、ユーザーの切り替えを待つ」とモデルに返る |
+
+判定はツール名ではなく安全区分（`read-only` かどうか）で行うので、後から増えたツールも区分どおりに扱われます。
+ツール一覧とシステムプロンプトは変えません（プロンプトキャッシュを保つため）。切り替えたことは、
+次の発言の先頭にモデル向けの注記として 1 回だけ添えます。権限ルール（下記）で `allow` にしたツールも、
+プランモード中は拒否されます。
+
+切り替えはユーザーのコマンドだけです（モデルが自分で抜けるツールはありません）。`/reset` や `--resume`
+で始めた新しい会話には注記が付かないため、モデルは最初の拒否で知ることになります。
+
+### 権限ルール（`AGENT_PERMISSIONS`）
+
+ツールごと・対象ごとに「確認せず許可（`allow`）」「必ず確認（`ask`）」「拒否（`deny`）」を決められます。
+**運用者のファイルだけ**から読みます: `AGENT_PERMISSIONS` に JSON の**絶対パス**を実環境変数で渡し
+（`.env` からは設定できない）、ファイルがワークスペース内（シンボリックリンクの先を含む）なら起動失敗です。
+ワークスペース内のルールファイルは読みません。
+
+```json
+{
+  "rules": [
+    { "tool": "write_file", "path": "migrations/", "effect": "deny" },
+    { "tool": "edit_file",  "path": "src/",        "effect": "allow" },
+    { "tool": "web_fetch",  "domain": "docs.rs",   "effect": "allow" },
+    { "tool": "run_command", "command": "git push", "effect": "ask" },
+    { "tool": "web_search", "effect": "ask" }
+  ]
+}
+```
+
+| 項目 | 意味 |
+|---|---|
+| `tool` | ツール名（必須）。存在しない名前は起動エラー（`web_fetch` など既定で無効の組み込みツールは書ける） |
+| `effect` | `allow` / `ask` / `deny`（必須） |
+| `path` | ファイル系ツール。`AGENT_DENY_READ` と同じパターン（`*.pem`、`secrets/`、`config/*.yml`。大文字小文字・Unicode の綴り違いも同一視）。**モデルが指定したパスと、書き込みが実際に届くファイル（シンボリックリンクの先）の両方**で照合 |
+| `domain` | `web_fetch` の URL のホスト（`docs.rs` は `*.docs.rs` も含む）。`deny` はリダイレクト先にも効く |
+| `command` | `run_command` のコマンド先頭の単語列（`git push` は `cd x && git push -f` にも一致） |
+| 省略 | そのツールの呼び出しすべて |
+
+- **複数が一致したら最も厳しいもの**: `deny` > `ask` > `allow`（書いた順は関係ない）
+- `allow` は一致したすべての対象（指定パスと実体の両方）が `allow` のときだけ効く。確認を省くだけで、
+  プランモードと依存ファイルの変更確認（§3）は省けない
+- `ask` は `AGENT_APPROVAL=auto` や確認プロンプトの `a`（以降すべて許可）より優先して必ず確認する。
+  非対話の実行では拒否になる
+- `deny` は確認せず拒否し、どのルールで拒否されたかをモデルに返す（ツール失敗として扱われ、ループは続く）
+- 解釈できない対象（`%` エスケープや非 ASCII を含むホストなど）は `deny` / `ask` に一致し、`allow` には一致しない
+- 項目の綴り間違い・未知の項目・1 つのルールに `path` と `domain` を両方書く、などは起動エラー
+
+**`run_command` のルールは安全境界ではなく、誤操作の柵です。** シェルにはクォート・変数・`eval`・
+別のプログラム経由など、先頭一致では見えない書き方がいくらでもあります。そのため `run_command` には
+`deny` と `ask` しか書けません（`allow` は起動エラー）。コマンドの封じ込めは §5 のサンドボックスが担います。
+
+ディレクトリをたどるツール（`search_files` / `glob` / `list_directory`）は**起点のパス**だけで照合します。
+中身を読ませたくないファイルは、ルールではなく `AGENT_DENY_READ`（§5）で守ってください。
 
 ### 中断したセッションを再開する
 
@@ -1178,7 +1241,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 1016 本、外部ネットワークもモデルも不要です。
+テストは 1063 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -1212,7 +1275,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 |---|---|
 | `AGENT_MCP_CONFIG`, `AGENT_MCP_SANDBOX` | 任意のプログラムを起動できる |
 | `AGENT_SHELL`, `AGENT_SHELL_SANDBOX`, `AGENT_SHELL_NETWORK_ALLOW`, `AGENT_SHELL_WRITABLE` | コマンド実行を有効にする・封じ込めを緩める |
-| `AGENT_APPROVAL`, `AGENT_ALLOW_DEPENDENCY_CHANGES` | 人間の承認を省く |
+| `AGENT_APPROVAL`, `AGENT_ALLOW_DEPENDENCY_CHANGES`, `AGENT_PERMISSIONS` | 人間の承認を省く |
 | `AGENT_WEB_FETCH`, `AGENT_WEB_FETCH_ALLOW`, `AGENT_WEB_FETCH_ALLOW_PRIVATE`, `AGENT_WEB_SEARCH`, `AGENT_WEB_SEARCH_API_KEY`, `AGENT_NOTIFY_WEBHOOK_URL` | 外部へ送る経路を開く |
 | `AGENT_NOTIFY_NTFY_TOKEN`, `AGENT_NOTIFY_NTFY_REPLY_TOPIC`, `AGENT_NOTIFY_NTFY_REPLY_TOKEN` | スマホから承認できる人を決める（同梱 `.env` が攻撃者のトークンを差し込めないように） |
 | `AGENT_GLOBAL_INSTRUCTIONS`, `AGENT_SYSTEM_PROMPT_FILE`, `AGENT_APPEND_SYSTEM_PROMPT` | モデルへの指示を差し替える |
@@ -1313,6 +1376,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_SHELL_WRITABLE` | — | ワークスペース外で書き込みを許可するパスのカンマ区切り（外部のビルドキャッシュ用） |
 | `AGENT_MCP_CONFIG` | —（**無効**） | MCP サーバの設定ファイル（JSON、**絶対パス**、ワークスペース外）。§5 参照。ワークスペース内なら起動失敗 |
 | `AGENT_MCP_SANDBOX` | `confined` | MCP サーバに必須とする封じ込め。`confined` \| `isolated`（`AGENT_SHELL_SANDBOX` と同じ意味）。**`none` は指定できない**（`AGENT_SHELL_SANDBOX` とは独立） |
+| `AGENT_PERMISSIONS` | —（ルールなし） | 権限ルールの JSON（**絶対パス**、ワークスペース外）。§3「権限ルール」参照。ワークスペース内・解釈できないルール・`run_command` の `allow` は起動失敗 |
 | `AGENT_PARALLEL_READ_TOOLS` | `true` | 読み取り系ツールの並列実行 |
 
 ### 通知（§3 参照）

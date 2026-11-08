@@ -17,6 +17,7 @@ use agent_test_support::{MockLlmServer, Response};
 fn config() -> WebFetchConfig {
     WebFetchConfig {
         allowed_domains: Vec::new(),
+        denied_domains: Vec::new(),
         allow_private: true, // the mock lives on loopback
         max_bytes: 64 * 1024,
         timeout: Duration::from_secs(5),
@@ -101,6 +102,45 @@ async fn a_redirect_to_a_host_off_the_allowlist_is_blocked() {
 
     assert!(
         matches!(error, FetchError::Blocked { ref reason, .. } if reason.contains("allowlist")),
+        "got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_redirect_to_a_denied_domain_is_blocked() {
+    let server = MockLlmServer::start(vec![Response::redirect(
+        "302 Found",
+        "http://Mirror.Blocked.Example./copy",
+    )])
+    .await;
+
+    // The first hop is a host no rule names; the second is refused before
+    // anything is resolved or connected to.
+    let mut cfg = config();
+    cfg.denied_domains = vec!["blocked.example".to_string()];
+    let error = fetcher(cfg).fetch(server.base_url()).await.unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            FetchError::Blocked { ref reason, .. }
+                if reason.contains("permission rules") && reason.contains("mirror.blocked.example")
+        ),
+        "got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_denied_domain_is_refused_even_on_the_allowlist() {
+    let mut cfg = config();
+    cfg.allowed_domains = vec!["example.com".to_string()];
+    cfg.denied_domains = vec!["internal.example.com".to_string()];
+    let error = fetcher(cfg)
+        .fetch("https://wiki.internal.example.com/")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, FetchError::Blocked { ref reason, .. } if reason.contains("permission rules")),
         "got {error:?}"
     );
 }

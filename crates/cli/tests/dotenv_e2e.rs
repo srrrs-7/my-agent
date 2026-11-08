@@ -83,6 +83,30 @@ async fn the_real_environment_still_turns_it_on() {
     );
 }
 
+#[tokio::test]
+async fn a_dotenv_cannot_name_the_permission_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    // A file that does not exist: had the setting been applied, startup
+    // would have failed on it.
+    std::fs::write(
+        dir.path().join(".env"),
+        format!("{DOTENV}AGENT_PERMISSIONS=/nonexistent/agent-permissions.json\n"),
+    )
+    .unwrap();
+
+    let output = tools(dir.path(), &[]).await;
+    let stderr = text(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "the rules were never read\n--- stderr\n{stderr}"
+    );
+    assert!(
+        stderr.contains("AGENT_PERMISSIONS"),
+        "the operator is told what was ignored: {stderr}"
+    );
+}
+
 /// `agent run hi` in `dir` with exactly `env`, which must name a provider.
 async fn run(dir: &Path, env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent"));

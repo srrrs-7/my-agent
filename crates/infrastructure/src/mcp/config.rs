@@ -361,7 +361,13 @@ impl ServerConfig {
     }
 }
 
-fn refuse_inside(workspace: &Path, resolved: &Path, what: &str) -> Result<(), McpConfigError> {
+/// Shared with every other operator file that decides what the agent may do
+/// (the permission rules): the same reasoning applies to each.
+pub(crate) fn refuse_inside(
+    workspace: &Path,
+    resolved: &Path,
+    what: &str,
+) -> Result<(), McpConfigError> {
     if resolved.starts_with(workspace) {
         return Err(McpConfigError::InsideWorkspace {
             what: what.to_string(),

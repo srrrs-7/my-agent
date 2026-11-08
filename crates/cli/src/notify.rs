@@ -424,6 +424,7 @@ pub(crate) mod tests {
             ),
             safety: ToolSafety::Mutating,
             summary: "write_file(path=\"a.rs\", content=\"API_KEY=sk-live-123\")".into(),
+            must_ask: false,
         }
     }
 

@@ -221,6 +221,7 @@ impl ToolDispatcher {
             call: call.clone(),
             safety,
             summary: summarize(call, safety),
+            must_ask: false,
         };
 
         match self.approval.authorize(&request).await {

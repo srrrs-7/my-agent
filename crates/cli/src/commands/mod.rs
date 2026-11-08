@@ -8,6 +8,7 @@ pub mod chat;
 mod checkpoint;
 pub mod doctor;
 pub mod eval;
+mod plan_mode;
 pub mod run;
 pub mod sessions;
 pub mod tools;

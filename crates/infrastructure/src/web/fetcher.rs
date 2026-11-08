@@ -1,8 +1,9 @@
 //! The guarded web fetcher.
 //!
 //! Every request runs the full gauntlet: lexical URL checks, DNS-resolution
-//! checks, an optional operator allowlist - and again for every redirect hop,
-//! because a permitted host can redirect anywhere. Redirects are therefore
+//! checks, an optional operator allowlist, the operator's denied domains -
+//! and again for every redirect hop, because a permitted host can redirect
+//! anywhere. Redirects are therefore
 //! never followed by the HTTP client itself.
 
 use std::net::IpAddr;
@@ -16,7 +17,7 @@ use tracing::debug;
 use url::Url;
 
 use super::html::html_to_text;
-use crate::net::guard::{DomainScope, HostPolicy, Rejection, RejectionKind};
+use crate::net::guard::{DomainScope, HostPolicy, Rejection, RejectionKind, matches_any};
 
 /// How many redirect hops are followed before giving up. Fixed: a legitimate
 /// documentation URL does not need more, and every hop is re-validated.
@@ -27,6 +28,11 @@ pub struct WebFetchConfig {
     /// Domain suffixes the operator allows (`docs.rs` also admits
     /// `foo.docs.rs`). Empty = any host that passes the address policy.
     pub allowed_domains: Vec<String>,
+    /// Domain suffixes the operator refuses, whatever the allowlist says:
+    /// the `deny` rules for `web_fetch` in `AGENT_PERMISSIONS`. The approval
+    /// gate refuses a URL naming one; this refuses a redirect to one, which
+    /// the gate never sees.
+    pub denied_domains: Vec<String>,
     /// Lifts the private/internal-address policy (intranet use, tests).
     /// Scheme and credential rules still apply.
     pub allow_private: bool,
@@ -92,6 +98,19 @@ impl GuardedWebFetcher {
             .policy
             .check_url(raw)
             .map_err(|rejection| rejected(raw, rejection))?;
+
+        if let Some(url::Host::Domain(name)) = url.host() {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            if matches_any(&name, &self.config.denied_domains) {
+                return Err(FetchError::Blocked {
+                    url: raw.to_string(),
+                    reason: format!(
+                        "host `{name}` is refused by the operator's permission rules \
+                         (AGENT_PERMISSIONS)"
+                    ),
+                });
+            }
+        }
 
         // Resolve and vet every address behind a hostname. IP literals were
         // already vetted lexically.
