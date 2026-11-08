@@ -13,11 +13,11 @@
 use crate::model::context::ContextSnapshot;
 use crate::model::tool::ToolDefinition;
 
-/// Renders the system prompt for one run.
+/// Renders the system prompt for one session.
 ///
 /// Implementations must be deterministic for a given input: the loop builds
-/// the prompt once per run and provider-side prompt caching relies on it being
-/// stable across iterations.
+/// the prompt once per session and provider-side prompt caching relies on it
+/// being byte-identical across every request of that session.
 pub trait PromptBuilder: Send + Sync {
     fn build(&self, context: &ContextSnapshot, tools: &[ToolDefinition]) -> String;
 }

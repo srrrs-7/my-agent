@@ -21,7 +21,7 @@ pub mod retry;
 pub mod routing;
 pub(crate) mod sse;
 
-pub use anthropic::AnthropicProvider;
+pub use anthropic::{AnthropicProvider, PromptCache};
 pub use factory::build_provider;
 pub use openai::OpenAiCompatibleProvider;
 pub use retry::RetryingProvider;

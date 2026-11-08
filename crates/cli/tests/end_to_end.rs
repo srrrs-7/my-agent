@@ -26,7 +26,7 @@ use agent_domain::ports::prompt::PromptBuilder;
 use agent_domain::ports::session_store::SessionStore;
 use agent_infrastructure::config::{LlmSettings, ProviderKind, ProviderSettings, RouterKind};
 use agent_infrastructure::fs::{LocalFileSystem, WorkspaceContextProvider};
-use agent_infrastructure::llm::build_provider;
+use agent_infrastructure::llm::{PromptCache, build_provider};
 use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
 use agent_test_support::{MockLlmServer, Response};
 use async_trait::async_trait;
@@ -105,6 +105,7 @@ impl Fixture {
             router: RouterKind::Static,
             request_timeout: Duration::from_secs(5),
             max_retries: 2,
+            prompt_cache: PromptCache::default(),
         };
 
         // Every harness logs, so that any test can ask what the record kept -

@@ -144,8 +144,7 @@ impl AgentLoop {
         user_input: impl Into<String>,
     ) -> Result<AgentOutcome, AppError> {
         let tools = self.advertised_tools();
-        let snapshot = self.context.snapshot().await?;
-        let system_prompt = self.prompt.build(&snapshot, &tools);
+        let system_prompt = self.system_prompt(session, &tools).await?;
         // A zero budget would silently answer nothing; one round-trip is the
         // smallest thing that can be called a run.
         let limit = self.config.max_iterations.max(1);
@@ -259,6 +258,22 @@ impl AgentLoop {
                 "the stream ended without a completed response".to_string(),
             ),
         ))
+    }
+
+    /// The session's system prompt, rendered on its first run and reused by
+    /// every later one - see [`Session`] for why it is not rebuilt.
+    async fn system_prompt(
+        &self,
+        session: &mut Session,
+        tools: &[ToolDefinition],
+    ) -> Result<String, AppError> {
+        if let Some(prompt) = &session.system_prompt {
+            return Ok(prompt.clone());
+        }
+        let snapshot = self.context.snapshot().await?;
+        let prompt = self.prompt.build(&snapshot, tools);
+        session.system_prompt = Some(prompt.clone());
+        Ok(prompt)
     }
 
     /// Tool definitions to advertise, or none if the provider cannot use them.

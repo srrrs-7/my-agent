@@ -68,13 +68,16 @@ fn build_client(
                     provider.id
                 ))
             })?;
-            Ok(Arc::new(AnthropicProvider::new(
-                provider.id.clone(),
-                provider.base_url.clone(),
-                api_key,
-                provider.model.clone(),
-                settings.request_timeout,
-            )?))
+            Ok(Arc::new(
+                AnthropicProvider::new(
+                    provider.id.clone(),
+                    provider.base_url.clone(),
+                    api_key,
+                    provider.model.clone(),
+                    settings.request_timeout,
+                )?
+                .with_prompt_cache(settings.prompt_cache),
+            ))
         }
     }
 }

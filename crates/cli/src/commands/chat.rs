@@ -8,6 +8,7 @@ use crate::commands::tools;
 use crate::composition::Application;
 use crate::input::prompt_line;
 use crate::notify::DRAIN_TIMEOUT;
+use crate::render::describe_usage;
 use crate::session_id;
 
 const HELP: &str = "  /reset  start a new conversation\n  \
@@ -136,9 +137,8 @@ fn run_meta(app: &Application, session: &mut Session, command: &str) {
             eprintln!("  conversation cleared");
         }
         "usage" => eprintln!(
-            "  {} in / {} out tokens over {} messages",
-            session.usage.input_tokens,
-            session.usage.output_tokens,
+            "  {} over {} messages",
+            describe_usage(&session.usage),
             session.turns()
         ),
         "tools" => tools::execute(app),

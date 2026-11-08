@@ -12,6 +12,9 @@
 //! * `content` may be `null`, a string, or an array of parts.
 //! * newer OpenAI models require `max_completion_tokens` instead of
 //!   `max_tokens`; the field name is configurable.
+//! * prompt caching is automatic where it exists at all, so nothing is sent
+//!   for it. Cache hits come back as `usage.prompt_tokens_details.cached_tokens`
+//!   on servers that report them, and are simply absent elsewhere.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
@@ -230,10 +233,7 @@ fn decode_response(
 
         let usage = response
             .usage
-            .map(|usage| TokenUsage {
-                input_tokens: usage.prompt_tokens.unwrap_or_default(),
-                output_tokens: usage.completion_tokens.unwrap_or_default(),
-            })
+            .map(WireUsage::into_domain)
             .unwrap_or_default();
 
         debug!(provider = %provider, tool_calls = has_tool_calls, "chat completion decoded");
@@ -720,10 +720,35 @@ struct WireResponseFunction {
 
 #[derive(Debug, Deserialize)]
 struct WireUsage {
+    /// The whole prompt, cached part included.
     #[serde(default)]
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+impl WireUsage {
+    fn into_domain(self) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.prompt_tokens.unwrap_or_default(),
+            output_tokens: self.completion_tokens.unwrap_or_default(),
+            cache_read_tokens: self
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+                .unwrap_or_default(),
+            // OpenAI neither reports nor bills cache writes: the cache fills
+            // as a side effect of serving the request.
+            cache_write_tokens: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -865,6 +890,7 @@ mod tests {
             usage: Some(WireUsage {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(3),
+                prompt_tokens_details: None,
             }),
         };
 
@@ -887,6 +913,55 @@ mod tests {
             content_to_text(Some(json!([{"type": "text", "text": "a"}, {"text": "b"}]))),
             Some("ab".to_string())
         );
+    }
+
+    #[test]
+    fn cached_tokens_are_read_as_part_of_the_prompt() {
+        let response: WireResponse = serde_json::from_value(json!({
+            "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 1024, "audio_tokens": 0}
+            }
+        }))
+        .unwrap();
+
+        let usage = provider()
+            .decode(response, ModelId::new("m"))
+            .unwrap()
+            .usage;
+
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: 1200,
+                output_tokens: 30,
+                cache_read_tokens: 1024,
+                cache_write_tokens: 0,
+            },
+            "prompt_tokens already includes the cached part"
+        );
+    }
+
+    #[test]
+    fn servers_without_cache_details_report_no_cache_activity() {
+        for usage in [
+            json!({"prompt_tokens": 10, "completion_tokens": 3}),
+            json!({"prompt_tokens": 10, "completion_tokens": 3, "prompt_tokens_details": null}),
+            json!({"prompt_tokens": 10, "completion_tokens": 3, "prompt_tokens_details": {}}),
+        ] {
+            let response: WireResponse = serde_json::from_value(json!({
+                "choices": [{"message": {"content": "hi"}}],
+                "usage": usage
+            }))
+            .unwrap();
+
+            let decoded = provider().decode(response, ModelId::new("m")).unwrap();
+
+            assert_eq!(decoded.usage.input_tokens, 10, "{usage}");
+            assert!(!decoded.usage.touched_cache(), "{usage}");
+        }
     }
 
     #[test]
