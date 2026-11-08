@@ -20,7 +20,7 @@ use agent_application::tools::file::{
 };
 use agent_application::tools::plan::TodoWriteTool;
 use agent_application::tools::server::server_tools;
-use agent_application::tools::web::WebFetchTool;
+use agent_application::tools::web::{WebFetchTool, WebSearchTool};
 use agent_domain::model::llm::{GenerationParams, ModelId};
 use agent_domain::model::tool::ToolSafety;
 use agent_domain::model::workspace::WorkspaceRoot;
@@ -44,7 +44,7 @@ use agent_infrastructure::mcp::{McpConfig, McpServer, start_servers};
 use agent_infrastructure::notify::{NtfyRemoteApprover, WebhookNotifier};
 use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
 use agent_infrastructure::tools::{DependencyWatchTool, RedactingTool, Redactor, TimeoutTool};
-use agent_infrastructure::web::{GuardedWebFetcher, WebFetchConfig};
+use agent_infrastructure::web::{BraveSearcher, GuardedWebFetcher, WebFetchConfig};
 use anyhow::{Context, Result};
 
 use tracing::warn;
@@ -246,6 +246,16 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
 
         tools.register(TimeoutTool::wrap(
             Arc::new(WebFetchTool::new(Arc::new(fetcher))),
+            settings.agent_loop.tool_timeout,
+        ));
+    }
+
+    // web_search likewise (AGENT_WEB_SEARCH=true): a query is an outbound
+    // message. The settings refuse to enable it without a key.
+    if let Some(key) = settings.web_search.active_key() {
+        let searcher = BraveSearcher::new(key.clone()).context("cannot build the web searcher")?;
+        tools.register(TimeoutTool::wrap(
+            Arc::new(WebSearchTool::new(Arc::new(searcher))),
             settings.agent_loop.tool_timeout,
         ));
     }

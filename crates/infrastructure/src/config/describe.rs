@@ -143,6 +143,14 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         },
     );
     description.insert(
+        "web search".into(),
+        if settings.web_search.active_key().is_some() {
+            "enabled (Brave Search API, key set)".to_string()
+        } else {
+            "disabled".to_string()
+        },
+    );
+    description.insert(
         "run_command".into(),
         if !settings.shell.enabled {
             "disabled".to_string()

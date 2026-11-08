@@ -37,4 +37,7 @@ pub use search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery};
 pub use session_store::{SessionStore, SessionSummary};
 pub use tool::Tool;
 pub use tool_server::{RemoteContent, RemoteTool, RemoteToolOutput, ToolServer};
-pub use web::{FetchedContent, WebFetcher};
+pub use web::{
+    FetchedContent, WebFetcher, WebSearchError, WebSearchHit, WebSearchQuery, WebSearchResults,
+    WebSearcher,
+};

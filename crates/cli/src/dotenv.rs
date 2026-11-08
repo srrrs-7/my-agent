@@ -47,6 +47,10 @@ pub const DENIED: &[&str] = &[
     "AGENT_WEB_FETCH",
     "AGENT_WEB_FETCH_ALLOW",
     "AGENT_WEB_FETCH_ALLOW_PRIVATE",
+    "AGENT_WEB_SEARCH",
+    // With the switch already on in the real environment, a key from `.env`
+    // would choose whose account every query is sent under.
+    "AGENT_WEB_SEARCH_API_KEY",
     "AGENT_NOTIFY_WEBHOOK_URL",
     // What the model is told to do, from files outside the workspace.
     "AGENT_GLOBAL_INSTRUCTIONS",
@@ -407,6 +411,28 @@ mod tests {
         assert!(
             !is_credential("AGENT_PROVIDER_\u{e9}"),
             "no panic on a short or odd key"
+        );
+    }
+
+    #[test]
+    fn a_dotenv_cannot_turn_on_web_search() {
+        let applied = apply(
+            entries(&[
+                ("AGENT_WEB_SEARCH", "true"),
+                ("AGENT_WEB_SEARCH_API_KEY", "BSA-from-the-repo"),
+                ("agent_web_search", "1"),
+            ]),
+            |_| false,
+            false,
+        );
+        assert!(applied.set.is_empty(), "{applied:?}");
+        assert_eq!(
+            applied.ignored,
+            [
+                "AGENT_WEB_SEARCH",
+                "AGENT_WEB_SEARCH_API_KEY",
+                "agent_web_search"
+            ]
         );
     }
 

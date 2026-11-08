@@ -160,6 +160,47 @@ async fn web_fetch_is_offered_only_when_the_operator_enables_it() {
 }
 
 #[tokio::test]
+async fn web_search_is_not_offered_on_a_key_alone() {
+    let (app, _) = Setup::new()
+        .with("AGENT_WEB_SEARCH_API_KEY", "BSA-0123456789abcdef")
+        .assemble()
+        .await
+        .unwrap();
+
+    assert_eq!(sorted_names(&app), DEFAULT_TOOLS);
+}
+
+#[tokio::test]
+async fn web_search_is_offered_when_the_operator_enables_it_and_asks_first() {
+    let (app, _) = Setup::new()
+        .with("AGENT_WEB_SEARCH", "true")
+        .with("AGENT_WEB_SEARCH_API_KEY", "BSA-0123456789abcdef")
+        .assemble()
+        .await
+        .unwrap();
+
+    let mut expected: Vec<&str> = DEFAULT_TOOLS.to_vec();
+    expected.push("web_search");
+    expected.sort_unstable();
+    assert_eq!(sorted_names(&app), expected);
+    assert!(
+        !tool(&app, "web_search").definition().safety.is_read_only(),
+        "a query leaves the machine, so the default policy must ask"
+    );
+}
+
+#[test]
+fn enabling_web_search_without_a_key_stops_startup() {
+    let setup = Setup::new().with("AGENT_WEB_SEARCH", "true");
+    let error =
+        Settings::from_source(&setup.env).expect_err("searching without a key must not start");
+    assert!(
+        error.to_string().contains("AGENT_WEB_SEARCH_API_KEY"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn run_command_is_offered_only_when_the_operator_enables_the_shell() {
     // `none` is the one requirement every platform satisfies, so this pins
     // the registration rather than the sandbox.

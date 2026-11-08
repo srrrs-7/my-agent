@@ -320,7 +320,7 @@ agent eval evals/tasks.json --repeat 3 --out .agent/eval --keep > report.json
 | `--out DIR` | 会話ログの置き場所。`<DIR>/sessions/` に試行ごとに 1 ファイル（既定 `.agent/eval`） |
 | `--keep` | 試行ごとの作業ディレクトリを消さずに残し、レポートの `scratch_dir` に場所を書く（準備に失敗した試行も含む） |
 | `--allow-mcp` | `AGENT_MCP_CONFIG` の MCP サーバを起動する（既定では起動しない） |
-| `--allow-web` | `AGENT_WEB_FETCH=true` のとき `web_fetch` を渡す（既定では渡さない） |
+| `--allow-web` | 有効化されている `web_fetch` / `web_search` を渡す（既定では渡さない） |
 
 > **信頼できないスイートを実行しないでください。** タスクファイルの `command` 検査は、書かれたコマンドを
 > そのまま実行します（サンドボックス内ですが、任意のコマンド実行と同じです）。他人のタスクファイルは
@@ -481,6 +481,7 @@ jq -s '[.[0].tasks, .[1].tasks] | transpose | map({id: .[0].id, before: .[0].pas
 | `edit_file` | mutating | 完全一致の部分置換。一致 0 件／複数件はエラー |
 | `todo_write` | read-only | 作業計画（手順と pending / in_progress / completed）を丸ごと書き換える。ワークスペースには触れない |
 | `web_fetch` | network | URL の内容をテキスト取得（**既定で無効**。`AGENT_WEB_FETCH=true` で有効化） |
+| `web_search` | network | Brave Search API で検索し、タイトル・URL・抜粋を番号付きで返す（最大 10 件。**既定で無効**。`AGENT_WEB_SEARCH=true` と `AGENT_WEB_SEARCH_API_KEY` で有効化） |
 | `run_command` | destructive | シェルコマンドをサンドボックス内で実行（**既定で無効**。`AGENT_SHELL=true` で有効化） |
 | `mcp__<サーバ>__<ツール>` | destructive | 設定した MCP サーバのツール（**既定で無効**。`AGENT_MCP_CONFIG` で有効化。§5） |
 
@@ -509,6 +510,14 @@ jq -s '[.[0].tasks, .[1].tasks] | transpose | map({id: .[0].id, before: .[0].pas
 - 安全分類は `network` で、既定の承認ポリシーでは**毎回確認**が入り、承認プロンプトに
   URL 全体が表示されます（`AGENT_APPROVAL=auto` では確認が入らない点に注意）
 - 取得内容は指示ではなくデータとしてツール結果でのみモデルに渡ります
+
+`web_search` も同じ理由で**既定で無効**です（検索語は第三者に送るメッセージです）。
+`AGENT_WEB_SEARCH=true` にするには `AGENT_WEB_SEARCH_API_KEY`（Brave Search API のキー）が必要で、
+キーなしで有効化すると起動時にエラーになります。安全分類は `network` で、承認プロンプトに検索語が
+表示されます。結果はタイトル・URL・抜粋だけで、リンク先は辿りません（読むには `web_fetch` が別途
+有効で、その承認を通る必要があります）。結果はデータとしてツール結果でのみ渡り、制御文字・不可視文字は
+取り除かれます。API キーはツール出力から伏せ字にされ、子プロセスにも渡りません。
+`agent eval` では `--allow-web` を付けたときだけ渡します（`web_fetch` と同じ）。
 
 `run_command` も**既定で無効**です。安全分類を `destructive` にしているのは、
 コマンドが必ず破壊的だからではなく、**引数を読んでも破壊的かどうか判断できない**
@@ -1139,7 +1148,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_MCP_CONFIG`, `AGENT_MCP_SANDBOX` | 任意のプログラムを起動できる |
 | `AGENT_SHELL`, `AGENT_SHELL_SANDBOX`, `AGENT_SHELL_NETWORK_ALLOW`, `AGENT_SHELL_WRITABLE` | コマンド実行を有効にする・封じ込めを緩める |
 | `AGENT_APPROVAL`, `AGENT_ALLOW_DEPENDENCY_CHANGES` | 人間の承認を省く |
-| `AGENT_WEB_FETCH`, `AGENT_WEB_FETCH_ALLOW`, `AGENT_WEB_FETCH_ALLOW_PRIVATE`, `AGENT_NOTIFY_WEBHOOK_URL` | 外部へ送る経路を開く |
+| `AGENT_WEB_FETCH`, `AGENT_WEB_FETCH_ALLOW`, `AGENT_WEB_FETCH_ALLOW_PRIVATE`, `AGENT_WEB_SEARCH`, `AGENT_WEB_SEARCH_API_KEY`, `AGENT_NOTIFY_WEBHOOK_URL` | 外部へ送る経路を開く |
 | `AGENT_GLOBAL_INSTRUCTIONS`, `AGENT_SYSTEM_PROMPT_FILE`, `AGENT_APPEND_SYSTEM_PROMPT` | モデルへの指示を差し替える |
 | `AGENT_WORKSPACE` | ファイルツールの届く範囲を変える |
 | `AGENT_SESSION_DIR` | 会話の原文（モデルが読んだファイルの中身を含む）の書き出し先と、保持期間による削除の対象を変える |
@@ -1230,6 +1239,8 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_WEB_FETCH_ALLOW_PRIVATE` | `false` | プライベート帯拒否の解除（イントラネット用。通常は触らない） |
 | `AGENT_WEB_FETCH_MAX_BYTES` | `1048576` | 取得サイズ上限 |
 | `AGENT_WEB_FETCH_TIMEOUT_SECS` | `30` | 取得の上限時間 |
+| `AGENT_WEB_SEARCH` | `false` | `web_search` ツールの有効化（§4 参照）。`AGENT_WEB_SEARCH_API_KEY` なしで `true` にすると起動エラー |
+| `AGENT_WEB_SEARCH_API_KEY` | — | Brave Search API のキー。秘密情報として伏せ字・子プロセスから除外される。設定しただけでは有効にならない |
 | `AGENT_SHELL` | `false` | `run_command` ツールの有効化（§4・§5 参照） |
 | `AGENT_SHELL_SANDBOX` | `confined` | 必須とする封じ込め。`confined`（その OS で使える封じ込め。Linux 6.7+ は Landlock）\| `isolated`（プロキシ以外に到達できない層。**まだどの OS にも実装がなく、常に起動失敗**）\| `none`（封じ込めなし。使い捨てのコンテナ内でのみ）。満たせない環境では**起動失敗**（黙って弱くならない） |
 | `AGENT_SHELL_NETWORK_ALLOW` | —（**通信不可**） | コマンドが到達できるドメインのカンマ区切り。空なら egress プロキシを起動せず全拒否 |
