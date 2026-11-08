@@ -104,11 +104,6 @@ impl Clock for SystemClock {
     }
 }
 
-/// Whether another provider could plausibly serve a request this error failed.
-pub fn is_failover_worthy(error: &LlmError) -> bool {
-    error.is_retryable()
-}
-
 /// What the destination knows about its primary.
 #[derive(Debug, Clone, Copy)]
 struct Health {
@@ -289,7 +284,9 @@ impl FailoverProvider {
                 }
                 Err(error) => error,
             };
-            let worthy = is_failover_worthy(&error);
+            // The errors worth retrying are the ones another provider could
+            // plausibly serve; the rest are configuration bugs.
+            let worthy = error.is_retryable();
             if index == 0 {
                 if !worthy {
                     // A configuration bug on the primary: surfaced, not hidden.
@@ -519,7 +516,7 @@ mod tests {
             api(503),
             api(429),
         ] {
-            assert!(is_failover_worthy(&error), "{error} should fail over");
+            assert!(error.is_retryable(), "{error} should fail over");
         }
         for error in [
             LlmError::Auth("bad key".into()),
@@ -530,7 +527,7 @@ mod tests {
             LlmError::Configuration("x".into()),
         ] {
             assert!(
-                !is_failover_worthy(&error),
+                !error.is_retryable(),
                 "{error} is a configuration bug that failover would hide"
             );
         }
