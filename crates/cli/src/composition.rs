@@ -32,7 +32,7 @@ use agent_domain::ports::session_store::SessionStore;
 use agent_domain::ports::tool::Tool;
 use agent_domain::ports::tool_server::ToolServer;
 use agent_infrastructure::config::{
-    ApprovalPolicy, PromptSettings, Settings, ShellSettings, SystemEnv,
+    ApprovalPolicy, NotifySettings, PromptSettings, Settings, ShellSettings, SystemEnv,
 };
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
@@ -73,10 +73,64 @@ pub struct Application {
     pub tool_servers: Vec<Arc<McpServer>>,
 }
 
+/// What differs between the callers of [`assemble`].
+///
+/// Everything else - the workspace, where the session log goes, which tools
+/// are offered, the approval policy - is in the [`Settings`] passed alongside,
+/// so a caller that wants a different workspace or log directory (a scratch
+/// workspace per eval task, a temporary one in a test) sets
+/// `settings.workspace` / `settings.session.dir` rather than a second copy
+/// here that could disagree with them.
+pub struct Wiring {
+    /// Whether a human can answer an approval prompt. Without one the gate
+    /// denies rather than waiting forever.
+    pub interactive: bool,
+    /// Where the loop narrates what it does.
+    pub events: Arc<dyn EventSink>,
+    /// Overrides the provider's model on every request (`--model`).
+    pub model: Option<ModelId>,
+    /// Environment variables whose secret-looking values are redacted from
+    /// tool output and notifications, on top of the keys in `Settings`.
+    pub environment: Vec<(String, String)>,
+    /// `Some` prunes old session records at startup, sparing the one this
+    /// resume names; `None` leaves the session directory alone.
+    pub retention: Option<Resume>,
+}
+
+/// The agent as `agent` itself runs it: settings from the environment with
+/// the command-line flags on top, narrated to the terminal.
+///
 /// Async because the egress proxy binds a socket at startup - see
 /// [`SandboxedCommandRunner::start`].
 pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
     let settings = resolve_settings(cli)?;
+    assemble(
+        settings,
+        Wiring {
+            interactive,
+            events: Arc::new(TerminalRenderer::new(cli.verbose, cli.no_color)),
+            model: cli.model.as_deref().map(ModelId::new),
+            // Read after `main` loaded `.env`, so its variables are among the
+            // environment's.
+            environment: SystemEnv.vars(),
+            retention: Some(cli.resolve_command().resume()),
+        },
+    )
+    .await
+}
+
+/// Wires the whole agent from resolved settings.
+///
+/// The one place every subcommand's agent is built, so that what a test or
+/// an eval run exercises is the wiring `agent run` uses, not a copy of it.
+pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application> {
+    let Wiring {
+        interactive,
+        events,
+        model,
+        environment,
+        retention,
+    } = wiring;
 
     // --- workspace sandbox ---------------------------------------------------
     let canonical = std::fs::canonicalize(&settings.workspace).with_context(|| {
@@ -99,11 +153,10 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
     // credential, and the server can echo it back.
     let mcp_config = load_mcp_config(&settings, workspace.as_path())?;
     // One instance for tool output and for notifications: a secret hidden
-    // from the model must not leave by the other door. Read after `main`
-    // loaded `.env`, so its variables are among the environment's.
+    // from the model must not leave by the other door.
     let redactor = Arc::new(Redactor::new(
         settings
-            .secrets(SystemEnv.vars())
+            .secrets(environment)
             .into_iter()
             .chain(mcp_config.iter().flat_map(McpConfig::secret_values)),
     ));
@@ -134,15 +187,8 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
 
     // No URL means `NullNotifier`, not a flag: nothing above this line has a
     // "notifications are off" branch, and nothing is ever sent.
-    let notifier: Arc<dyn Notifier> = match &settings.notify.webhook {
-        Some(url) => Arc::new(
-            WebhookNotifier::new(
-                url,
-                settings.notify.format,
-                agent_infrastructure::notify::DEFAULT_TIMEOUT,
-            )
-            .context("cannot set up webhook notifications")?,
-        ),
+    let notifier: Arc<dyn Notifier> = match webhook(&settings.notify)? {
+        Some(webhook) => Arc::new(webhook),
         None => Arc::new(NullNotifier),
     };
     let notifications = Arc::new(
@@ -154,7 +200,6 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         CliApprovalGate::new(settings.approval, interactive, notifications.clone())
             .with_dependency_changes_allowed(settings.allow_dependency_changes),
     );
-    let events: Arc<dyn EventSink> = Arc::new(TerminalRenderer::new(cli.verbose, cli.no_color));
 
     let mut tools = build_tools(
         file_system,
@@ -235,7 +280,9 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
     // The reader is wired unconditionally: turning the log off stops new
     // sessions being written, it does not make the old ones unreadable.
     let store = Arc::new(FileSessionStore::new(settings.session_dir()));
-    apply_retention(&settings, &store, cli).await;
+    if let Some(resume) = &retention {
+        apply_retention(&settings, &store, resume).await;
+    }
     let sessions: Arc<dyn SessionStore> = store;
 
     let prompt = build_prompt_builder(&settings.prompt)?;
@@ -250,7 +297,7 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             log,
         },
         AgentLoopConfig {
-            model: cli.model.as_deref().map(ModelId::new),
+            model,
             params: GenerationParams {
                 temperature: settings.agent_loop.temperature,
                 max_tokens: settings.agent_loop.max_tokens,
@@ -342,14 +389,14 @@ async fn register_tool_servers(
 ///
 /// A failure here is a warning, never a refusal to start. Housekeeping that
 /// could not run is not a reason to withhold the agent.
-async fn apply_retention(settings: &Settings, store: &FileSessionStore, cli: &Cli) {
+async fn apply_retention(settings: &Settings, store: &FileSessionStore, resume: &Resume) {
     if settings.session.retention.keeps_everything() {
         return;
     }
 
-    let protected: Vec<String> = match cli.resolve_command().resume() {
+    let protected: Vec<String> = match resume {
         Resume::No => Vec::new(),
-        Resume::Session(id) => vec![id],
+        Resume::Session(id) => vec![id.clone()],
         // `keep` alone would spare the newest, but `max_age` would not: a
         // session resumed after a long break is old by definition.
         Resume::Latest => store.latest().await.ok().flatten().into_iter().collect(),
@@ -394,6 +441,23 @@ async fn build_command_runner(
     })?;
 
     Ok(Arc::new(runner))
+}
+
+/// The webhook notifications go to, if the operator configured one.
+///
+/// Separate from where `NullNotifier` stands in for it so that "no URL, no
+/// sender" is checkable: behind `Arc<dyn Notifier>` the two look the same.
+fn webhook(settings: &NotifySettings) -> Result<Option<WebhookNotifier>> {
+    let Some(url) = &settings.webhook else {
+        return Ok(None);
+    };
+    let webhook = WebhookNotifier::new(
+        url,
+        settings.format,
+        agent_infrastructure::notify::DEFAULT_TIMEOUT,
+    )
+    .context("cannot set up webhook notifications")?;
+    Ok(Some(webhook))
 }
 
 /// The default toolset, every tool wrapped in a timeout so that one
@@ -534,6 +598,33 @@ mod tests {
     use agent_application::build_system_prompt;
     use agent_domain::model::context::ContextSnapshot;
     use clap::Parser as _;
+
+    fn settings(pairs: &[(&str, &str)]) -> Settings {
+        let mut env = agent_infrastructure::config::MapEnv::new(&[
+            ("AGENT_WORKSPACE", "/workspace"),
+            ("AGENT_PROVIDER", "ollama"),
+            ("AGENT_MODEL", "m"),
+        ]);
+        for (key, value) in pairs {
+            env.set(key, value);
+        }
+        Settings::from_source(&env).unwrap()
+    }
+
+    #[test]
+    fn without_a_webhook_url_no_sender_is_built() {
+        let settings = settings(&[]);
+        assert!(
+            webhook(&settings.notify).unwrap().is_none(),
+            "no URL must mean NullNotifier, so nothing can be sent"
+        );
+    }
+
+    #[test]
+    fn a_webhook_url_builds_the_sender() {
+        let settings = settings(&[("AGENT_NOTIFY_WEBHOOK_URL", "https://ntfy.sh/my-agent-topic")]);
+        assert!(webhook(&settings.notify).unwrap().is_some());
+    }
 
     fn snapshot() -> ContextSnapshot {
         ContextSnapshot {

@@ -4,6 +4,7 @@ created: 2026-08-14
 urgency: high
 importance: high
 priority: P1
+started: 2026-11-08
 scope: [cli, docs]
 ---
 
@@ -83,23 +84,23 @@ E2E テストが名前どおりのものになる — 手で組み直した配�
 
 ## 達成条件
 
-- [ ] 解決済みの `Settings` を渡して `Application` を組み立てられる。
+- [x] 解決済みの `Settings` を渡して `Application` を組み立てられる。
       プロセス環境を触らずに設定を変えたテストが書ける
-- [ ] `agent-test-support` のモックサーバ相手に、**本物の composition で組んだ**
+- [x] `agent-test-support` のモックサーバ相手に、**本物の composition で組んだ**
       `Application` で 1 ターン走らせられる
 - [ ] 在庫の 3 つが塞がる
-  - [ ] `AGENT_SESSION_LOG=false` で 1 バイトも書かれない／`true` で書かれる
+  - [x] `AGENT_SESSION_LOG=false` で 1 バイトも書かれない／`true` で書かれる
   - [ ] `chat::start` が、記録なし・壊れた記録・空の記録のそれぞれで新規セッションを返す
   - [ ] 起動時に保持ポリシーが適用され、`--resume` が名指ししたセッションは残る
-- [ ] 登録されるツールの一覧が、設定（`AGENT_SHELL` / `AGENT_WEB_FETCH`）に応じて
+- [x] 登録されるツールの一覧が、設定（`AGENT_SHELL` / `AGENT_WEB_FETCH`）に応じて
       期待どおりであることを固定する
-- [ ] 要求したサンドボックスが得られないときに起動が失敗することを固定する。
+- [x] 要求したサンドボックスが得られないときに起動が失敗することを固定する。
       **この環境で実証できない場合は、なぜできないかを issue に記録して次善の形にする**
 - [ ] `std::env::set_var` を使っていない（`grep` で確認できる形）
 - [ ] `tests/end_to_end.rs` が手で組んだ配線を捨てて composition を使う。
       **採らない判断をした場合は理由を残す**
-- [ ] README §7 のテストの説明が実態と合っている
-- [ ] `make check` が緑
+- [x] README §7 のテストの説明が実態と合っている
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -139,3 +140,40 @@ E2E テストが名前どおりのものになる — 手で組み直した配�
     `todo/2026-11-08_approve-from-phone-via-ntfy.md`、`todo/2026-11-08_sandboxed-mcp-client.md`
 
 - 2026-11-08: 緊急度を medium → high に変更（score 9）。新規 7 機能が composition.rs に配線を足すため、かつ D（eval）の前提として D の中で先に実施する（root 判断）
+
+- 2026-11-08（refactor-agent、D の前提として実施）: **案 B（lib target）を採用**
+  - `crates/cli` を lib + 薄い bin に分割（`src/lib.rs` + `src/main.rs`。`main.rs` は
+    `.env`・ログ・ランタイム・終了コードだけを持つ）。案 A（bin 内の `mod tests`）では
+    `tests/` から本物の配線でモックサーバ相手の 1 ターンを回せず、eval（D）が呼ぶ入口とも
+    共有にならないため
+  - 入口を 2 段に分割した。振る舞いは変えていない（既存 663 本は同じ集合のまま緑）
+    - `composition::build(cli, interactive)` … 環境 + CLI 引数から `Settings` を作り、
+      `TerminalRenderer`・`--model`・プロセス環境（伏せ字の材料）・`--resume` を
+      `Wiring` に詰めて次を呼ぶだけ
+    - `composition::assemble(settings, Wiring) -> Result<Application>` … 配線の本体。
+      run / chat / sessions / tools / doctor はすべてここを通る。eval もタスクごとにこれを呼ぶ想定
+    - `Wiring { interactive, events, model, environment, retention: Option<Resume> }`。
+      ワークスペースと会話ログの置き場は**別引数にしていない** — `settings.workspace` /
+      `settings.session.dir` がそれで、2 か所に持つと食い違うため。
+      `retention: None` で起動時の刈り込みを行わない（テスト・eval 用）
+    - 承認ゲートは引数にしていない。eval は `interactive: false` の `CliApprovalGate`
+      （設定どおりに自動承認／拒否）で足りるため。必要になった時点で足す
+  - 通知の分岐は `webhook(&NotifySettings) -> Result<Option<WebhookNotifier>>` に切り出し、
+    「URL なし → 送り手なし（`NullNotifier`）」を単体テストで固定
+  - `crates/cli/tests/composition.rs`（13 本）: 既定のツール集合（7 つ）、`web_fetch` /
+    `run_command` の条件付き登録、`AGENT_SHELL_SANDBOX=isolated`（どのプラットフォームでも
+    未実装）で起動失敗、既定サンドボックスは「起動するなら confines()」か「起動失敗」の
+    どちらか、伏せ字（API キーが `[REDACTED]` になる）、タイムアウト（応答しない
+    サーバへの `web_fetch` が `AGENT_TOOL_TIMEOUT_SECS=0` で切られる）、依存監視は
+    destructive（`run_command`）だけ、`AGENT_ALLOW_DEPENDENCY_CHANGES` の有無で
+    無人 auto 実行のマニフェスト編集が拒否／通過、`AGENT_SESSION_LOG` の on/off
+  - **残り（この issue を done にする前に要判断）**
+    - `chat::start` の再開フォールバック 3 種と、起動時の保持ポリシー適用（`--resume` の除外）は
+      未着手。`assemble` の `retention` 引数と `agent_cli::commands` が公開されたので書ける状態
+    - `tests/end_to_end.rs` の composition への移行は未着手。14 本が `AgentLoopConfig` や
+      プロンプトビルダを直接差し替えて分岐を突いており、`Settings` 経由に直すと
+      テストの意図が変わるものがある。移行するか、`composition.rs` 側を本物の配線の
+      担当として end_to_end は「ループ + アダプタの結合」と位置付け直すかを判断する
+    - `std::env::set_var` は `crates/infrastructure/tests/sandbox.rs:447` に既存の使用がある
+      （この issue の追加分では使っていない）
+

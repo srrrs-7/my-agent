@@ -7,6 +7,11 @@ license.workspace = true
 publish.workspace = true
 description = "Presentation layer and composition root: argument parsing, rendering, wiring."
 
+# A library under a thin binary, so that `tests/` can build the agent through
+# the real composition root (see `src/lib.rs`).
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "agent"
 path = "src/main.rs"

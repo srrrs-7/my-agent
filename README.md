@@ -773,13 +773,15 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 741 本、外部ネットワークもモデルも不要です。
+テストは 756 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
 - LLM クライアント … 生 TCP のモックサーバで実 HTTP を検証
 - E2E … HTTP → provider → routing → retry → loop → tools → 実ファイルシステム
-  （`crates/cli/tests/end_to_end.rs`）
+  （`crates/cli/tests/end_to_end.rs`。配線はテスト側で組み直した最小構成）
+- 合成ルート … 本物の `composition::assemble` を `MapEnv` の設定で呼び、登録ツール・装飾子・
+  承認ゲート・会話ログ・サンドボックス不成立時の起動失敗を固定（`crates/cli/tests/composition.rs`）
 - 実バイナリ … `agent` を子プロセスとして起動し、モック LLM とモック Webhook だけを相手に
   合成ルートと終了処理まで通す（`crates/cli/tests/notify_e2e.rs`）。Ctrl-C は実際に SIGINT を送って
   終了コードと会話の保持を確かめる（`crates/cli/tests/interrupt_e2e.rs`）
