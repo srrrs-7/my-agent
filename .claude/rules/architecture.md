@@ -33,7 +33,7 @@
 |---|---|
 | `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider` |
 | `LlmRouter` | `StaticRouter`, `ModelPrefixRouter` |
-| `Tool` | `application/src/tools/{file,web,exec}/*`（実装）, `TimeoutTool`（装飾） |
+| `Tool` | `application/src/tools/{file,web,exec}/*`（実装）, `TimeoutTool`・`RedactingTool`（装飾） |
 | `FileSystem` | `LocalFileSystem` |
 | `FileSearcher` | `IgnoreAwareSearcher` |
 | `ContextProvider` | `WorkspaceContextProvider` |

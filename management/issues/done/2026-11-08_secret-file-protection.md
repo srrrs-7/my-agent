@@ -2,6 +2,7 @@
 title: 秘密ファイルをツールから保護し、既知の秘密の値を出力と通知から伏せる
 created: 2026-11-08
 started: 2026-11-08
+completed: 2026-11-08
 urgency: high
 importance: xhigh
 priority: P0
@@ -66,26 +67,26 @@ scope: [domain, infrastructure, cli, docs]
 
 ## 達成条件
 
-- [ ] `read_file` / `write_file` / `edit_file` で `.env`・`.env.local`・セッションログが拒否され、
+- [x] `read_file` / `write_file` / `edit_file` で `.env`・`.env.local`・セッションログが拒否され、
       モデルに次の行動を示すメッセージが `is_error` の `tool_result` で返る（ループは継続）
-- [ ] `.env.example` は読める
-- [ ] シンボリックリンク経由（`link -> .env`、`dir -> .agent/sessions`）でも拒否されることを
+- [x] `.env.example` は読める
+- [x] シンボリックリンク経由（`link -> .env`、`dir -> .agent/sessions`）でも拒否されることを
       テストで固定する
-- [ ] `search_files` が `path: ".env"`・`path: ".agent/sessions"`・`include` に `.env` を含む glob の
+- [x] `search_files` が `path: ".env"`・`path: ".agent/sessions"`・`include` に `.env` を含む glob の
       いずれでも中身を返さないことをテストで固定する。**着手時にまず現状で読めるかを再現し、
       結果をこの issue に記録する**（メモ参照。コード読みからの推測）
-- [ ] `AGENT_SESSION_DIR` をワークスペース内の別の場所にしても、その場所が保護される
-- [ ] 既知の秘密の値（`AGENT_API_KEY`、プロバイダ別のキー、Webhook URL、`is_secret` に該当する
+- [x] `AGENT_SESSION_DIR` をワークスペース内の別の場所にしても、その場所が保護される
+- [x] 既知の秘密の値（`AGENT_API_KEY`、プロバイダ別のキー、Webhook URL、`is_secret` に該当する
       環境変数の値）がツール出力に現れたら伏せられ、会話・セッションログ・端末・通知のいずれにも
       原文が残らない。`run_command` で `cat .env` した出力を含む
-- [ ] 伏せ字は出力の切り詰め（`AGENT_MAX_TOOL_OUTPUT_BYTES`）より前に行う
+- [x] 伏せ字は出力の切り詰め（`AGENT_MAX_TOOL_OUTPUT_BYTES`）より前に行う
       （切り詰めで秘密の前半だけが残らない）
-- [ ] ターン完了通知の抜粋から既知の秘密の値が伏せられる
-- [ ] 短すぎる値（下限は設計で決める）は伏せ字の対象にせず、誤検知でツール出力が壊れない
-- [ ] 装飾子の結線がテストで踏まれている（付け忘れが composition の無テスト部分に埋もれない）
-- [ ] 子プロセス経路の限界（パスでの拒否が効かない、egress 許可先へ値を送る経路は伏せ字では
+- [x] ターン完了通知の抜粋から既知の秘密の値が伏せられる
+- [x] 短すぎる値（下限は設計で決める）は伏せ字の対象にせず、誤検知でツール出力が壊れない
+- [x] 装飾子の結線がテストで踏まれている（付け忘れが composition の無テスト部分に埋もれない）
+- [x] 子プロセス経路の限界（パスでの拒否が効かない、egress 許可先へ値を送る経路は伏せ字では
       止まらない）が README §5 に書かれている
-- [ ] `make check` が緑
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -119,3 +120,5 @@ score 11 → P0。
   - `todo/2026-08-14_composition-root-test-harness.md` — 装飾子の付け忘れが見えない問題
   - `todo/2026-11-08_approve-from-phone-via-ntfy.md`、`todo/2026-11-08_sandboxed-mcp-client.md`
     — この issue を前提にする
+
+- 2026-11-08 完了: 字句段はツール解決時ではなくアダプタ（guard / searcher / context）で適用（迂回経路を塞ぐため）。既存の穴 3 件（リンク先不在のリンク経由の外部書き込み、外部を指すリンクでの全文検索、外部を指す AGENTS.md）も同時に閉じた。AGENT_SESSION_DIR=ワークスペースルートは起動エラー。残余リスクは README §5

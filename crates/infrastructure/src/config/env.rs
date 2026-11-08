@@ -29,6 +29,18 @@ impl EnvSource for SystemEnv {
     }
 }
 
+impl SystemEnv {
+    /// Every variable of the process environment, for
+    /// [`super::Settings::secrets`]. Entries that are not valid UTF-8 are
+    /// skipped rather than panicking as `std::env::vars` would; such a value
+    /// cannot be matched in text output anyway.
+    pub fn vars(&self) -> Vec<(String, String)> {
+        std::env::vars_os()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .collect()
+    }
+}
+
 /// In-memory environment for tests and for embedding the agent in a host that
 /// keeps its configuration somewhere other than the process environment.
 #[derive(Debug, Clone, Default)]

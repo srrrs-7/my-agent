@@ -44,6 +44,20 @@ pub(crate) fn is_secret(name: &str) -> bool {
         || SECRET_SUFFIXES.iter().any(|suffix| upper.ends_with(suffix))
 }
 
+/// The values of the variables in `vars` that [`is_secret`] keeps from a
+/// child process.
+///
+/// The same names decide what is redacted from tool output, so that the two
+/// lists cannot drift: a value too sensitive to hand to a command is too
+/// sensitive to show the model when a command prints it anyway.
+pub(crate) fn secret_values(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> impl Iterator<Item = String> {
+    vars.into_iter()
+        .filter(|(name, _)| is_secret(name))
+        .map(|(_, value)| value)
+}
+
 /// Removes every secret-looking variable from a child's environment.
 pub(crate) fn scrub(command: &mut tokio::process::Command) {
     for (name, _) in std::env::vars() {

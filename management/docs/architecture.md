@@ -48,7 +48,7 @@
 |---|---|---|
 | `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider` | チャット補完 |
 | `LlmRouter` | `StaticRouter`, `ModelPrefixRouter` | 委譲先の選択 |
-| `Tool` | `ReadFileTool` ほか（application）, `TimeoutTool`（装飾） | モデルに公開する能力 |
+| `Tool` | `ReadFileTool` ほか（application）, `TimeoutTool`・`RedactingTool`（装飾） | モデルに公開する能力 |
 | `FileSystem` | `LocalFileSystem` | サンドボックス化された I/O |
 | `FileSearcher` | `IgnoreAwareSearcher` | `.gitignore` 準拠の内容検索 |
 | `ContextProvider` | `WorkspaceContextProvider` | 環境情報とプロジェクト指示の収集 |
@@ -284,4 +284,4 @@ pub struct RequestMetadata {
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 402 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 455 本）。

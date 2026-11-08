@@ -19,3 +19,6 @@ target/
 
 # agent runtime artifacts
 /.agent/
+
+# agent worktrees (Claude Code isolation)
+.claude/worktrees/

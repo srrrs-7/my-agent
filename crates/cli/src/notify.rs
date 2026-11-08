@@ -26,6 +26,7 @@ use agent_domain::ports::approval::ApprovalRequest;
 use agent_domain::ports::events::FinishReason;
 use agent_domain::ports::notify::{Notification, NotificationEvent, NotificationKind, Notifier};
 use agent_infrastructure::config::NotifySettings;
+use agent_infrastructure::tools::Redactor;
 use tokio::task::JoinSet;
 use tracing::warn;
 
@@ -90,18 +91,25 @@ pub fn approval_pending(session_id: &str, request: &ApprovalRequest) -> Notifica
 /// Only a final answer carries an excerpt. A turn that ran out of iterations
 /// has no answer to quote, only whatever the model was saying when it was cut
 /// off.
+///
+/// Known secrets are hidden before the answer is cut, not after: cutting
+/// first could leave the opening of a key in the excerpt, where no longer
+/// matches it as a whole.
 pub fn turn_outcome(
     session_id: &str,
     result: &Result<AgentOutcome, AppError>,
     elapsed: Duration,
     excerpt_chars: usize,
+    redactor: &Redactor,
 ) -> Notification {
     let event = match result {
         Ok(outcome) => NotificationEvent::TurnFinished {
             reason: outcome.reason.clone(),
             elapsed,
             excerpt: match outcome.reason {
-                FinishReason::Completed => excerpt(&outcome.final_text, excerpt_chars),
+                FinishReason::Completed => {
+                    excerpt(&redactor.redact(&outcome.final_text), excerpt_chars)
+                }
                 _ => None,
             },
         },
@@ -158,6 +166,9 @@ fn excerpt(text: &str, max_chars: usize) -> Option<String> {
 pub struct Notifications {
     notifier: Arc<dyn Notifier>,
     policy: NotifyPolicy,
+    /// An answer excerpt is the one notification field written by the model,
+    /// and the model may have seen a secret.
+    redactor: Arc<Redactor>,
     /// `std` rather than `tokio` mutexes: none is held across an `.await`.
     pending: Mutex<JoinSet<()>>,
     last_engaged: Mutex<Instant>,
@@ -171,10 +182,18 @@ impl Notifications {
         Self {
             notifier,
             policy,
+            redactor: Arc::new(Redactor::default()),
             pending: Mutex::new(JoinSet::new()),
             last_engaged: Mutex::new(Instant::now()),
             session_id: Mutex::new(String::new()),
         }
+    }
+
+    /// Hides `redactor`'s secrets in answer excerpts.
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// Sends nothing. What the approval gate's tests run against.
@@ -234,6 +253,7 @@ impl Notifications {
             result,
             elapsed,
             self.policy.excerpt_chars,
+            &self.redactor,
         ));
     }
 
@@ -330,6 +350,7 @@ pub(crate) mod tests {
             &outcome(FinishReason::Completed, "done"),
             Duration::from_secs(secs),
             100,
+            &Redactor::default(),
         )
     }
 
@@ -360,12 +381,14 @@ pub(crate) mod tests {
             &outcome(FinishReason::MaxIterations { limit: 3 }, ""),
             Duration::from_secs(1),
             100,
+            &Redactor::default(),
         );
         let broke = turn_outcome(
             "s",
             &Err(AppError::Llm(LlmError::Timeout { seconds: 1 })),
             Duration::ZERO,
             100,
+            &Redactor::default(),
         );
         assert!(policy.wants(&gave_up));
         assert!(policy.wants(&broke));
@@ -407,6 +430,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_known_secret_in_the_answer_is_hidden_before_the_excerpt_is_cut() {
+        const KEY: &str = "sk-ant-0123456789abcdef";
+        let redactor = Redactor::new([KEY.to_string()]);
+        let answer = format!("Found it: {KEY}");
+
+        for limit in [100, 16] {
+            let notification = turn_outcome(
+                "s",
+                &outcome(FinishReason::Completed, &answer),
+                Duration::ZERO,
+                limit,
+                &redactor,
+            );
+            let shown = format!("{notification:?}");
+            assert!(
+                !shown.contains("sk-ant"),
+                "no part of the key may leave with a {limit}-char excerpt: {shown}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shared_sender_hides_secrets_in_what_it_sends() {
+        const KEY: &str = "sk-ant-0123456789abcdef";
+        let notifier = Arc::new(RecordingNotifier::default());
+        let notifications = Notifications::new(notifier.clone(), everything())
+            .with_redactor(Arc::new(Redactor::new([KEY.to_string()])));
+        notifications.begin_turn("s");
+        let started = notifications.last_engaged();
+
+        notifications.turn_finished_at(
+            &outcome(FinishReason::Completed, &format!("the key is {KEY}")),
+            started + Duration::from_secs(60),
+        );
+        notifications.drain(DRAIN_TIMEOUT).await;
+
+        let sent = format!("{:?}", lock(&notifier.sent));
+        assert!(!sent.contains(KEY), "{sent}");
+        assert!(sent.contains("[REDACTED]"), "{sent}");
+    }
+
+    #[test]
     fn a_zero_limit_or_an_empty_answer_sends_no_excerpt() {
         assert_eq!(excerpt("anything", 0), None);
         assert_eq!(excerpt("  \n ", 100), None);
@@ -419,6 +484,7 @@ pub(crate) mod tests {
             &outcome(FinishReason::MaxIterations { limit: 3 }, "half a thought"),
             Duration::ZERO,
             100,
+            &Redactor::default(),
         );
         assert!(
             matches!(
@@ -442,7 +508,8 @@ pub(crate) mod tests {
         let error = AppError::Llm(LlmError::Transport(
             "connection refused (http://10.0.0.5:11434/v1?key=secret)".into(),
         ));
-        let notification = turn_outcome("s", &Err(error), Duration::ZERO, 100);
+        let notification =
+            turn_outcome("s", &Err(error), Duration::ZERO, 100, &Redactor::default());
         let NotificationEvent::TurnFailed { reason, .. } = &notification.event else {
             panic!("expected a failure, got {notification:?}");
         };
@@ -451,7 +518,8 @@ pub(crate) mod tests {
         let error = AppError::FileSystem(FsError::NotFound {
             path: "/home/me/secret-plans.md".into(),
         });
-        let notification = turn_outcome("s", &Err(error), Duration::ZERO, 100);
+        let notification =
+            turn_outcome("s", &Err(error), Duration::ZERO, 100, &Redactor::default());
         assert!(!format!("{notification:?}").contains("secret-plans"));
     }
 

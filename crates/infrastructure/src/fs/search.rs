@@ -3,11 +3,18 @@
 //! Built on the `ignore` crate (the walker behind ripgrep) so that `.gitignore`
 //! is honoured for free: without it, the first search in any Rust project would
 //! drown the model in `target/`.
+//!
+//! `.gitignore` is a convenience, not a protection - an include glob such as
+//! `.env*` overrides it. Files the workspace's access policy refuses to read
+//! are skipped on their own account, checked by name and by where they really
+//! are, just as `read_file` checks them.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use agent_domain::error::FsError;
-use agent_domain::model::workspace::WorkspaceRoot;
+use agent_domain::model::access::FileAccess;
+use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::search::{FileSearcher, SearchHit, SearchQuery};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
@@ -57,6 +64,30 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
         });
     }
 
+    // The walker follows a symlink given as its starting point, so the root
+    // of the search is resolved and checked like any other path: a link to a
+    // directory outside the workspace, or to a protected one, would otherwise
+    // be searched in full.
+    let real_root = super::canonical_root(root)?;
+    let real_base = std::fs::canonicalize(&base).map_err(|error| FsError::Io {
+        path: query.root.display(),
+        message: error.to_string(),
+    })?;
+    let real_query_root =
+        real_root
+            .relativize(&real_base)
+            .map_err(|_| FsError::OutsideWorkspace {
+                path: query.root.display(),
+            })?;
+    if !root.permits(&query.root, FileAccess::Read)
+        || !real_root.permits(&real_query_root, FileAccess::Read)
+    {
+        return Err(FsError::AccessDenied {
+            path: query.root.display(),
+            access: FileAccess::Read,
+        });
+    }
+
     let mut builder = WalkBuilder::new(&base);
     builder
         .hidden(true)
@@ -89,6 +120,14 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
             continue;
         }
 
+        let Ok(path) = root.relativize(entry.path()) else {
+            continue;
+        };
+        // Decided before the file is opened: a refused file is never read.
+        if !permitted(root, &path, &real_root, &base, &real_base, entry.path()) {
+            continue;
+        }
+
         let Ok(bytes) = std::fs::read(entry.path()) else {
             continue;
         };
@@ -96,10 +135,6 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
             continue;
         }
         let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
-
-        let Ok(path) = root.relativize(entry.path()) else {
             continue;
         };
 
@@ -118,6 +153,36 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
     }
 
     Ok(hits)
+}
+
+/// Whether a file the walk found may be read, by its name and by where it
+/// really is.
+///
+/// Below its starting point the walk follows no links, so the real location
+/// is the resolved start plus the same tail - no syscall per file. Anything
+/// that does not fit that shape is refused rather than guessed at.
+fn permitted(
+    root: &WorkspaceRoot,
+    path: &WorkspacePath,
+    real_root: &WorkspaceRoot,
+    base: &Path,
+    real_base: &Path,
+    found: &Path,
+) -> bool {
+    if !root.permits(path, FileAccess::Read) {
+        return false;
+    }
+    let Ok(tail) = found.strip_prefix(base) else {
+        return false;
+    };
+    let real = if tail.as_os_str().is_empty() {
+        real_base.to_path_buf()
+    } else {
+        real_base.join(tail)
+    };
+    real_root
+        .relativize(&real)
+        .is_ok_and(|real| real_root.permits(&real, FileAccess::Read))
 }
 
 #[cfg(test)]
@@ -206,6 +271,73 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    // --- access policy -------------------------------------------------------
+
+    fn searcher(dir: &std::path::Path) -> IgnoreAwareSearcher {
+        IgnoreAwareSearcher::new(Arc::new(WorkspaceRoot::new(dir.to_path_buf()).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn protected_files_are_not_searched_even_when_nothing_ignores_them() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".env", "API_KEY=needle-in-env\n");
+        write(dir.path(), "certs/server.pem", "needle-in-pem\n");
+        write(dir.path(), "src/lib.rs", "// needle-in-source\n");
+
+        // An include glob overrides `.gitignore` and hidden-file skipping, so
+        // this is the search that would reach `.env` if anything could.
+        let mut everything = query("needle");
+        everything.include_glob = Some("{.env,*.pem,*.rs}".into());
+        let hits = searcher(dir.path()).search(everything).await.unwrap();
+
+        let shown: Vec<String> = hits.iter().map(|hit| hit.line.clone()).collect();
+        assert_eq!(shown, vec!["// needle-in-source"], "got {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn searching_inside_a_protected_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".env.d/database", "needle\n");
+
+        let mut scoped = query("needle");
+        scoped.root = WorkspacePath::parse(".env.d").unwrap();
+        let error = searcher(dir.path()).search(scoped).await.unwrap_err();
+
+        assert!(
+            matches!(error, FsError::AccessDenied { .. }),
+            "got {error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_search_root_is_checked_where_it_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(outside.path(), "passwd", "needle:x:0:0\n");
+        write(dir.path(), "secrets.key/token", "needle\n");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secrets.key"), dir.path().join("vault"))
+            .unwrap();
+        let searcher = searcher(dir.path());
+
+        let mut escape = query("needle");
+        escape.root = WorkspacePath::parse("escape").unwrap();
+        let error = searcher.search(escape).await.unwrap_err();
+        assert!(
+            matches!(error, FsError::OutsideWorkspace { .. }),
+            "got {error:?}"
+        );
+
+        let mut vault = query("needle");
+        vault.root = WorkspacePath::parse("vault").unwrap();
+        let error = searcher.search(vault).await.unwrap_err();
+        assert!(
+            matches!(error, FsError::AccessDenied { .. }),
+            "got {error:?}"
         );
     }
 }

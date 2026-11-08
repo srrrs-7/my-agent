@@ -5,6 +5,7 @@
 
 use thiserror::Error;
 
+use crate::model::access::FileAccess;
 use crate::model::tool::ToolName;
 
 /// Invariant violations detected while constructing domain values.
@@ -89,6 +90,15 @@ pub enum FsError {
     #[error("`{path}` resolves outside the workspace root and was refused")]
     OutsideWorkspace { path: String },
 
+    /// The workspace's [`crate::model::access::AccessPolicy`] refused it.
+    /// `path` is the one the caller asked for, never where a symlink led:
+    /// the model learns that the name is off limits, not where secrets live.
+    #[error(
+        "`{path}` is protected by the operator's access policy and cannot be {}",
+        refusal(.access)
+    )]
+    AccessDenied { path: String, access: FileAccess },
+
     #[error("`{path}` is {actual} bytes which exceeds the {limit} byte limit")]
     TooLarge {
         path: String,
@@ -104,6 +114,21 @@ pub enum FsError {
 
     #[error("io error on `{path}`: {message}")]
     Io { path: String, message: String },
+}
+
+/// The rest of an [`FsError::AccessDenied`] message. Written for the model:
+/// what to do instead, and not to go looking for another way in - a model
+/// that means well would otherwise reach for `run_command`.
+fn refusal(access: &FileAccess) -> &'static str {
+    match access {
+        FileAccess::Read => {
+            "read. Do not try to reach it another way; if you need a value from it, ask the user."
+        }
+        FileAccess::Write => {
+            "written. Do not try to change it another way; if the change is needed, ask the \
+             user to make it."
+        }
+    }
 }
 
 impl From<DomainError> for FsError {

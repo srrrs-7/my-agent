@@ -108,6 +108,29 @@ impl WebhookUrl {
             self.0.host_str().unwrap_or_default()
         )
     }
+
+    /// The parts of the URL that grant access, for redaction: the URL itself,
+    /// its path and query wherever they appear without it, any password, and
+    /// for ntfy the topic on its own - knowing the topic is enough to read it.
+    ///
+    /// Short parts are dropped later by the redactor's length threshold.
+    pub(crate) fn secrets(&self, format: NotifyFormat) -> Vec<String> {
+        let mut secrets = vec![self.0.as_str().to_string()];
+        let path = self.0.path().trim_matches('/');
+        if !path.is_empty() {
+            secrets.push(path.to_string());
+        }
+        secrets.extend(self.0.query().map(str::to_string));
+        secrets.extend(self.0.password().map(str::to_string));
+        if format == NotifyFormat::Ntfy {
+            secrets.extend(
+                endpoint(self, format)
+                    .ok()
+                    .and_then(|endpoint| endpoint.topic),
+            );
+        }
+        secrets
+    }
 }
 
 impl fmt::Debug for WebhookUrl {
@@ -245,6 +268,28 @@ mod tests {
         for hidden in ["XYZSECRET", "services", "user", "pw", "x=1"] {
             assert!(!shown.contains(hidden), "`{hidden}` leaked: {shown}");
         }
+    }
+
+    #[test]
+    fn the_secret_parts_of_a_webhook_url_cover_its_path_and_the_ntfy_topic() {
+        let slack = url("https://hooks.slack.com/services/T000/B000/XXXXSECRET");
+        let secrets = slack.secrets(NotifyFormat::Slack);
+        assert!(
+            secrets.contains(&"services/T000/B000/XXXXSECRET".to_string()),
+            "{secrets:?}"
+        );
+        assert!(
+            !secrets.iter().any(|secret| secret == "hooks.slack.com"),
+            "the host is not a secret: {secrets:?}"
+        );
+
+        let ntfy = url("https://ntfy.sh/my-private-topic-42");
+        let secrets = ntfy.secrets(NotifyFormat::Ntfy);
+        assert!(
+            secrets.contains(&"my-private-topic-42".to_string()),
+            "{secrets:?}"
+        );
+        assert!(secrets.contains(&"https://ntfy.sh/my-private-topic-42".to_string()));
     }
 
     #[test]

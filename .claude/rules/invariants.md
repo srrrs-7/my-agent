@@ -35,10 +35,33 @@ make exec CMD="grep -rn 'tokio\|agent_infrastructure' crates/application/src/ | 
 | 段 | 場所 | 防ぐもの |
 |---|---|---|
 | 字句 | `domain/src/model/workspace.rs` | `..` による脱出、範囲外の絶対パス、NUL |
-| 正規化 | `infrastructure/src/fs/local.rs` の `guard()` | ワークスペース内から外部を指すシンボリックリンク |
+| 正規化 | `infrastructure/src/fs/local.rs` の `guard()` | ワークスペース内から外部を指すシンボリックリンク、リンク先が存在しないシンボリックリンク |
 
 `guard()` には既知の落とし穴があります: 既存パスに空の tail を `join` すると末尾スラッシュが付き、
 通常ファイルへの全 syscall が ENOTDIR になります。早期 return で回避済みなので消さないでください。
+
+### ワークスペース内の保護ファイル（`AccessPolicy`）
+
+ワークスペースの中でも、資格情報（`.env`, `*.pem` …）・セッションログ・`.git/`（書き込みのみ）には
+ファイルツールが触れません。規則は `WorkspaceRoot` が持ち（`domain/src/model/access.rs`）、
+上と同じく 2 段で、**両方必要**です。
+
+| 段 | 何に当てるか | 防ぐもの |
+|---|---|---|
+| 字句 | モデルが指定した `WorkspacePath` | `.env -> config/app.env`（保護された名前が無害な実体を指す） |
+| 正規化 | canonicalize 後の実パスを正規化済みルートで相対化したもの | `notes -> .env`（無害な名前が保護された実体を指す） |
+
+両段とも `FileSystem` / `FileSearcher` のアダプタ（`guard()`、`IgnoreAwareSearcher`）で適用します。
+読み書きはすべてそこを通るため、`WorkspacePath` をどの経路で得ても迂回できません。
+`list_dir` と `exists` は名前しか返さないので規則を当てません。
+起動時の指示ファイル（`fs/context.rs`）にも同じ 2 段を当てます。
+
+- **規則は追加しかできない** — `AccessPolicy::standard()` が唯一の起点で、他はすべて追加です。
+  既定を外す設定・コンストラクタを足さないでください
+- **拒否はモデルへのツール失敗**（§3）— `FsError::AccessDenied` は「ユーザーに尋ねる」
+  「別の手段で取りにいかない」を伝えます。エラーには要求されたパスだけを載せ、リンク先は載せません
+- **`run_command` には効きません** — 子プロセスは Landlock の読み取り許可の下で `.env` を読めます。
+  その緩和が `RedactingTool`（既知の秘密の値を出力から伏せる装飾子）で、閉じてはいません
 
 **この不変条件は子プロセスには効きません。** `run_command` が起動したプロセスは
 `WorkspacePath` の外側にいるため、封じ込めは OS が行います（`infrastructure/src/exec/`）。

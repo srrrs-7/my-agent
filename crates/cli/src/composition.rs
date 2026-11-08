@@ -28,13 +28,15 @@ use agent_domain::ports::notify::{Notifier, NullNotifier};
 use agent_domain::ports::prompt::PromptBuilder;
 use agent_domain::ports::session_store::SessionStore;
 use agent_domain::ports::tool::Tool;
-use agent_infrastructure::config::{ApprovalPolicy, PromptSettings, Settings, ShellSettings};
+use agent_infrastructure::config::{
+    ApprovalPolicy, PromptSettings, Settings, ShellSettings, SystemEnv,
+};
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
 use agent_infrastructure::notify::WebhookNotifier;
 use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
-use agent_infrastructure::tools::TimeoutTool;
+use agent_infrastructure::tools::{RedactingTool, Redactor, TimeoutTool};
 use agent_infrastructure::web::{GuardedWebFetcher, WebFetchConfig};
 use anyhow::{Context, Result};
 
@@ -76,8 +78,20 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
             settings.workspace.display()
         )
     })?;
-    let workspace =
-        Arc::new(WorkspaceRoot::new(canonical).context("the workspace path must be absolute")?);
+    // Built against the canonical path, which is what the session directory
+    // has to be compared with.
+    let access = settings
+        .access_policy(&canonical)
+        .context("invalid file access settings")?;
+    let workspace = Arc::new(
+        WorkspaceRoot::new(canonical)
+            .context("the workspace path must be absolute")?
+            .with_policy(access),
+    );
+    // One instance for tool output and for notifications: a secret hidden
+    // from the model must not leave by the other door. Read after `main`
+    // loaded `.env`, so its variables are among the environment's.
+    let redactor = Arc::new(Redactor::new(settings.secrets(SystemEnv.vars())));
 
     // --- adapters ------------------------------------------------------------
     let file_system = Arc::new(
@@ -101,10 +115,10 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         ),
         None => Arc::new(NullNotifier),
     };
-    let notifications = Arc::new(Notifications::new(
-        notifier,
-        NotifyPolicy::from_settings(&settings.notify),
-    ));
+    let notifications = Arc::new(
+        Notifications::new(notifier, NotifyPolicy::from_settings(&settings.notify))
+            .with_redactor(redactor.clone()),
+    );
 
     let approval: Arc<dyn ApprovalGate> = Arc::new(CliApprovalGate::new(
         settings.approval,
@@ -161,6 +175,9 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
     } else {
         None
     };
+
+    // Last, so that a tool registered above can never be missed.
+    let tools = redact_all(&tools, &redactor);
 
     // --- the loop ------------------------------------------------------------
     // Disabled means `NullConversationLog`, not a flag the loop checks: there
@@ -315,6 +332,19 @@ fn build_tools(
             ))))
             .with(timed(Arc::new(SearchFilesTool::new(searcher, workspace)))),
     )
+}
+
+/// Every registered tool, wrapped so that a known secret never reaches the
+/// model through its output. Outermost, so it also covers the timeout's
+/// error.
+fn redact_all(tools: &ToolRegistry, redactor: &Arc<Redactor>) -> Arc<ToolRegistry> {
+    let mut redacted = ToolRegistry::new();
+    for definition in tools.definitions() {
+        if let Some(tool) = tools.get(&definition.name) {
+            redacted.register(RedactingTool::wrap(tool, redactor.clone()));
+        }
+    }
+    Arc::new(redacted)
 }
 
 /// Resolves the operator's prompt configuration into the builder the loop

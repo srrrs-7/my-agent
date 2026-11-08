@@ -8,6 +8,10 @@
 //! Adapters are still expected to re-check after canonicalisation, because
 //! symlinks can only be resolved by touching the filesystem (see
 //! `agent-infrastructure::fs::local`).
+//!
+//! The root also carries the [`AccessPolicy`] - the files inside it that are
+//! off limits anyway. The two travel together so that nothing can hold the
+//! boundary without also holding the exceptions to it.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -15,6 +19,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::DomainError;
+use crate::model::access::{AccessPolicy, FileAccess};
 
 /// A path that is guaranteed to be relative to the workspace root, normalised,
 /// and free of any `..` component that could climb out of it.
@@ -117,13 +122,18 @@ impl fmt::Display for WorkspacePath {
     }
 }
 
-/// The absolute directory every [`WorkspacePath`] is interpreted against.
+/// The absolute directory every [`WorkspacePath`] is interpreted against,
+/// and the files inside it that are refused anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRoot {
     path: PathBuf,
+    policy: AccessPolicy,
 }
 
 impl WorkspaceRoot {
+    /// A root protected by [`AccessPolicy::standard`]. There is no
+    /// unprotected root: a caller that forgets the policy gets the built-in
+    /// rules, never none.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, DomainError> {
         let path = path.into();
         if !path.is_absolute() {
@@ -132,7 +142,28 @@ impl WorkspaceRoot {
                 format!("`{}` must be an absolute path", path.display()),
             ));
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            policy: AccessPolicy::standard(),
+        })
+    }
+
+    /// Replaces the policy. Every [`AccessPolicy`] extends the standard one,
+    /// so this can only make the root stricter.
+    #[must_use]
+    pub fn with_policy(mut self, policy: AccessPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn policy(&self) -> &AccessPolicy {
+        &self.policy
+    }
+
+    /// Whether the policy lets `access` happen to `path`. Lexical only:
+    /// adapters ask again with the symlink-resolved path.
+    pub fn permits(&self, path: &WorkspacePath, access: FileAccess) -> bool {
+        self.policy.permits(path, access)
     }
 
     pub fn as_path(&self) -> &Path {
@@ -260,6 +291,15 @@ mod tests {
         let absolute = root.absolute(&path);
         assert_eq!(absolute, PathBuf::from("/workspace/src/main.rs"));
         assert_eq!(root.relativize(&absolute).unwrap(), path);
+    }
+
+    #[test]
+    fn a_new_root_protects_the_standard_files() {
+        let root = root();
+        let env = root.resolve(".env").unwrap();
+        assert!(!root.permits(&env, FileAccess::Read));
+        assert!(root.permits(&root.resolve("src/main.rs").unwrap(), FileAccess::Write));
+        assert_eq!(root.policy(), &AccessPolicy::standard());
     }
 
     #[test]

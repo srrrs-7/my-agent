@@ -4,11 +4,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agent_domain::error::FsError;
+use agent_domain::model::access::FileAccess;
 use agent_domain::model::context::ContextSnapshot;
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::context::ContextProvider;
 use async_trait::async_trait;
 use ignore::WalkBuilder;
+use tracing::warn;
 
 /// Instruction files, in precedence order. The first one found wins - this is
 /// the convention Claude Code and Codex established, and following it means an
@@ -48,7 +50,7 @@ impl ContextProvider for WorkspaceContextProvider {
                 os: std::env::consts::OS.to_string(),
                 today,
                 is_git_repository: base.join(".git").exists(),
-                project_instructions: read_instructions(base),
+                project_instructions: read_instructions(&root),
                 directory_overview: overview(base),
             })
         })
@@ -60,13 +62,43 @@ impl ContextProvider for WorkspaceContextProvider {
     }
 }
 
-fn read_instructions(base: &Path) -> Option<String> {
-    INSTRUCTION_FILES
+fn read_instructions(root: &WorkspaceRoot) -> Option<String> {
+    let (name, path) = INSTRUCTION_FILES
         .iter()
-        .map(|name| base.join(name))
-        .find(|path| path.is_file())
-        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|name| (*name, root.as_path().join(name)))
+        .find(|(_, path)| path.is_file())?;
+
+    // The operator's process reads this file, but the repository chooses
+    // what it is. `AGENTS.md -> .env` or `-> ~/.aws/credentials` would put
+    // the secret in the system prompt without any tool being called.
+    if let Err(error) = instruction_file_permitted(root, name) {
+        warn!(file = name, %error, "project instructions were not loaded");
+        return None;
+    }
+
+    std::fs::read_to_string(path)
+        .ok()
         .filter(|contents| !contents.trim().is_empty())
+}
+
+/// The same two checks `read_file` makes: the name, and where it leads.
+fn instruction_file_permitted(root: &WorkspaceRoot, name: &str) -> Result<(), FsError> {
+    let requested = root.resolve(name)?;
+    let real_root = super::canonical_root(root)?;
+    let real = std::fs::canonicalize(root.absolute(&requested)).map_err(|error| FsError::Io {
+        path: name.to_string(),
+        message: error.to_string(),
+    })?;
+    let real = real_root.relativize(&real)?;
+
+    if root.permits(&requested, FileAccess::Read) && real_root.permits(&real, FileAccess::Read) {
+        Ok(())
+    } else {
+        Err(FsError::AccessDenied {
+            path: name.to_string(),
+            access: FileAccess::Read,
+        })
+    }
 }
 
 fn overview(base: &Path) -> Vec<String> {
@@ -131,6 +163,38 @@ mod tests {
                 .contains(&"crates/domain/".to_string())
         );
         assert_eq!(snapshot.today.len(), 10, "ISO-8601 date");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_instruction_file_that_links_to_a_secret_is_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "API_KEY=sk-from-env").unwrap();
+        std::fs::write(outside.path().join("credentials"), "aws_secret=sk-outside").unwrap();
+        let root = Arc::new(WorkspaceRoot::new(dir.path().to_path_buf()).unwrap());
+
+        std::os::unix::fs::symlink(".env", dir.path().join("AGENTS.md")).unwrap();
+        let snapshot = WorkspaceContextProvider::new(root.clone())
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!(snapshot.project_instructions, None);
+
+        std::fs::remove_file(dir.path().join("AGENTS.md")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("credentials"),
+            dir.path().join("AGENTS.md"),
+        )
+        .unwrap();
+        let snapshot = WorkspaceContextProvider::new(root)
+            .snapshot()
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.project_instructions, None,
+            "a link out of the workspace is refused as well"
+        );
     }
 
     #[tokio::test]

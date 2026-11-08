@@ -286,6 +286,53 @@ async fn a_zero_excerpt_keeps_the_answer_out_of_the_notification() {
     );
 }
 
+/// The exfiltration chain the access policy and the redactor exist for: an
+/// injected instruction has the model read `.env`, then open its answer with
+/// the key, and the notification carries the answer off the machine.
+///
+/// Through the real binary, because both defences are wired in the
+/// composition root, which no other test sees. `.env` is loaded by `main`
+/// itself, exactly as on a developer's machine.
+#[tokio::test]
+async fn a_key_from_env_reaches_neither_the_model_nor_the_notification() {
+    const KEY: &str = "sk-test-0123456789SECRET";
+    const TOKEN: &str = "ghp_UNRELATED_TOKEN_42";
+    let llm = MockLlmServer::start(vec![
+        Response::tool_call("call_1", "read_file", r#"{"path":".env"}"#),
+        // As if the model had found the key some other way.
+        Response::assistant_text(&format!("{KEY} and {TOKEN} are the credentials")),
+    ])
+    .await;
+    let hook = receiver().await;
+    let agent = Agent::run(&llm, "hi").webhook(hook.url(), "json");
+    std::fs::write(
+        agent.workspace().join(".env"),
+        format!("AGENT_API_KEY={KEY}\nGITHUB_TOKEN={TOKEN}\n"),
+    )
+    .unwrap();
+
+    agent.finish().await.assert_code(0);
+
+    let body = only(&hook.received()).json();
+    let message = as_str(&body, "message");
+    assert!(
+        !message.contains("0123456789SECRET") && !message.contains("UNRELATED_TOKEN"),
+        "a secret left in the notification: {message}"
+    );
+    assert!(message.contains("[REDACTED]"), "{message}");
+
+    let requests = llm.json_requests().await;
+    let refusal = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("the read was answered")["content"]
+        .to_string();
+    assert!(refusal.contains("protected"), "got: {refusal}");
+    assert!(!refusal.contains("0123456789SECRET"), "got: {refusal}");
+}
+
 // --- agent run: failures ---------------------------------------------------
 
 #[tokio::test]

@@ -16,12 +16,15 @@ pub mod env;
 pub mod kinds;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::session::store::RetentionPolicy;
 
+use agent_domain::error::DomainError;
+use agent_domain::model::access::{AccessPolicy, PathPattern};
 use agent_domain::model::llm::{ModelId, ProviderId};
+use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::notify::NotificationKind;
 use thiserror::Error;
 
@@ -297,6 +300,56 @@ fn notify_events(reader: &Reader<'_>) -> Result<Vec<NotificationKind>, ConfigErr
     Ok(kinds)
 }
 
+/// Files inside the workspace the file tools refuse, on top of the built-in
+/// rules ([`AccessPolicy::standard`]) and the session log directory.
+///
+/// Additions only. There is deliberately no setting that removes a built-in
+/// rule: those name files that are never project files, and a project that
+/// needs a value from one can put it in the prompt.
+#[derive(Debug, Clone, Default)]
+pub struct AccessSettings {
+    /// Neither read nor written.
+    pub deny_read: Vec<PathPattern>,
+    /// Readable, but never written.
+    pub deny_write: Vec<PathPattern>,
+}
+
+const DENY_READ_KEY: &str = "AGENT_DENY_READ";
+const DENY_WRITE_KEY: &str = "AGENT_DENY_WRITE";
+
+impl AccessSettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        Ok(Self {
+            deny_read: patterns(reader, DENY_READ_KEY)?,
+            deny_write: patterns(reader, DENY_WRITE_KEY)?,
+        })
+    }
+}
+
+/// A pattern that does not parse aborts startup. Skipping it would leave the
+/// operator believing a file is protected that is not.
+fn patterns(reader: &Reader<'_>, key: &str) -> Result<Vec<PathPattern>, ConfigError> {
+    reader
+        .list(key)
+        .iter()
+        .map(|raw| {
+            PathPattern::parse(raw).map_err(|error| {
+                let reason = match error {
+                    DomainError::Invalid { reason, .. } => reason,
+                    other => other.to_string(),
+                };
+                ConfigError::invalid(
+                    key,
+                    raw,
+                    format!(
+                        "{reason}. Expected names such as `*.p12` or directories such as `secrets/`"
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub workspace: PathBuf,
@@ -308,6 +361,7 @@ pub struct Settings {
     pub web_fetch: WebFetchSettings,
     pub shell: ShellSettings,
     pub notify: NotifySettings,
+    pub access: AccessSettings,
     /// Largest file the read tool will load.
     pub max_file_bytes: u64,
 }
@@ -369,8 +423,89 @@ impl Settings {
                     .collect(),
             },
             notify: NotifySettings::read(&reader)?,
+            access: AccessSettings::read(&reader)?,
             max_file_bytes: reader.parsed("AGENT_MAX_FILE_BYTES", 2 * 1024 * 1024)?,
         })
+    }
+
+    /// The rules the file tools enforce in a workspace at `workspace`.
+    ///
+    /// The workspace is passed in rather than read from `self.workspace`
+    /// because the composition root has the canonical path, and the session
+    /// directory has to be compared with the path files are really reached
+    /// by.
+    pub fn access_policy(&self, workspace: &Path) -> Result<AccessPolicy, ConfigError> {
+        let mut policy = AccessPolicy::standard();
+
+        // Protected whether or not logging is on: turning the log off stops
+        // new records, it does not remove the old ones.
+        if let Some(sessions) = self.session_dir_inside(workspace) {
+            let pattern = PathPattern::directory(&sessions).map_err(|_| {
+                ConfigError::invalid(
+                    "AGENT_SESSION_DIR",
+                    self.session.dir.display().to_string(),
+                    "the session log cannot be the workspace root itself: it holds the whole \
+                     conversation, and keeping it from the file tools would refuse every file. \
+                     Use a subdirectory such as .agent/sessions, or a path outside the workspace",
+                )
+            })?;
+            policy = policy.with_read_denied(pattern);
+        }
+
+        for pattern in &self.access.deny_read {
+            policy = policy.with_read_denied(pattern.clone());
+        }
+        for pattern in &self.access.deny_write {
+            policy = policy.with_write_denied(pattern.clone());
+        }
+        Ok(policy)
+    }
+
+    /// Where the session log sits relative to `workspace`, or `None` when it
+    /// is outside.
+    ///
+    /// Compared both as written and as resolved, so that neither a `..` in
+    /// the setting nor a symlink between the two spellings of the workspace
+    /// hides that the log is inside.
+    fn session_dir_inside(&self, workspace: &Path) -> Option<WorkspacePath> {
+        let dir = if self.session.dir.is_absolute() {
+            self.session.dir.clone()
+        } else {
+            workspace.join(&self.session.dir)
+        };
+        let spellings = |path: &Path| {
+            [Some(lexically_normal(path)), resolved(path)]
+                .into_iter()
+                .flatten()
+        };
+
+        spellings(workspace)
+            .filter_map(|root| WorkspaceRoot::new(root).ok())
+            .find_map(|root| spellings(&dir).find_map(|dir| root.relativize(&dir).ok()))
+    }
+
+    /// Every secret value this process holds, for the redactor that scrubs
+    /// tool output and notifications: the provider keys, the webhook URL, and
+    /// the value of every variable in `environment` whose name the command
+    /// sandbox would keep from a child process.
+    ///
+    /// The environment is passed in (`SystemEnv.vars()` in production) for
+    /// the same reason the settings are read through an [`EnvSource`]. It
+    /// matters beyond the variables this program reads: `.env` is loaded into
+    /// the process environment at startup, so whatever else it holds - a
+    /// `GITHUB_TOKEN`, a database password - is in there too.
+    pub fn secrets(&self, environment: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+        let mut secrets: Vec<String> = self
+            .llm
+            .providers
+            .iter()
+            .filter_map(|provider| provider.api_key.clone())
+            .collect();
+        if let Some(url) = &self.notify.webhook {
+            secrets.extend(url.secrets(self.notify.format));
+        }
+        secrets.extend(crate::exec::env::secret_values(environment));
+        secrets
     }
 
     /// Absolute location of the session directory.
@@ -513,6 +648,35 @@ fn describe_notify(notify: &NotifySettings) -> String {
     )
 }
 
+/// `path` with `.` and `..` resolved by text alone. `..` above the root
+/// stays at the root, as it does on the filesystem.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
+}
+
+/// `path` with symlinks resolved, including when it does not exist yet - the
+/// session directory is only created by the first session. The deepest
+/// existing ancestor is resolved and the rest appended as written.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let path = lexically_normal(path);
+    let mut existing = path.as_path();
+    while std::fs::symlink_metadata(existing).is_err() {
+        existing = existing.parent()?;
+    }
+    let tail = path.strip_prefix(existing).ok()?;
+    Some(std::fs::canonicalize(existing).ok()?.join(tail))
+}
+
 /// `0` reads as "no limit" for every retention setting.
 ///
 /// A limit of zero would otherwise mean "delete everything immediately", which
@@ -569,6 +733,13 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         },
     );
     description.insert("notify".into(), describe_notify(&settings.notify));
+    description.insert(
+        "file access".into(),
+        match settings.access_policy(&settings.workspace) {
+            Ok(policy) => policy.describe(),
+            Err(error) => error.to_string(),
+        },
+    );
     description.insert(
         "session log".into(),
         if settings.session.log {
@@ -1068,6 +1239,173 @@ mod tests {
         assert!(
             doctor.contains("https://hooks.slack.com/…"),
             "doctor still says where notifications go: {doctor}"
+        );
+    }
+
+    // --- file access ---------------------------------------------------------
+
+    use agent_domain::model::access::FileAccess;
+
+    fn readable(policy: &AccessPolicy, path: &str) -> bool {
+        policy.permits(&WorkspacePath::parse(path).unwrap(), FileAccess::Read)
+    }
+
+    #[test]
+    fn the_built_in_rules_and_the_session_log_are_protected_by_default() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        let policy = settings.access_policy(Path::new("/workspace")).unwrap();
+
+        assert!(!readable(&policy, ".env"));
+        assert!(!readable(&policy, ".agent/sessions/0b1c.jsonl"));
+        assert!(readable(&policy, ".agent/instructions.md"));
+        assert!(readable(&policy, "src/main.rs"));
+    }
+
+    #[test]
+    fn the_session_log_is_protected_wherever_inside_the_workspace_it_is() {
+        for dir in [
+            "/workspace/logs",
+            "logs",
+            "tmp/../logs",
+            "/workspace/./logs/",
+        ] {
+            let settings = settings(&[("AGENT_MODEL", "m"), ("AGENT_SESSION_DIR", dir)]).unwrap();
+            let policy = settings.access_policy(Path::new("/workspace")).unwrap();
+            assert!(
+                !readable(&policy, "logs/0b1c.jsonl"),
+                "AGENT_SESSION_DIR={dir} left the log readable: {}",
+                policy.describe()
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_log_outside_the_workspace_adds_no_rule() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SESSION_DIR", "/var/lib/agent"),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.access_policy(Path::new("/workspace")).unwrap(),
+            AccessPolicy::standard()
+        );
+    }
+
+    #[test]
+    fn the_session_log_cannot_be_the_workspace_root() {
+        for dir in [".", "/workspace"] {
+            let settings = settings(&[("AGENT_MODEL", "m"), ("AGENT_SESSION_DIR", dir)]).unwrap();
+            let error = settings
+                .access_policy(Path::new("/workspace"))
+                .expect_err("startup must fail rather than refuse every file");
+            assert!(error.to_string().contains("AGENT_SESSION_DIR"), "{error}");
+        }
+    }
+
+    #[test]
+    fn operator_rules_extend_the_built_in_ones() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_DENY_READ", "*.p12, secrets/ ,"),
+            ("AGENT_DENY_WRITE", "Cargo.lock"),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.access.deny_read.len(),
+            2,
+            "blank entries are dropped"
+        );
+
+        let policy = settings.access_policy(Path::new("/workspace")).unwrap();
+        assert!(!readable(&policy, "certs/client.p12"));
+        assert!(!readable(&policy, "deploy/secrets/prod.yml"));
+        assert!(readable(&policy, "Cargo.lock"));
+        assert!(!policy.permits(
+            &WorkspacePath::parse("Cargo.lock").unwrap(),
+            FileAccess::Write
+        ));
+        assert!(!readable(&policy, ".env"), "the built-in rules stay");
+    }
+
+    #[test]
+    fn an_unusable_rule_aborts_startup_and_names_the_variable() {
+        for (key, value) in [
+            ("AGENT_DENY_READ", "!.env.local"),
+            ("AGENT_DENY_READ", "/etc/shadow"),
+            ("AGENT_DENY_WRITE", "**/*.lock"),
+            ("AGENT_DENY_WRITE", "secret?.txt"),
+        ] {
+            let error = settings(&[("AGENT_MODEL", "m"), (key, value)])
+                .expect_err("a rule that cannot be enforced as written must not be skipped");
+            let message = error.to_string();
+            assert!(message.contains(key), "{message}");
+            assert!(message.contains(value), "{message}");
+        }
+    }
+
+    #[test]
+    fn doctor_lists_every_protected_path_on_one_line() {
+        let settings = settings(&[("AGENT_MODEL", "m"), ("AGENT_DENY_READ", "*.p12")]).unwrap();
+        let shown = describe(&settings)["file access"].clone();
+
+        assert!(!shown.contains('\n'), "{shown}");
+        for rule in [
+            ".env,",
+            ".env.example",
+            ".agent/sessions/",
+            "*.p12",
+            ".git/",
+        ] {
+            assert!(shown.contains(rule), "`{rule}` is missing: {shown}");
+        }
+    }
+
+    #[test]
+    fn secrets_cover_every_provider_key_and_the_webhook() {
+        let settings = settings(&[
+            ("AGENT_PROVIDERS", "local,cloud"),
+            ("AGENT_PROVIDER_LOCAL_KIND", "openai"),
+            ("AGENT_PROVIDER_LOCAL_MODEL", "m"),
+            ("AGENT_PROVIDER_LOCAL_API_KEY", "sk-proj-LOCALKEY123"),
+            ("AGENT_PROVIDER_CLOUD_KIND", "anthropic"),
+            ("AGENT_PROVIDER_CLOUD_MODEL", "claude-sonnet-5"),
+            ("AGENT_PROVIDER_CLOUD_API_KEY", "sk-ant-CLOUDKEY456"),
+            (
+                "AGENT_NOTIFY_WEBHOOK_URL",
+                "https://ntfy.sh/private-topic-789",
+            ),
+        ])
+        .unwrap();
+
+        let redactor = crate::tools::Redactor::new(settings.secrets(Vec::new()));
+        let leaked = "keys sk-proj-LOCALKEY123 sk-ant-CLOUDKEY456, topic private-topic-789";
+        let shown = redactor.redact(leaked);
+        for secret in ["LOCALKEY", "CLOUDKEY", "private-topic"] {
+            assert!(!shown.contains(secret), "`{secret}` survived: {shown}");
+        }
+    }
+
+    #[test]
+    fn secrets_include_every_variable_the_command_sandbox_would_withhold() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        let environment = [
+            ("GITHUB_TOKEN", "ghp_0123456789abcdef"),
+            ("db_password", "correct-horse-battery"),
+            ("NPM_TOKEN", "short"),
+            ("PATH", "/usr/local/bin:/usr/bin"),
+            ("AGENT_WORKSPACE", "/workspace/project"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()));
+
+        let redactor = crate::tools::Redactor::new(settings.secrets(environment));
+        let shown = redactor.redact(
+            "ghp_0123456789abcdef correct-horse-battery short /usr/local/bin:/usr/bin \
+             /workspace/project",
+        );
+        assert_eq!(
+            shown, "[REDACTED] [REDACTED] short /usr/local/bin:/usr/bin /workspace/project",
+            "secret-named values are hidden, others and short ones are not"
         );
     }
 }

@@ -24,6 +24,7 @@ pub use error::{
     ApprovalError, CommandError, DomainError, FetchError, FsError, LlmError, NotifyError, ToolError,
 };
 pub use model::{
+    access::{AccessPolicy, FileAccess, PathPattern},
     context::ContextSnapshot,
     conversation::Conversation,
     llm::{

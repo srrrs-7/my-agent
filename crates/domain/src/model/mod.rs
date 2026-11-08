@@ -1,5 +1,6 @@
 //! Entities and value objects.
 
+pub mod access;
 pub mod context;
 pub mod conversation;
 pub mod llm;
