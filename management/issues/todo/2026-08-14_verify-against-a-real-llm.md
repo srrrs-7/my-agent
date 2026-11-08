@@ -60,3 +60,5 @@ scope: [ops, docs]
 - ツール呼び出しの精度はモデル依存。`qwen3:8b` で駄目なら、より大きいモデルか
   クラウド LLM（`AGENT_PROVIDER=anthropic`）でも試して、結果を README に残す
 - 実 API キーでの Anthropic 経路の疎通も未確認。分けるなら別 issue
+- 関連（2026-11-08 追記）: `todo/2026-11-08_replay-and-eval-harness.md` — この issue の確認項目は
+  そのまま `agent eval` のタスクにできる。ここで動くモデルを確定させ、eval で継続的に測る

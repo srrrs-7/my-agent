@@ -86,3 +86,7 @@ scope: [domain, infrastructure, docs]
 - 関連: `done/2026-08-14_session-log-rotation.md`（切り出し元）、
   `done/2026-08-14_session-persistence-and-resume.md`（1 セッション 1 ファイルを決めた issue）、
   `done/2026-08-14_conversation-log-append-only.md`（追記専用にした理由）
+- 関連（2026-11-08 追記）:
+  - `todo/2026-11-08_todo-plan-tool.md` — 再開時に計画を復元する。案 A（末尾だけ読む）を採ると、
+    計画を導くための最後の更新が読む範囲の外に落ちうる
+  - `todo/2026-11-08_replay-and-eval-harness.md` — `agent replay` も記録を丸ごと読む

@@ -87,3 +87,7 @@ ntfy / Slack / 汎用 JSON の送信形式を選べる。URL を設定しなけ�
   - 承認ゲートの対話経路は TTY が要るため、`CliApprovalGate` に入力関数の差し替え口
     （`#[cfg(test)] with_read_line`、既定は `prompt_line`）を設けて単体で検証した
   - 「URL がログでマスクされる」は stderr の警告について確認。`agent doctor` の表示は未検証
+- 関連（2026-11-08 追記, issue-agent）:
+  - `progress/2026-11-08_secret-file-protection.md` — 上の「プロンプトインジェクションで秘密を
+    回答に書かせれば Webhook 先へ出ていく」経路を塞ぐ issue
+  - `todo/2026-11-08_approve-from-phone-via-ntfy.md` — この通知に返信できるようにする（双方向化）

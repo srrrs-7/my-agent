@@ -1,7 +1,7 @@
 ---
 title: composition root をテストから組み立てられるようにする
 created: 2026-08-14
-urgency: medium
+urgency: high
 importance: high
 priority: P1
 scope: [cli, docs]
@@ -130,3 +130,12 @@ E2E テストが名前どおりのものになる — 手で組み直した配�
 - 関連: `done/2026-08-14_conversation-log-append-only.md`、
   `done/2026-08-14_session-persistence-and-resume.md`、
   `done/2026-08-14_session-log-rotation.md`（いずれも「やらなかったこと」でこの穴を挙げている）
+- 関連（2026-11-08 追記）: 次の issue がいずれも `composition.rs` に配線を足す。特に A は
+  伏せ字の装飾子の付け忘れがそのままセキュリティ上の穴になるため、この足場の有無が効く
+  - `progress/2026-11-08_secret-file-protection.md`（装飾子の結線）
+  - `todo/2026-11-08_interrupt-turn-with-ctrl-c.md`（`chat::start` / `run`）
+  - `todo/2026-11-08_replay-and-eval-harness.md`（新しいサブコマンド）
+  - `todo/2026-11-08_dependency-change-gate.md`、`todo/2026-11-08_todo-plan-tool.md`、
+    `todo/2026-11-08_approve-from-phone-via-ntfy.md`、`todo/2026-11-08_sandboxed-mcp-client.md`
+
+- 2026-11-08: 緊急度を medium → high に変更（score 9）。新規 7 機能が composition.rs に配線を足すため、かつ D（eval）の前提として D の中で先に実施する（root 判断）

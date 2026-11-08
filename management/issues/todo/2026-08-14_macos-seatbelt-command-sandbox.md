@@ -78,3 +78,8 @@ medium に上げた。
   ツールチェーンの読み取り・`(deny network*)` を明示する
 - CI（GitHub Actions の macOS runner）で回すかは要検討。
   Linux runner だけなら macOS テストは開発者のローカル実行に頼ることになる
+- 関連（2026-11-08 追記）:
+  - `progress/2026-11-08_secret-file-protection.md` — Seatbelt は `deny` を書けるので、
+    子プロセスからの `.env` 読み取りもこの層なら塞げる（Landlock ではできない）
+  - `todo/2026-11-08_sandboxed-mcp-client.md` — MCP サーバも同じサンドボックスで起動するため、
+    これが無いと macOS では MCP を使えない

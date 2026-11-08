@@ -62,3 +62,6 @@ scope: [domain, application, cli, docs]
 - 並列に複数の子を走らせるのは第 2 段階。まず直列 1 子で成立させる
 - コンテキスト圧縮（2026-08-14_context-compaction-by-summarization）とは補完関係:
   圧縮は「溢れたら要約」、sub agent は「最初から溢れさせない」
+- 関連（2026-11-08 追記）:
+  - `todo/2026-11-08_todo-plan-tool.md` — 子エージェントの計画を親にどう見せるか
+  - `todo/2026-11-08_interrupt-turn-with-ctrl-c.md` — 子ループも中断できる必要がある

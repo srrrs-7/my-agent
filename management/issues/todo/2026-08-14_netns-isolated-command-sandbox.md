@@ -3,7 +3,7 @@ title: ネットワーク名前空間による完全隔離層（SandboxKind::Net
 created: 2026-08-14
 urgency: low
 importance: medium
-priority: P3
+priority: P2
 scope: [infrastructure, docs]
 ---
 
@@ -81,3 +81,9 @@ Landlock 層で「ワークスペース外への書き込み」「正直なプ�
   **この層は追加の tier であって既定にはしない**。
 - 関連: `management/issues/done/2026-08-14_sandboxed-command-execution-tool.md`、
   `management/issues/todo/2026-08-14_macos-seatbelt-command-sandbox.md`
+- 関連（2026-11-08 追記）:
+  - `progress/2026-11-08_secret-file-protection.md` — 「書き込み可能・読み取り可能なツリー内の
+    部分拒否」を表現できない同じ制約で、子プロセスからの `.env` 読み取りを Landlock では塞げない
+  - `todo/2026-11-08_sandboxed-mcp-client.md` — 同一ポート別ホストの穴は MCP サーバにも残る
+- 2026-11-08 issue-agent: `priority` を P3 → P2 に訂正（medium × low = score 5 は表で P2。
+  `urgency` / `importance` は変えていない）
