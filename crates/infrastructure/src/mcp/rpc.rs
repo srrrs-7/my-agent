@@ -10,28 +10,50 @@
 //!   `notifications/cancelled` is sent, so the timeout decorator (or an
 //!   interrupted turn) both frees the slot and tells the server to stop. A
 //!   response that arrives afterwards matches nothing and is discarded.
+//! * **Every message is written whole.** One task owns the outgoing stream
+//!   and is handed complete lines over a queue; a caller that is dropped has
+//!   either queued its line or not, and never leaves half of one behind for
+//!   the next message to be glued onto. `write_all` is not cancel-safe, so
+//!   writing from the caller's own future would.
 //! * **No message may exceed the cap.** A server that sends one larger is
 //!   treated as broken and the connection is closed: there is no way to tell
 //!   which call an unread message answered, so skipping it would leave that
 //!   call waiting for nothing.
+//! * **What waits to be written is bounded** ([`MAX_QUEUED_MESSAGES`]). A
+//!   server that keeps sending requests while never reading the answers would
+//!   otherwise make this process hold them without limit; past the bound the
+//!   connection is closed.
 //! * **Once closed, always closed.** Every waiting call fails, and every later
 //!   one fails at once with the reason.
 //!
 //! Requests from the server are answered "method not found", except `ping`.
 //! This client offers no capabilities, so a well-behaved server sends none.
+//! A request whose id is neither a number nor a short string
+//! ([`MAX_REQUEST_ID_BYTES`]) is ignored: the answer would echo it, and an id
+//! can be megabytes long.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{AbortHandle, JoinHandle};
 use tracing::debug;
 
 /// The largest message either side may send, in bytes.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Messages queued for the server and not yet written. Shared by this
+/// client's own messages and its answers to the server's requests; a server
+/// that has let this many pile up is not reading its input.
+pub(crate) const MAX_QUEUED_MESSAGES: usize = 64;
+
+/// The longest string id a request from the server may carry and still be
+/// answered.
+pub(crate) const MAX_REQUEST_ID_BYTES: usize = 128;
 
 /// How much of a server's error message is kept.
 const MAX_ERROR_BYTES: usize = 1024;
@@ -46,7 +68,6 @@ pub(crate) enum RpcError {
     Remote { code: i64, message: String },
 }
 
-type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 type Reply = oneshot::Sender<Result<Value, RpcError>>;
 
 #[derive(Default)]
@@ -56,9 +77,12 @@ struct State {
 }
 
 struct Shared {
-    /// `None` once closed. An async lock, because a write is held across the
-    /// await that flushes it; [`RpcClient::close`] only ever `try_lock`s.
-    writer: tokio::sync::Mutex<Option<Writer>>,
+    /// Whole lines, for the writer task.
+    outgoing: mpsc::Sender<Vec<u8>>,
+    /// The writer task, stopped when the connection closes. Stopping it drops
+    /// the stream - for a process, closes its stdin - even when a write to a
+    /// server that does not read is stuck.
+    writer: OnceLock<AbortHandle>,
     state: Mutex<State>,
     next_id: AtomicU64,
 }
@@ -70,28 +94,29 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Queues `message`, waiting for room. Cancel-safe: a caller dropped
+    /// while waiting has queued nothing, and a queued line is written whole
+    /// whatever becomes of the caller.
     async fn send(&self, message: &Value) -> Result<(), RpcError> {
-        let mut line = serde_json::to_vec(message)
-            .map_err(|error| RpcError::Closed(format!("cannot encode a message: {error}")))?;
-        line.push(b'\n');
+        let line = encode(message)?;
+        if let Some(reason) = &self.state().closed {
+            return Err(RpcError::Closed(reason.clone()));
+        }
+        self.outgoing
+            .send(line)
+            .await
+            .map_err(|_| RpcError::Closed(self.closed_reason()))
+    }
 
-        let mut writer = self.writer.lock().await;
-        let Some(stream) = writer.as_mut() else {
-            return Err(RpcError::Closed(self.closed_reason()));
-        };
-        let written = async {
-            stream.write_all(&line).await?;
-            stream.flush().await
-        }
-        .await;
-        if let Err(error) = written {
-            *writer = None;
-            drop(writer);
-            let reason = format!("writing to the server failed: {error}");
-            self.close_with(reason.clone());
-            return Err(RpcError::Closed(reason));
-        }
-        Ok(())
+    /// Queues `message` if there is room right now. For callers that cannot
+    /// wait: `Drop`, and the reader, which must not stall behind a server
+    /// that is not reading.
+    fn try_send(&self, message: &Value) -> Result<(), TrySendError<()>> {
+        let line = encode(message).map_err(|_| TrySendError::Closed(()))?;
+        self.outgoing.try_send(line).map_err(|error| match error {
+            TrySendError::Full(_) => TrySendError::Full(()),
+            TrySendError::Closed(_) => TrySendError::Closed(()),
+        })
     }
 
     fn closed_reason(&self) -> String {
@@ -101,8 +126,8 @@ impl Shared {
             .unwrap_or_else(|| "the connection is closed".to_string())
     }
 
-    /// Marks the connection closed (keeping the first reason) and fails every
-    /// call still waiting.
+    /// Marks the connection closed (keeping the first reason), fails every
+    /// call still waiting, and stops the writer.
     fn close_with(&self, reason: String) {
         let waiting: Vec<Reply> = {
             let mut state = self.state();
@@ -111,6 +136,9 @@ impl Shared {
             }
             state.pending.drain().map(|(_, reply)| reply).collect()
         };
+        if let Some(writer) = self.writer.get() {
+            writer.abort();
+        }
         let reason = self.closed_reason();
         for reply in waiting {
             let _ = reply.send(Err(RpcError::Closed(reason.clone())));
@@ -129,6 +157,13 @@ impl Shared {
     }
 }
 
+fn encode(message: &Value) -> Result<Vec<u8>, RpcError> {
+    let mut line = serde_json::to_vec(message)
+        .map_err(|error| RpcError::Closed(format!("cannot encode a message: {error}")))?;
+    line.push(b'\n');
+    Ok(line)
+}
+
 /// A connection to one server.
 pub(crate) struct RpcClient {
     shared: Arc<Shared>,
@@ -136,18 +171,22 @@ pub(crate) struct RpcClient {
 }
 
 impl RpcClient {
-    /// Starts reading `reader` in the background. Must be called inside a
-    /// tokio runtime.
+    /// Starts reading `reader` and writing `writer` in the background. Must
+    /// be called inside a tokio runtime.
     pub(crate) fn start<R, W>(reader: R, writer: W, max_message_bytes: usize) -> Self
     where
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        let (outgoing, queue) = mpsc::channel(MAX_QUEUED_MESSAGES);
         let shared = Arc::new(Shared {
-            writer: tokio::sync::Mutex::new(Some(Box::new(writer))),
+            outgoing,
+            writer: OnceLock::new(),
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(1),
         });
+        let writing = tokio::spawn(write_loop(writer, queue, Arc::downgrade(&shared)));
+        let _ = shared.writer.set(writing.abort_handle());
         let reader = tokio::spawn(read_loop(
             BufReader::new(reader),
             shared.clone(),
@@ -171,25 +210,19 @@ impl RpcClient {
         let mut guard = Cancellation {
             shared: self.shared.clone(),
             id,
-            armed: true,
+            queued: false,
+            finished: false,
         };
 
-        let sent = self
-            .shared
+        self.shared
             .send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-            .await;
-        if let Err(error) = sent {
-            // The request never reached the server; there is nothing to
-            // cancel there.
-            guard.armed = false;
-            self.shared.state().pending.remove(&id);
-            return Err(error);
-        }
+            .await?;
+        guard.queued = true;
 
         let outcome = response
             .await
             .unwrap_or_else(|_| Err(RpcError::Closed(self.shared.closed_reason())));
-        guard.armed = false;
+        guard.finished = true;
         outcome
     }
 
@@ -202,12 +235,9 @@ impl RpcClient {
 
     /// Closes the outgoing stream - for a process, its stdin, which is how a
     /// server is told to shut down - and stops reading. Synchronous, for
-    /// `Drop`. If a write is in flight at this instant the stream cannot be
-    /// taken; the caller kills the process next either way.
+    /// `Drop`; the stream itself is dropped as soon as the runtime gets to
+    /// the stopped writer.
     pub(crate) fn close(&self) {
-        if let Ok(mut writer) = self.shared.writer.try_lock() {
-            writer.take();
-        }
         self.reader.abort();
         self.shared
             .close_with("the client shut the connection down".to_string());
@@ -224,34 +254,53 @@ impl Drop for RpcClient {
 struct Cancellation {
     shared: Arc<Shared>,
     id: u64,
-    armed: bool,
+    /// The request is on its way to the server, so there is something there
+    /// to cancel.
+    queued: bool,
+    /// The response arrived (or never will); nothing to clean up.
+    finished: bool,
 }
 
 impl Drop for Cancellation {
     fn drop(&mut self) {
-        if !self.armed {
+        if self.finished {
             return;
         }
         let still_waiting = self.shared.state().pending.remove(&self.id).is_some();
-        if !still_waiting {
+        if !still_waiting || !self.queued {
             return;
         }
-        // Drop cannot await, so the notice goes out on its own task. Outside a
-        // runtime there is no task to spawn, and the process is ending anyway.
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // Without waiting, since `Drop` cannot. With the queue full the
+        // notice is skipped: the server is not reading, and closing the
+        // connection over a courtesy would turn one abandoned call into a
+        // stopped server.
+        let _ = self.shared.try_send(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": self.id, "reason": "the client abandoned the request"},
+        }));
+    }
+}
+
+/// The only place the outgoing stream is written. Runs until the connection
+/// closes and the task is stopped, or a write fails.
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut stream: W,
+    mut queue: mpsc::Receiver<Vec<u8>>,
+    shared: Weak<Shared>,
+) {
+    while let Some(line) = queue.recv().await {
+        let written = async {
+            stream.write_all(&line).await?;
+            stream.flush().await
+        }
+        .await;
+        if let Err(error) = written {
+            if let Some(shared) = shared.upgrade() {
+                shared.close_with(format!("writing to the server failed: {error}"));
+            }
             return;
-        };
-        let shared = self.shared.clone();
-        let id = self.id;
-        runtime.spawn(async move {
-            let _ = shared
-                .send(&json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/cancelled",
-                    "params": {"requestId": id, "reason": "the client abandoned the request"},
-                }))
-                .await;
-        });
+        }
     }
 }
 
@@ -293,7 +342,11 @@ async fn read_line<R: AsyncBufRead + Unpin>(
 async fn read_loop<R: AsyncBufRead + Unpin>(mut reader: R, shared: Arc<Shared>, max: usize) {
     let reason = loop {
         match read_line(&mut reader, max).await {
-            Ok(Some(line)) => handle(&shared, &line),
+            Ok(Some(line)) => {
+                if let Err(reason) = handle(&shared, &line) {
+                    break reason;
+                }
+            }
             Ok(None) => break "the server closed its output".to_string(),
             Err(LineError::TooLong) => {
                 break format!("the server sent a message larger than {max} bytes");
@@ -305,42 +358,51 @@ async fn read_loop<R: AsyncBufRead + Unpin>(mut reader: R, shared: Arc<Shared>, 
     shared.close_with(reason);
 }
 
-fn handle(shared: &Arc<Shared>, line: &[u8]) {
+/// Acts on one line. `Err` is the reason to close the connection.
+fn handle(shared: &Arc<Shared>, line: &[u8]) -> Result<(), String> {
     if line.iter().all(u8::is_ascii_whitespace) {
-        return;
+        return Ok(());
     }
     let Ok(message) = serde_json::from_slice::<Value>(line) else {
         debug!("ignoring a line from the server that is not JSON");
-        return;
+        return Ok(());
     };
 
     if let Some(method) = message.get("method").and_then(Value::as_str) {
         // A request from the server carries an id; a notification does not.
         // Notifications - `list_changed` included - are ignored: the tool
         // list is fixed at startup.
-        if let Some(id) = message.get("id").filter(|id| !id.is_null()) {
-            let reply = if method == "ping" {
-                json!({"jsonrpc": "2.0", "id": id, "result": {}})
-            } else {
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {"code": METHOD_NOT_FOUND, "message": "Method not found"},
-                })
-            };
-            // On its own task: a server that is not reading its stdin must not
-            // be able to stall the reading of its stdout.
-            let shared = shared.clone();
-            tokio::spawn(async move {
-                let _ = shared.send(&reply).await;
-            });
+        let Some(id) = message.get("id").filter(|id| !id.is_null()) else {
+            return Ok(());
+        };
+        if !answerable(id) {
+            debug!("ignoring a request from the server with an unusable id");
+            return Ok(());
         }
-        return;
+        let reply = if method == "ping" {
+            json!({"jsonrpc": "2.0", "id": id, "result": {}})
+        } else {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": METHOD_NOT_FOUND, "message": "Method not found"},
+            })
+        };
+        // Queued without waiting: a server that is not reading its stdin
+        // must not be able to stall the reading of its stdout, nor to make
+        // the answers pile up.
+        return match shared.try_send(&reply) {
+            Ok(()) | Err(TrySendError::Closed(())) => Ok(()),
+            Err(TrySendError::Full(())) => Err(format!(
+                "the server sent requests faster than it read the answers ({MAX_QUEUED_MESSAGES} \
+                 messages were waiting to be written)"
+            )),
+        };
     }
 
     let Some(id) = message.get("id").and_then(response_id) else {
         debug!("ignoring a response without a usable id");
-        return;
+        return Ok(());
     };
     let outcome = match message.get("error") {
         Some(error) => Err(RpcError::Remote {
@@ -356,6 +418,17 @@ fn handle(shared: &Arc<Shared>, line: &[u8]) {
         None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
     };
     shared.deliver(id, outcome);
+    Ok(())
+}
+
+/// Whether a request's id may be echoed back: JSON-RPC allows a number or a
+/// string, and the string is what could be made enormous.
+fn answerable(id: &Value) -> bool {
+    match id {
+        Value::Number(_) => true,
+        Value::String(text) => text.len() <= MAX_REQUEST_ID_BYTES,
+        _ => false,
+    }
 }
 
 /// Ids are sent as numbers; a server that echoes them as strings is
@@ -404,7 +477,13 @@ mod tests {
     }
 
     fn connect(max: usize) -> (RpcClient, FakeServer) {
-        let (client_end, server_end) = duplex(64 * 1024);
+        connect_buffered(max, 64 * 1024)
+    }
+
+    /// `buffer` is how much each direction of the pipe holds before a write
+    /// blocks.
+    fn connect_buffered(max: usize, buffer: usize) -> (RpcClient, FakeServer) {
+        let (client_end, server_end) = duplex(buffer);
         let (client_read, client_write) = split(client_end);
         let (server_read, server_write) = split(server_end);
         (
@@ -552,6 +631,96 @@ mod tests {
         let pong = server.receive().await;
         assert_eq!(pong["id"], "p");
         assert_eq!(pong["result"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_request_with_an_unusable_id_is_ignored() {
+        let (_client, mut server) = connect(MAX_MESSAGE_BYTES);
+        for id in [
+            json!("x".repeat(MAX_REQUEST_ID_BYTES + 1)),
+            json!({"nested": 1}),
+            json!([1]),
+            json!(true),
+        ] {
+            server
+                .send(json!({"jsonrpc": "2.0", "id": id, "method": "ping"}))
+                .await;
+        }
+        let longest = "y".repeat(MAX_REQUEST_ID_BYTES);
+        server
+            .send(json!({"jsonrpc": "2.0", "id": longest, "method": "ping"}))
+            .await;
+
+        // The first answer is to the last request: none of the others got one.
+        assert_eq!(server.receive().await["id"], json!(longest));
+    }
+
+    #[tokio::test]
+    async fn a_flood_of_requests_the_server_does_not_read_the_answers_to_closes_it() {
+        // A small pipe, so the answers back up almost at once.
+        let (client, server) = connect_buffered(MAX_MESSAGE_BYTES, 256);
+        // `lines` is kept but never read: the server is alive and not reading.
+        let FakeServer { lines, mut writer } = server;
+        let flood = tokio::spawn(async move {
+            for id in 0..10 * MAX_QUEUED_MESSAGES {
+                let line = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"ping\"}}\n");
+                // Fails once the client has hung up, which is the point.
+                if writer.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), client.request("a", json!({})))
+            .await
+            .expect("the connection must close, not wait");
+        match outcome {
+            Err(RpcError::Closed(reason)) => {
+                assert!(reason.contains("faster than it read"), "{reason}");
+            }
+            other => panic!("expected a closed connection, got {other:?}"),
+        }
+        flood.await.unwrap();
+        drop(lines);
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_mid_write_does_not_corrupt_the_next_message() {
+        // The pipe holds 64 bytes; the request is far larger, so its write is
+        // still under way when the request is dropped.
+        let (client, mut server) = connect_buffered(MAX_MESSAGE_BYTES, 64);
+        let blob = "x".repeat(64 * 1024);
+        let mut big = Box::pin(client.request("big", json!({"blob": blob})));
+        tokio::select! {
+            biased;
+            _ = &mut big => panic!("nothing has answered yet"),
+            () = async {
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        drop(big);
+
+        let next = client.request("next", json!({}));
+        let answer = async {
+            // Each message arrives as its own well-formed line - `receive`
+            // fails on anything that is not JSON.
+            let first = server.receive().await;
+            assert_eq!(first["method"], "big");
+            assert_eq!(
+                first["params"]["blob"].as_str().map(str::len),
+                Some(blob.len())
+            );
+            let cancelled = server.receive().await;
+            assert_eq!(cancelled["method"], "notifications/cancelled");
+            assert_eq!(cancelled["params"]["requestId"], first["id"]);
+            let next = server.receive().await;
+            assert_eq!(next["method"], "next");
+            server.send(result(&next["id"], json!("fresh"))).await;
+        };
+        let (next, ()) = tokio::join!(next, answer);
+        assert_eq!(next.unwrap(), json!("fresh"));
     }
 
     #[tokio::test]

@@ -25,9 +25,8 @@
 //! session ends.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -47,6 +46,7 @@ use super::rpc::{MAX_MESSAGE_BYTES, RpcClient, RpcError};
 use crate::exec::confined::{ConfinementPolicy, confine_command};
 use crate::exec::process::GuardedChild;
 use crate::exec::proxy::EgressProxy;
+use crate::fs::scratch::ScratchDir;
 use crate::net::guard::HostPolicy;
 
 /// The protocol revision this client speaks. The server's answer is accepted
@@ -66,9 +66,6 @@ const STDERR_TAIL_BYTES: usize = 2048;
 
 /// How long a failed startup waits for the server's last words on stderr.
 const STDERR_GRACE: Duration = Duration::from_millis(500);
-
-/// Distinguishes servers started by the same process.
-static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Why a server could not be started. Read by the operator.
 #[derive(Debug, Error)]
@@ -111,7 +108,9 @@ pub struct McpServer {
     child: Option<GuardedChild>,
     stderr: JoinHandle<()>,
     egress: Option<EgressProxy>,
-    dir: PathBuf,
+    /// Last, so that it is removed after the drop has killed the process
+    /// group that writes into it.
+    dir: ScratchDir,
 }
 
 impl McpServer {
@@ -134,19 +133,11 @@ impl McpServer {
             message,
         };
 
-        let dir = std::env::temp_dir().join(format!(
-            "my-agent-mcp-{}-{}-{name}",
-            std::process::id(),
-            DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).map_err(|error| {
-            setup(format!(
-                "cannot create its directory `{}`: {error}",
-                dir.display()
-            ))
-        })?;
-        // From here on, the directory is removed on every exit path.
-        let dir = DirGuard(Some(dir));
+        // Owner-only and always new: a name already taken in the shared temp
+        // dir - by anyone, a planted link included - is skipped, never
+        // reused. Removed on every exit path from here on.
+        let dir = ScratchDir::empty(&format!("my-agent-mcp-{name}-"))
+            .map_err(|error| setup(format!("cannot create its directory: {error}")))?;
 
         let egress = if config.allow_hosts.is_empty() {
             None
@@ -187,8 +178,9 @@ impl McpServer {
                 source,
             })?;
         // After confinement, which scrubs the environment: these are the
-        // operator's explicit grant, secrets included.
-        command.envs(&config.env);
+        // operator's explicit grant. `inherited` holds secrets the scrub has
+        // just removed by value; this server is the one they are meant for.
+        command.envs(&config.env).envs(&config.inherited);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -217,7 +209,7 @@ impl McpServer {
             child: Some(guarded),
             stderr: tokio::spawn(drain(stderr, tail.clone())),
             egress,
-            dir: dir.release(),
+            dir,
         };
 
         match tokio::time::timeout(STARTUP_TIMEOUT, server.handshake()).await {
@@ -303,7 +295,7 @@ impl McpServer {
 
     /// The server's own writable directory.
     pub fn directory(&self) -> &Path {
-        &self.dir
+        self.dir.path()
     }
 }
 
@@ -315,7 +307,6 @@ impl Drop for McpServer {
         self.rpc.close();
         drop(self.child.take());
         self.stderr.abort();
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -451,27 +442,6 @@ fn stderr_tail(tail: &Mutex<VecDeque<u8>>) -> String {
         }
     }
     clean.trim().to_string()
-}
-
-/// Removes a directory unless ownership was handed on.
-struct DirGuard(Option<PathBuf>);
-
-impl DirGuard {
-    fn path(&self) -> &Path {
-        self.0.as_deref().unwrap_or(Path::new(""))
-    }
-
-    fn release(mut self) -> PathBuf {
-        self.0.take().unwrap_or_default()
-    }
-}
-
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        if let Some(dir) = self.0.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
 }
 
 #[cfg(test)]

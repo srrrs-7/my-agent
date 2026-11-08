@@ -93,6 +93,8 @@ fn config(script: &Path) -> ServerConfig {
         command: PathBuf::from("/bin/sh"),
         args: vec![script.display().to_string()],
         env: BTreeMap::new(),
+        env_from: Vec::new(),
+        inherited: BTreeMap::new(),
         allow_hosts: Vec::new(),
         workspace_access: WorkspaceAccess::None,
     }
@@ -156,6 +158,13 @@ async fn by_default_a_server_writes_its_own_directory_and_not_the_workspace() {
         "ok"
     );
     assert!(own.exists());
+
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(server.directory())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "owner-only, got {mode:o}");
 
     let escape = fixture.workspace.join("Cargo.toml");
     assert_eq!(
@@ -307,6 +316,32 @@ async fn the_operators_env_reaches_the_server() {
     assert_eq!(
         call(&server, "env", json!({"var": "PROBE_TOKEN"})).await,
         "value=handed-over"
+    );
+}
+
+#[tokio::test]
+async fn an_inherited_secret_reaches_its_server_though_the_scrub_withholds_it() {
+    let fixture = fixture();
+    let secret = "inherited-0123456789".to_string();
+    // As in production: the value is withheld from every child by value, and
+    // handed to this one explicitly.
+    let server = McpServer::start(
+        "probe",
+        &ServerConfig {
+            env_from: vec!["PROBE_KEY".to_string()],
+            inherited: BTreeMap::from([("PROBE_KEY".to_string(), secret.clone())]),
+            ..config(&fixture.script)
+        },
+        landlock(),
+        &fixture.workspace,
+        std::slice::from_ref(&secret),
+    )
+    .await
+    .expect("the probe server starts");
+
+    assert_eq!(
+        call(&server, "env", json!({"var": "PROBE_KEY"})).await,
+        format!("value={secret}")
     );
 }
 
