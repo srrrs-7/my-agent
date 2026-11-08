@@ -109,6 +109,9 @@ pub struct ExecConfig {
     /// the result comes back as text; a shell command that can reach anything
     /// can also post the workspace to it.
     pub allowed_domains: Vec<String>,
+    /// The operator's configured secrets (`Settings::configured_secrets`).
+    /// Any variable holding one is kept from the child, whatever its name.
+    pub withheld: Vec<String>,
 }
 
 impl Default for ExecConfig {
@@ -117,6 +120,7 @@ impl Default for ExecConfig {
             sandbox: SandboxRequirement::Confined,
             extra_writable: Vec::new(),
             allowed_domains: Vec::new(),
+            withheld: Vec::new(),
         }
     }
 }
@@ -283,6 +287,7 @@ impl SandboxedCommandRunner {
             writable,
             scratch: self.session_temp.clone(),
             proxy_port: self.egress_port(),
+            withheld: self.config.withheld.clone(),
         }
     }
 }

@@ -232,7 +232,12 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     // sandbox is weaker than asked for, rather than registering the tool with
     // less protection than the operator believes it has.
     let commands = if settings.shell.enabled {
-        let runner = build_command_runner(&settings.shell, workspace.clone()).await?;
+        let runner = build_command_runner(
+            &settings.shell,
+            workspace.clone(),
+            settings.configured_secrets(),
+        )
+        .await?;
 
         let mut registry = (*tools).clone();
         registry.register(TimeoutTool::wrap(
@@ -360,13 +365,18 @@ async fn register_tool_servers(
     let Some(config) = config else {
         return Ok(Vec::new());
     };
-    let servers = start_servers(config, settings.mcp.sandbox, workspace)
-        .await
-        .context(
-            "cannot start the MCP servers AGENT_MCP_CONFIG lists. They run only under a sandbox \
+    let servers = start_servers(
+        config,
+        settings.mcp.sandbox,
+        workspace,
+        &settings.configured_secrets(),
+    )
+    .await
+    .context(
+        "cannot start the MCP servers AGENT_MCP_CONFIG lists. They run only under a sandbox \
              (Linux 6.7+ for Landlock; macOS is not supported yet) - unset AGENT_MCP_CONFIG to \
              start without them",
-        )?;
+    )?;
     for server in &servers {
         let tools = server_tools(server.clone() as Arc<dyn ToolServer>, registry)?;
         for tool in tools {
@@ -423,6 +433,7 @@ async fn apply_retention(settings: &Settings, store: &FileSessionStore, resume: 
 async fn build_command_runner(
     shell: &ShellSettings,
     workspace: Arc<WorkspaceRoot>,
+    withheld: Vec<String>,
 ) -> Result<Arc<SandboxedCommandRunner>> {
     let runner = SandboxedCommandRunner::start(
         workspace,
@@ -430,6 +441,7 @@ async fn build_command_runner(
             sandbox: shell.sandbox,
             extra_writable: shell.extra_writable.clone(),
             allowed_domains: shell.allowed_domains.clone(),
+            withheld,
         },
     )
     .await

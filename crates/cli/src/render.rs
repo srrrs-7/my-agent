@@ -214,6 +214,16 @@ impl EventSink for TerminalRenderer {
                 ));
             }
 
+            AgentEvent::DependencyCheckIncomplete { name, limit } => {
+                self.status(self.paint(
+                    YELLOW,
+                    &format!(
+                        "! {name}: dependency check incomplete - the workspace scan stopped \
+                         after {limit} entries, so a dependency change may have gone unreported"
+                    ),
+                ));
+            }
+
             AgentEvent::RunFinished {
                 reason,
                 iterations,

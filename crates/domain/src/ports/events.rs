@@ -87,6 +87,15 @@ pub enum AgentEvent {
         name: ToolName,
         files: Vec<DependencyFileChange>,
     },
+    /// The comparison behind [`Self::DependenciesChanged`] did not cover the
+    /// whole workspace, so a change may have gone unreported. Separate from
+    /// it because "nothing changed" and "not everything was checked" must not
+    /// look alike on the terminal.
+    DependencyCheckIncomplete {
+        name: ToolName,
+        /// The scan's entry limit, the usual reason it stopped.
+        limit: usize,
+    },
     /// The model's work plan changed. Emitted only when it differs from the
     /// one already shown, so a sink can redraw it unconditionally. An empty
     /// plan means the model cleared it.

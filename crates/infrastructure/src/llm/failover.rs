@@ -27,9 +27,17 @@
 //! ## What is worth failing over
 //!
 //! Exactly what is worth retrying ([`LlmError::is_retryable`]): transport
-//! errors, timeouts, 5xx, 408 and 429. A 401 or a 400 is not an outage but a
-//! configuration bug, and quietly answering from another provider would hide
-//! it until the day the fallback is down too.
+//! errors, timeouts, 5xx, 408 and 429. A 401 or a 400 *from the primary* is
+//! not an outage but a configuration bug, and quietly answering from another
+//! provider would hide it until the day the fallback is down too - so the
+//! chain stops there.
+//!
+//! The same error from a fallback does not stop the chain. A misconfigured
+//! fallback is no reason to skip the candidates after it - least of all the
+//! primary, which a cooldown may have moved to the end of the chain while it
+//! recovered. It is logged, and the error a failed chain returns is the
+//! primary's whenever the primary was tried: the fallback's 401 would
+//! otherwise replace the outage that actually happened.
 //!
 //! A stream is never failed over once it has been handed out. An error from
 //! [`LlmProvider::chat_stream`] itself means nothing was emitted; an error
@@ -40,11 +48,18 @@
 //!
 //! After the primary fails over, it is skipped for `cooldown` and requests go
 //! straight to the fallback - otherwise every request during an outage would
-//! pay the primary's full retry latency first. Once the cooldown has passed
-//! the primary is tried first again, which is how the destination returns to
-//! its first choice. A primary that is cooling down is still tried last, so
-//! the cooldown only ever reorders the chain and never makes a request fail
-//! that the primary could have served.
+//! pay the primary's full retry latency first. A primary that is cooling down
+//! is still tried last, so the cooldown only ever reorders the chain and never
+//! makes a request fail that the primary could have served.
+//!
+//! Once the cooldown has passed, the primary is tried first again - but
+//! through its *probe*, the client without the retry layer. A primary that
+//! does not answer at all would otherwise cost every probe its whole retry
+//! budget (three attempts of a 180 s timeout is nine minutes) before the
+//! fallback is reached. A failed probe doubles the cooldown, up to
+//! [`MAX_COOLDOWN`] (or the configured cooldown, if longer), so a primary that
+//! stays down is asked less and less often; any success restores the
+//! configured cooldown.
 //!
 //! ## Capabilities
 //!
@@ -61,7 +76,7 @@
 //! `claude-...`), and sending that name to an Ollama server would only turn
 //! an outage into a 404.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use agent_domain::error::LlmError;
@@ -69,6 +84,9 @@ use agent_domain::model::llm::{ChatRequest, ChatResponse, ProviderCapabilities, 
 use agent_domain::ports::llm::{ChatStream, LlmProvider};
 use async_trait::async_trait;
 use tracing::{info, warn};
+
+/// The longest a failing primary's cooldown grows to.
+pub const MAX_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// Source of "now" for the cooldown, so its tests can move time instead of
 /// waiting for it.
@@ -91,13 +109,32 @@ pub fn is_failover_worthy(error: &LlmError) -> bool {
     error.is_retryable()
 }
 
-pub struct FailoverProvider {
-    /// `[0]` is the primary; the rest are the fallbacks in order.
-    candidates: Vec<Arc<dyn LlmProvider>>,
+/// What the destination knows about its primary.
+#[derive(Debug, Clone, Copy)]
+struct Health {
+    /// When the primary last failed. `None` while it is healthy.
+    tripped_at: Option<Instant>,
+    /// How long it is skipped after `tripped_at`. Grows with failed probes.
     cooldown: Duration,
+}
+
+/// One step of the chain: which candidate, and whether through the probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attempt {
+    index: usize,
+    probe: bool,
+}
+
+pub struct FailoverProvider {
+    /// `[0]` is the primary; the rest are the fallbacks in order. Each is the
+    /// retried client.
+    candidates: Vec<Arc<dyn LlmProvider>>,
+    /// The primary without its retry layer, for the first attempt after a
+    /// cooldown. `None` probes through `candidates[0]`.
+    probe: Option<Arc<dyn LlmProvider>>,
+    base_cooldown: Duration,
     clock: Arc<dyn Clock>,
-    /// When the primary last failed over. `None` while it is healthy.
-    tripped_at: Mutex<Option<Instant>>,
+    health: Mutex<Health>,
 }
 
 impl FailoverProvider {
@@ -117,10 +154,21 @@ impl FailoverProvider {
         );
         Self {
             candidates,
-            cooldown,
+            probe: None,
+            base_cooldown: cooldown,
             clock: Arc::new(SystemClock),
-            tripped_at: Mutex::new(None),
+            health: Mutex::new(Health {
+                tripped_at: None,
+                cooldown,
+            }),
         }
+    }
+
+    /// The primary's client without retries, used for the first attempt once
+    /// a cooldown has passed (see the module docs).
+    pub fn with_probe(mut self, probe: Arc<dyn LlmProvider>) -> Self {
+        self.probe = Some(probe);
+        self
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -132,23 +180,46 @@ impl FailoverProvider {
         self.candidates[index].id()
     }
 
-    /// How much of the primary's cooldown is left, if any.
-    fn cooldown_left(&self) -> Option<Duration> {
-        let tripped_at = (*self
-            .tripped_at
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner))?;
-        let left = self
-            .cooldown
-            .checked_sub(self.clock.now().saturating_duration_since(tripped_at))?;
-        (!left.is_zero()).then_some(left)
+    fn health(&self) -> MutexGuard<'_, Health> {
+        self.health.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn set_tripped(&self, at: Option<Instant>) {
-        *self
-            .tripped_at
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = at;
+    fn provider(&self, attempt: Attempt) -> &dyn LlmProvider {
+        match (&self.probe, attempt.probe) {
+            (Some(probe), true) => probe.as_ref(),
+            _ => self.candidates[attempt.index].as_ref(),
+        }
+    }
+
+    /// Whether the primary is down, and if so how much cooldown is left.
+    /// `Some(ZERO)` means the cooldown has passed and the next attempt is a
+    /// probe.
+    fn cooldown_left(&self) -> Option<Duration> {
+        let health = *self.health();
+        let tripped_at = health.tripped_at?;
+        let elapsed = self.clock.now().saturating_duration_since(tripped_at);
+        Some(health.cooldown.saturating_sub(elapsed))
+    }
+
+    /// Records a failure of the primary. A failed probe doubles the cooldown;
+    /// any other failure starts one, or restarts the current one.
+    fn trip(&self, probe: bool) {
+        let now = self.clock.now();
+        let ceiling = MAX_COOLDOWN.max(self.base_cooldown);
+        let mut health = self.health();
+        health.cooldown = match (health.tripped_at, probe) {
+            (None, _) => self.base_cooldown,
+            (Some(_), true) => health.cooldown.saturating_mul(2).min(ceiling),
+            (Some(_), false) => health.cooldown,
+        };
+        health.tripped_at = Some(now);
+    }
+
+    fn recover(&self) {
+        *self.health() = Health {
+            tripped_at: None,
+            cooldown: self.base_cooldown,
+        };
     }
 
     /// Whether fallback `index` can do what `request` needs.
@@ -158,76 +229,103 @@ impl FailoverProvider {
     }
 
     /// The order to try candidates in for this request.
-    fn order(&self, request: &ChatRequest) -> Vec<usize> {
-        let fallbacks: Vec<usize> = (1..self.candidates.len())
+    fn order(&self, request: &ChatRequest) -> Vec<Attempt> {
+        let fallbacks = (1..self.candidates.len())
             .filter(|&index| self.can_serve(index, request))
-            .collect();
+            .map(|index| Attempt {
+                index,
+                probe: false,
+            });
+        let primary = |probe| Attempt { index: 0, probe };
 
         match self.cooldown_left() {
-            Some(left) if !fallbacks.is_empty() => {
-                info!(
-                    target: "agent::route",
-                    "`{}` failed recently; using `{}` for another {}s of cooldown",
-                    self.id_of(0),
-                    self.id_of(fallbacks[0]),
-                    left.as_secs().max(1)
-                );
-                fallbacks.into_iter().chain([0]).collect()
+            None => [primary(false)].into_iter().chain(fallbacks).collect(),
+            Some(left) if left.is_zero() => [primary(true)].into_iter().chain(fallbacks).collect(),
+            Some(left) => {
+                let fallbacks: Vec<Attempt> = fallbacks.collect();
+                if let Some(first) = fallbacks.first() {
+                    info!(
+                        target: "agent::route",
+                        "`{}` failed recently; using `{}` for another {}s of cooldown",
+                        self.id_of(0),
+                        self.id_of(first.index),
+                        left.as_secs().max(1)
+                    );
+                }
+                // Last, and with its retries: by now it is the only hope.
+                fallbacks.into_iter().chain([primary(false)]).collect()
             }
-            _ => [0].into_iter().chain(fallbacks).collect(),
         }
     }
 
     /// The failover loop both entry points share. `call` is invoked with the
-    /// index of the candidate to use and the request to send it.
-    async fn run<T, Fut>(
-        &self,
+    /// provider to use and the request to send it.
+    async fn run<'a, T, Fut>(
+        &'a self,
         request: ChatRequest,
-        call: impl Fn(usize, ChatRequest) -> Fut,
+        call: impl Fn(&'a dyn LlmProvider, ChatRequest) -> Fut,
     ) -> Result<T, LlmError>
     where
         Fut: std::future::Future<Output = Result<T, LlmError>>,
     {
         let order = self.order(&request);
-        let mut last_error = None;
+        let mut primary_error = None;
+        let mut first_error = None;
 
-        for (position, &index) in order.iter().enumerate() {
-            let attempt = if index == 0 {
+        for (position, &attempt) in order.iter().enumerate() {
+            let index = attempt.index;
+            let sent = if index == 0 {
                 request.clone()
             } else {
                 request.clone().with_model(None)
             };
 
-            match call(index, attempt).await {
+            let error = match call(self.provider(attempt), sent).await {
                 Ok(value) => {
                     if index == 0 {
-                        self.set_tripped(None);
+                        self.recover();
                     }
                     return Ok(value);
                 }
-                Err(error) if is_failover_worthy(&error) => {
-                    if index == 0 {
-                        self.set_tripped(Some(self.clock.now()));
-                    }
-                    if let Some(&next) = order.get(position + 1) {
-                        // Always visible: someone paying for a cloud model
-                        // should know when their answers come from elsewhere.
-                        // The reason is coarse on purpose - transport errors
-                        // carry the endpoint URL.
-                        warn!(
-                            "LLM provider `{}` failed ({}); failing over to `{}`",
-                            self.id_of(index),
-                            coarse_reason(&error),
-                            self.id_of(next)
-                        );
-                    }
-                    last_error = Some(error);
+                Err(error) => error,
+            };
+            let worthy = is_failover_worthy(&error);
+            if index == 0 {
+                if !worthy {
+                    // A configuration bug on the primary: surfaced, not hidden.
+                    return Err(error);
                 }
-                Err(error) => return Err(error),
+                self.trip(attempt.probe);
+            }
+
+            // Always visible: someone paying for a cloud model should know
+            // when their answers come from elsewhere, and a fallback that
+            // refuses requests is a configuration bug of its own. The reason
+            // is coarse on purpose - transport errors carry the endpoint URL.
+            match (order.get(position + 1), worthy) {
+                (Some(next), _) => warn!(
+                    "LLM provider `{}` failed ({}); failing over to `{}`",
+                    self.id_of(index),
+                    coarse_reason(&error),
+                    self.id_of(next.index)
+                ),
+                (None, false) => warn!(
+                    "LLM provider `{}` failed ({}); check its configuration",
+                    self.id_of(index),
+                    coarse_reason(&error)
+                ),
+                (None, true) => {}
+            }
+
+            if index == 0 {
+                primary_error = Some(error);
+            } else if first_error.is_none() {
+                first_error = Some(error);
             }
         }
 
-        Err(last_error
+        Err(primary_error
+            .or(first_error)
             .unwrap_or_else(|| LlmError::NoRoute("no provider could serve the request".into())))
     }
 }
@@ -258,19 +356,15 @@ impl LlmProvider for FailoverProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        self.run(request, |index, request| {
-            self.candidates[index].chat(request)
-        })
-        .await
+        self.run(request, |provider, request| provider.chat(request))
+            .await
     }
 
     /// Fails over only while opening the stream. Once a stream is returned,
     /// its events - errors included - reach the consumer untouched.
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream, LlmError> {
-        self.run(request, |index, request| {
-            self.candidates[index].chat_stream(request)
-        })
-        .await
+        self.run(request, |provider, request| provider.chat_stream(request))
+            .await
     }
 }
 
@@ -487,13 +581,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_last_error_is_returned_when_every_candidate_is_down() {
+    async fn the_primarys_error_is_returned_when_every_candidate_is_down() {
         let provider = failover(
             Scripted::down("cloud", api(503)),
             Scripted::down("local", LlmError::Transport("refused".into())),
         );
         let error = provider.chat(request()).await.unwrap_err();
-        assert!(matches!(error, LlmError::Transport(_)), "{error}");
+        assert!(
+            matches!(error, LlmError::Api { status: 503, .. }),
+            "the outage that happened, not the fallback's: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fallbacks_auth_error_does_not_replace_the_primarys_outage() {
+        let local = Scripted::down("local", api(401));
+        let provider = failover(Scripted::down("cloud", api(503)), local.clone());
+
+        let error = provider.chat(request()).await.unwrap_err();
+        assert!(
+            matches!(error, LlmError::Api { status: 503, .. }),
+            "{error}"
+        );
+        assert_eq!(local.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fallbacks_auth_error_during_the_cooldown_still_tries_the_primary() {
+        let clock = ManualClock::new();
+        // Down for the first request only; healthy again by the second.
+        let cloud = Scripted::new("cloud", vec![api(503)]);
+        let local = Scripted::new("local", vec![]);
+        let provider = failover(cloud.clone(), local.clone()).with_clock(clock.clone());
+        assert_eq!(served_by(provider.chat(request()).await), "local");
+
+        // Now inside the cooldown, the fallback turns out misconfigured.
+        local.script.lock().unwrap().push_back(api(401));
+        assert_eq!(
+            served_by(provider.chat(request()).await),
+            "cloud",
+            "a broken fallback must not keep a recovered primary from serving"
+        );
+        assert_eq!(cloud.calls(), 2);
+    }
+
+    /// The primary as the factory builds it: the retried client for normal
+    /// use, and the same client without retries as its probe. Two scripts
+    /// stand in for the two, so the calls each received can be told apart.
+    fn probed(
+        retried: Arc<Scripted>,
+        probe: Arc<Scripted>,
+        fallback: Arc<Scripted>,
+        clock: Arc<ManualClock>,
+    ) -> FailoverProvider {
+        failover(retried, fallback)
+            .with_probe(probe)
+            .with_clock(clock)
+    }
+
+    #[tokio::test]
+    async fn the_first_attempt_after_the_cooldown_is_a_single_probe_without_retries() {
+        let clock = ManualClock::new();
+        let retried = Scripted::down("cloud", api(503));
+        let probe = Scripted::down("cloud", LlmError::Timeout { seconds: 180 });
+        let local = Scripted::healthy("local");
+        let provider = probed(retried.clone(), probe.clone(), local.clone(), clock.clone());
+
+        assert_eq!(served_by(provider.chat(request()).await), "local");
+        assert_eq!((retried.calls(), probe.calls()), (1, 0));
+
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(served_by(provider.chat(request()).await), "local");
+        assert_eq!(
+            (retried.calls(), probe.calls()),
+            (1, 1),
+            "after the cooldown the primary is probed once, without its retry layer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_probe_puts_the_primary_back_in_front() {
+        let clock = ManualClock::new();
+        let retried = Scripted::new("cloud", vec![api(503)]);
+        let probe = Scripted::healthy("cloud");
+        let provider = probed(
+            retried.clone(),
+            probe.clone(),
+            Scripted::healthy("local"),
+            clock.clone(),
+        );
+        provider.chat(request()).await.unwrap();
+
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(served_by(provider.chat(request()).await), "cloud");
+        assert_eq!(probe.calls(), 1);
+
+        assert_eq!(served_by(provider.chat(request()).await), "cloud");
+        assert_eq!(
+            (retried.calls(), probe.calls()),
+            (2, 1),
+            "once recovered, the retried client is used again"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_failed_probe_doubles_the_cooldown_up_to_a_ceiling() {
+        let clock = ManualClock::new();
+        let retried = Scripted::down("cloud", api(503));
+        let probe = Scripted::down("cloud", api(503));
+        let provider = probed(
+            retried,
+            probe.clone(),
+            Scripted::healthy("local"),
+            clock.clone(),
+        );
+        provider.chat(request()).await.unwrap();
+
+        // 60 s, then 120, 240, 480, and 600 from there on.
+        let mut probes = 0;
+        for cooldown in [60, 120, 240, 480, 600, 600] {
+            clock.advance(Duration::from_secs(cooldown - 1));
+            provider.chat(request()).await.unwrap();
+            assert_eq!(
+                probe.calls(),
+                probes,
+                "still cooling down {cooldown} s after the last failure"
+            );
+
+            clock.advance(Duration::from_secs(1));
+            provider.chat(request()).await.unwrap();
+            probes += 1;
+            assert_eq!(probe.calls(), probes, "probed once the {cooldown} s passed");
+        }
     }
 
     #[tokio::test]

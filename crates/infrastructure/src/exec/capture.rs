@@ -13,6 +13,38 @@
 //! * **So does being abandoned.** When the caller drops the future - the turn
 //!   was interrupted - the group is killed as well, not only the direct child
 //!   (see [`super::process`]).
+//! * **And so does finishing.** `(sleep 20; echo x >> Cargo.toml) >/dev/null
+//!   2>&1 &` lets the shell exit at once with the subshell holding no pipe, so the
+//!   capture ends normally while the subshell is still waiting to act - after
+//!   the dependency check has compared the workspace and the call has been
+//!   reported as done. Whatever is left in the group when the command ends is
+//!   therefore killed too.
+//!
+//! ## Kill, then reap
+//!
+//! The group is signalled through the leader's pid, and that is only safe
+//! while the leader is unreaped: once reaped, its pid - and the group id with
+//! it, as soon as the group empties - may be handed to an unrelated process.
+//! So the order has to be "notice the end, kill the group, reap", and tokio's
+//! `Child::wait` cannot provide the middle step: it reports the exit only by
+//! reaping. A non-reaping `waitid(WNOWAIT)` is not something tokio exposes,
+//! and calling it by hand on a pid the runtime owns would mean blocking a
+//! thread on it and keeping that thread in step with the runtime's reaper.
+//!
+//! The end is noticed instead through the pipes. Both reach EOF only when
+//! every process holding a write end has closed it - for the leader that
+//! means it has exited (or deliberately closed both), and a background child
+//! that kept them would hold the capture open until the timeout, which kills
+//! the group anyway. At EOF the leader is at worst a zombie, still owning its
+//! pid, so the group is killed and only then reaped.
+//!
+//! The cost: a leader that closes its own stdout and stderr and keeps working
+//! is killed at that point. That is a command detaching itself from the
+//! capture, which is the behaviour being shut down here.
+//!
+//! What this cannot reach is a process that left the group: `setsid` (or
+//! `setpgid`) puts it beyond a group signal. The OS sandbox still confines
+//! it, but it can outlive the call. The README states this residual risk.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -50,6 +82,8 @@ pub(crate) async fn run_capped(
     let half = max_output_bytes / 2;
     let capture = async {
         let (out, err) = tokio::join!(read_capped(stdout, half), read_capped(stderr, half));
+        // Before `wait`, which reaps: see "Kill, then reap" above.
+        kill_group(pid);
         let status = guarded.child.wait().await;
         guarded.group.disarm();
         (out, err, status)
@@ -234,6 +268,46 @@ mod tests {
             Some(libc::ESRCH),
             "gone, not merely unsignalable"
         );
+    }
+
+    /// A command that finished normally must not leave a background child
+    /// behind: one that holds no pipe would otherwise outlive the call and
+    /// act after it was reported as done.
+    #[tokio::test]
+    async fn a_finished_command_leaves_no_background_child_behind() {
+        let output = run_capped(
+            shell("sleep 30 >/dev/null 2>&1 & echo $!"),
+            Duration::from_secs(20),
+            4096,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, Some(0), "{output:?}");
+        let grandchild: i32 = output.stdout.trim().parse().expect("a pid");
+
+        // SIGKILL is asynchronous and the orphan is reaped by init, so give
+        // it a bounded moment to disappear.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while alive(grandchild) {
+            assert!(
+                Instant::now() < deadline,
+                "background child {grandchild} survived the finished command"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "gone, not merely unsignalable"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_exit_code_survives_the_group_kill() {
+        let output = run_capped(shell("exit 7"), Duration::from_secs(10), 4096)
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, Some(7), "{output:?}");
     }
 
     #[tokio::test]

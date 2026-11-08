@@ -119,12 +119,15 @@ impl McpServer {
     /// [`crate::exec::resolve_sandbox`] - and completes the handshake.
     ///
     /// `workspace` is the canonical workspace root; it is writable for the
-    /// server only when the configuration says so.
+    /// server only when the configuration says so. `withheld` are the
+    /// operator's configured secrets, kept out of the inherited environment
+    /// (see [`crate::exec::ExecConfig::withheld`]).
     pub async fn start(
         name: &str,
         config: &ServerConfig,
         kind: SandboxKind,
         workspace: &Path,
+        withheld: &[String],
     ) -> Result<Self, McpStartError> {
         let setup = |message: String| McpStartError::Setup {
             server: name.to_string(),
@@ -171,6 +174,7 @@ impl McpServer {
             writable,
             scratch: own.clone(),
             proxy_port: egress.as_ref().map(EgressProxy::port),
+            withheld: withheld.to_vec(),
         };
 
         // The server's own directory, always: a relative path in `args`

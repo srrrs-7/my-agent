@@ -27,14 +27,31 @@
 //! before the second scan, and nothing is reported - the dispatcher already
 //! tells the model to check what an interrupted call left behind.
 //!
-//! The scan skips the directories package managers fill with other people's
-//! manifests (`node_modules`, `target`, `vendor`, ...) and stops after a
-//! fixed number of entries, saying so in the result when it does.
+//! ## What the scan walks
+//!
+//! It skips the directories package managers and tools fill with installed
+//! copies (`node_modules`, `target`, `.venv`, ...), and directories the
+//! workspace's ignore files (`.gitignore`, `.ignore`, the repository's
+//! `info/exclude`) exclude. Without the second, a single `venv/` or `build/`
+//! uses up the entry limit on every call, and changes past it go unreported.
+//!
+//! The ignore rules prune **directories only**. A file is compared whatever
+//! the rules say about it: `Cargo.lock` is gitignored in many library crates,
+//! and a lockfile rewritten behind the user's back matters all the same.
+//!
+//! `vendor/` is walked on purpose. Unlike `node_modules`, it is committed
+//! source the build trusts as-is, so a rewritten vendored manifest is a
+//! supply-chain change and exactly what this exists to notice.
+//!
+//! The scan stops after a fixed number of entries. When it does, the result
+//! says so and an [`AgentEvent::DependencyCheckIncomplete`] warns on the
+//! terminal - a check that silently covered half the workspace would read as
+//! "nothing changed".
 
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use agent_domain::error::ToolError;
@@ -44,11 +61,21 @@ use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::events::{AgentEvent, EventSink};
 use agent_domain::ports::tool::Tool;
 use async_trait::async_trait;
+use ignore::WalkBuilder;
 use serde_json::Value;
 
-/// Directories whose manifests belong to installed packages, not to the
-/// project. Compared case-insensitively, like the file names.
-const SKIPPED_DIRS: [&str; 5] = ["node_modules", "target", ".git", ".venv", "vendor"];
+/// Directories whose manifests belong to installed packages or tool state,
+/// not to the project, skipped even where no ignore file says so. Compared
+/// case-insensitively, like the file names. Not `vendor`: see the module docs.
+const SKIPPED_DIRS: [&str; 7] = [
+    "node_modules",
+    "target",
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+];
 
 /// Directory entries visited per scan before giving up. Two scans per call,
 /// so this bounds the cost a large workspace adds to every command.
@@ -130,6 +157,12 @@ impl Tool for DependencyWatchTool {
                 files: changes.clone(),
             });
         }
+        if !complete {
+            self.events.emit(AgentEvent::DependencyCheckIncomplete {
+                name: self.inner.definition().name,
+                limit: self.max_entries,
+            });
+        }
 
         let Some(note) = note(&changes, complete, self.max_entries) else {
             return result;
@@ -200,15 +233,42 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    /// Directories come from an ignore-aware walk, which prunes them; the
+    /// files in each are then listed directly, so no ignore rule ever hides a
+    /// file (see the module docs).
     fn take(root: &Path, limit: usize) -> Self {
         let mut files = BTreeMap::new();
         let mut visited = 0usize;
-        let mut pending: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
 
-        while let Some((directory, relative)) = pending.pop() {
-            let Ok(entries) = std::fs::read_dir(&directory) else {
+        let directories = WalkBuilder::new(root)
+            .hidden(false)
+            .git_ignore(true)
+            .git_exclude(true)
+            // The user's global excludes describe their editor, not this
+            // project; letting them prune would make the check differ by
+            // machine.
+            .git_global(false)
+            .ignore(true)
+            // Apply ignore rules even when the workspace is not a checkout.
+            .require_git(false)
+            // A link out of the workspace is never walked into.
+            .follow_links(false)
+            .filter_entry(|entry| {
+                let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+                let skipped = || {
+                    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                    SKIPPED_DIRS.contains(&name.as_str())
+                };
+                // The root is walked whatever it is called.
+                entry.depth() == 0 || (is_dir && !skipped())
+            })
+            .build();
+
+        for directory in directories.flatten() {
+            let Ok(entries) = std::fs::read_dir(directory.path()) else {
                 continue;
             };
+            let prefix = relative_prefix(root, directory.path());
             for entry in entries.flatten() {
                 visited += 1;
                 if visited > limit {
@@ -217,26 +277,14 @@ impl Snapshot {
                         complete: false,
                     };
                 }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let path = if relative.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{relative}/{name}")
-                };
-                // `file_type` does not follow symlinks, so a link out of the
-                // workspace is never walked into.
-                let Ok(file_type) = entry.file_type() else {
+                // `file_type` does not follow symlinks; a link named
+                // `Cargo.toml` is not a file this directory owns.
+                if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
                     continue;
-                };
-                if file_type.is_dir() {
-                    let lower = name.to_ascii_lowercase();
-                    if !SKIPPED_DIRS.contains(&lower.as_str()) {
-                        pending.push((entry.path(), path));
-                    }
-                } else if file_type.is_file() {
-                    if let Some(kind) = ManifestKind::classify_name(&name) {
-                        files.insert(path, (kind, hash_file(&entry.path())));
-                    }
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(kind) = ManifestKind::classify_name(&name) {
+                    files.insert(format!("{prefix}{name}"), (kind, hash_file(&entry.path())));
                 }
             }
         }
@@ -274,6 +322,17 @@ impl Snapshot {
     }
 }
 
+/// `directory` relative to `root`, `/`-separated with a trailing `/`, or
+/// empty for the root itself.
+fn relative_prefix(root: &Path, directory: &Path) -> String {
+    directory
+        .strip_prefix(root)
+        .unwrap_or(directory)
+        .components()
+        .map(|component| format!("{}/", component.as_os_str().to_string_lossy()))
+        .collect()
+}
+
 fn change(path: &str, kind: ManifestKind, change: FileChange) -> DependencyFileChange {
     DependencyFileChange {
         path: path.to_string(),
@@ -294,6 +353,7 @@ fn hash_file(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     use agent_domain::model::tool::ToolName;
@@ -393,6 +453,26 @@ mod tests {
                     _ => Vec::new(),
                 })
                 .collect()
+        }
+
+        /// The limits of every incomplete-check warning, in order.
+        fn incomplete(&self) -> Vec<usize> {
+            self.events
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::DependencyCheckIncomplete { limit, .. } => Some(*limit),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn write(&self, relative: &str, contents: &str) {
+            let path = self.dir.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
         }
     }
 
@@ -500,6 +580,101 @@ mod tests {
             "{}",
             outcome.content
         );
+        assert_eq!(
+            fixture.incomplete(),
+            [1],
+            "the terminal is warned too, not only the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_scan_raises_no_incomplete_warning() {
+        let fixture = Fixture::new();
+        fixture
+            .watch("index.js", "console.log(1)", false)
+            .execute(json!({}))
+            .await
+            .unwrap();
+        assert!(fixture.incomplete().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gitignored_directory_is_not_walked() {
+        let fixture = Fixture::new();
+        fixture.write(".gitignore", "build/\n");
+        // Far more entries than the limit allows, all inside the ignored
+        // directory: walking into it would leave the scan incomplete.
+        for index in 0..50 {
+            fixture.write(&format!("build/out/{index}.o"), "");
+        }
+        let tool = fixture
+            .watch("build/out/package.json", "{}", false)
+            .with_max_entries(20);
+
+        let outcome = tool.execute(json!({})).await.unwrap();
+
+        assert_eq!(outcome.content, "added 1 package", "nothing to report");
+        assert!(fixture.reported().is_empty());
+        assert!(fixture.incomplete().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gitignored_lockfile_is_still_compared() {
+        let fixture = Fixture::new();
+        fixture.write(".gitignore", "Cargo.lock\n");
+        fixture.write("Cargo.lock", "version = 3\n");
+        let tool = fixture.watch("Cargo.lock", "version = 4\n", false);
+
+        tool.execute(json!({})).await.unwrap();
+
+        assert_eq!(
+            fixture.reported(),
+            [change(
+                "Cargo.lock",
+                ManifestKind::CargoLock,
+                FileChange::Modified
+            )],
+            "ignore rules prune directories, never files"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vendored_manifest_is_watched() {
+        let fixture = Fixture::new();
+        fixture.write("vendor/x/Cargo.toml", "[package]\nname = \"x\"\n");
+        let tool = fixture.watch(
+            "vendor/x/Cargo.toml",
+            "[package]\nname = \"x\"\nbuild = \"evil.rs\"\n",
+            false,
+        );
+
+        tool.execute(json!({})).await.unwrap();
+
+        assert_eq!(
+            fixture.reported(),
+            [change(
+                "vendor/x/Cargo.toml",
+                ManifestKind::CargoToml,
+                FileChange::Modified
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_state_directories_are_skipped_without_an_ignore_file() {
+        for file in [
+            "venv/lib/pyproject.toml",
+            "__pycache__/lib/pyproject.toml",
+            ".tox/lib/pyproject.toml",
+        ] {
+            let fixture = Fixture::new();
+            let outcome = fixture
+                .watch(file, "[project]", false)
+                .execute(json!({}))
+                .await
+                .unwrap();
+            assert_eq!(outcome.content, "added 1 package", "{file}");
+        }
     }
 
     #[test]

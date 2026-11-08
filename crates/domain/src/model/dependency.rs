@@ -10,7 +10,12 @@
 //! a case-insensitive filesystem (macOS, Windows) opens `cargo.toml` as
 //! `Cargo.toml`, so a spelling that slips past the comparison would slip past
 //! the gate while still changing the real file. The directory does not
-//! matter either - a nested crate or a vendored package has a manifest too.
+//! matter either - a nested crate or a vendored package has a manifest too,
+//! and a vendored manifest is committed code the next build trusts, so a
+//! change to it is a supply-chain change like any other. (What a scan of the
+//! whole workspace may skip is a different question - copies a package
+//! manager installed, such as `node_modules` - and is answered where the
+//! scan is.)
 //!
 //! What a change *contains* is described by parsers in the application layer.
 //! The description is for the human; whether to ask at all never depends on

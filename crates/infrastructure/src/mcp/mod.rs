@@ -37,10 +37,14 @@ use crate::exec::{SandboxRequirement, resolve_sandbox};
 /// the partial list is dropped: an agent missing tools the operator
 /// configured would behave differently from what they set up, without
 /// saying so.
+///
+/// `withheld` are the operator's configured secrets; see
+/// [`McpServer::start`].
 pub async fn start_servers(
     config: &McpConfig,
     requirement: SandboxRequirement,
     workspace: &Path,
+    withheld: &[String],
 ) -> Result<Vec<Arc<McpServer>>, McpStartError> {
     if config.servers.is_empty() {
         return Ok(Vec::new());
@@ -49,7 +53,7 @@ pub async fn start_servers(
     let mut started = Vec::with_capacity(config.servers.len());
     for (name, server) in &config.servers {
         started.push(Arc::new(
-            McpServer::start(name, server, kind, workspace).await?,
+            McpServer::start(name, server, kind, workspace, withheld).await?,
         ));
     }
     Ok(started)
