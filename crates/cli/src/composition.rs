@@ -107,12 +107,23 @@ pub struct Wiring {
 /// Async because the egress proxy binds a socket at startup - see
 /// [`SandboxedCommandRunner::start`].
 pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
+    let events = Arc::new(TerminalRenderer::new(cli.verbose, cli.no_color));
+    build_with_events(cli, interactive, events).await
+}
+
+/// [`build`], narrated to `events` instead of the terminal - for
+/// `agent run --output-format json`, whose stdout must carry JSON only.
+pub async fn build_with_events(
+    cli: &Cli,
+    interactive: bool,
+    events: Arc<dyn EventSink>,
+) -> Result<Application> {
     let settings = resolve_settings(cli)?;
     assemble(
         settings,
         Wiring {
             interactive,
-            events: Arc::new(TerminalRenderer::new(cli.verbose, cli.no_color)),
+            events,
             model: cli.model.as_deref().map(ModelId::new),
             // Read after `main` loaded `.env`, so its variables are among the
             // environment's.

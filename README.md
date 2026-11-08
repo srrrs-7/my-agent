@@ -166,10 +166,75 @@ make run ARGS="sessions --delete <ID>"    # 記録を消す
 
 出力のチャネル分離:
 
-- **stdout** … モデルの回答のみ（`agent run "..." > answer.md` がそのまま使えます）
+- **stdout** … モデルの回答のみ（`agent run "..." > answer.md` がそのまま使えます）。
+  `--output-format json|stream-json` では JSON のみ（下の「スクリプトから使う」）
 - **stderr** … ツール実行ログ、承認プロンプト、警告
 
 終了コード: `0` 正常終了 / `2` 反復上限に達して未完了 / `1` エラー / `130` Ctrl-C で中断。
+
+### スクリプトから使う（構造化出力）
+
+`agent run --output-format <FORMAT>` で stdout の形を選べます（既定は `text`）。
+フラグはプロンプトより**前**に置きます（プロンプト以降の語はすべてプロンプトとして結合されるため）。
+
+| FORMAT | stdout |
+|---|---|
+| `text` | 回答の散文（従来どおり） |
+| `json` | ターン終了時に結果オブジェクトを 1 つだけ |
+| `stream-json` | イベントを 1 行 1 JSON で逐次、最後の行が結果オブジェクト |
+
+```bash
+make run ARGS="run --output-format json 'テストを直して'" | jq -r .final_text
+```
+
+`json` / `stream-json` では **stdout は JSON だけ**です（散文もストリーミングの断片も出しません）。
+ツール実行ログ・警告・中断の案内はどちらのモードでも stderr に出ます
+（`json` は終わるまで stdout が無言なので、進捗を見る手段として残しています。不要なら `2>/dev/null`）。
+終了コードは `text` と同じで、結果オブジェクトの `exit_code` にも入ります。
+失敗時も（設定の誤りで起動できない場合・プロバイダの失敗を含む）`reason: "error"` の結果オブジェクトを出したうえで、
+エラーは従来どおり stderr にも出ます。Ctrl-C で止めた場合は `reason: "interrupted"`（その時点までの内容）を出して `130` で終わります。
+
+**全行に `"v": 1`** が付きます。フィールドの削除・改名・型変更をするときだけ上げます。
+フィールドやイベント種別の追加では上げないので、読む側は知らないキーと `type` を無視してください。
+モデルやツール由来の文字列は値を変えずに入ります（制御文字・双方向制御などは `\uXXXX` でエスケープされるだけです）。
+
+結果オブジェクト（`json` の唯一の行、`stream-json` の最後の行）:
+
+```json
+{"v":1,"type":"result","reason":"completed","final_text":"...","session_id":"9f1c...",
+ "iterations":2,"usage":{"input_tokens":1200,"output_tokens":80,"cache_read_tokens":1000,
+ "cache_write_tokens":0},"exit_code":0}
+```
+
+| `reason` | 追加のキー | `exit_code` |
+|---|---|---|
+| `completed` | — | `0` |
+| `max_iterations` | `limit` | `2` |
+| `stopped`（プロバイダ側の停止） | `stop_reason` | `2` |
+| `interrupted` | — | `130` |
+| `error` | `error`（メッセージ） | `1` |
+
+`session_id` は起動前に失敗した場合だけ `null` です。`usage` はそのターンの合計（`input_tokens` はキャッシュ分を含む）。
+
+`stream-json` のイベント（`type` ごとのキー。`v` と `type` は省略）:
+
+| `type` | キー |
+|---|---|
+| `run_started` | `session_id`, `provider`, `model`（既定モデルなら `null`） |
+| `iteration_started` | `iteration`, `limit` |
+| `history_trimmed` | `dropped_messages` |
+| `history_compacted` | `folded_messages`, `before_bytes`, `after_bytes` |
+| `model_responded` | `provider`, `model`, `stop_reason`（`end_turn` / `tool_use` / `max_tokens` / `stop_sequence` / プロバイダの値そのまま）, `usage`, `latency_ms` |
+| `assistant_delta` | `text`（ストリーミングの断片。`AGENT_STREAM=false` では出ない） |
+| `assistant_message` | `text`（完成した発言。断片を連結したものと同じ） |
+| `tool_call_started` | `call_id`, `name`, `arguments`（モデルが書いた JSON のまま）, `safety`（`read_only` / `mutating` / `network` / `destructive`） |
+| `tool_call_finished` | `call_id`, `name`, `is_error`, `summary`, `duration_ms` |
+| `tool_call_denied` | `name`, `reason` |
+| `dependencies_changed` | `name`, `files`（`[{path, kind: manifest/lockfile/config, change: created/modified/deleted}]`） |
+| `dependency_check_incomplete` | `name`, `limit` |
+| `plan_updated` | `items`（`[{content, status: pending/in_progress/completed}]`、空なら計画の消去） |
+| `run_finished` | `reason`（と結果オブジェクトと同じ追加キー）, `iterations`, `usage` |
+| `result` | 上の結果オブジェクト。必ず最後の 1 行 |
 
 ### ツール承認（human-in-the-loop）
 

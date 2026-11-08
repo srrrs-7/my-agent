@@ -114,6 +114,17 @@ Arc<dyn LlmProvider>
 
 `agent run "..." > answer.md` が期待どおり動くのはこの分離のためです。壊さないでください。
 
+**`agent run --output-format json|stream-json` では stdout は JSON だけ**です（`cli/src/output/`）。
+散文もストリーミングの断片も stdout に出しません — 回答は結果オブジェクトの `final_text` に入ります。
+stderr はそのまま（`TerminalRenderer` から散文のイベントだけを除いて転送）。
+JSON の形は cli 側の DTO（`output/dto.rs`）が決め、**`AgentEvent` やドメイン型に `Serialize` を付けません**。
+ドメインの改名が公開スキーマを黙って変えないためです。全行に `"v":1` が付きます。
+起動失敗・プロバイダの失敗・中断を含め、どの終わり方でも最後に `"type":"result"` の 1 行を出します。
+
+JSON 内の文字列（モデルの散文・ツール引数・要約）は**値を変えず**に渡します。`printable` は掛けず、
+代わりに `is_unprintable` な文字を `\uXXXX` でエスケープして書きます（パース後の値は同一、
+生のバイトは端末を書き換えない）。
+
 stderr に出す文字列のうち、モデルやサーバ（MCP サーバ・LLM プロバイダ・ファイルの中身）が決めたもの
 — ツール引数、結果の要約、計画の項目、ファイル名、拒否理由など — は、**出口で一度だけ**
 `domain::text::printable` を通します。制御文字・双方向制御・不可視文字が端末の表示を書き換え、
