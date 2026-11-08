@@ -400,21 +400,8 @@ impl AgentLoop {
     /// abandoned before it changed anything, and trimming is skipped too: the
     /// turn is ending, and the next one fits the history again first.
     async fn fit_history(&self, session: &mut Session, interrupt: &Interrupt) -> Option<()> {
-        let max_bytes = self.config.max_history_bytes;
-        let reminder = plan::reminder(session.plan());
-        let note_bytes = reminder.as_ref().map_or(0, Message::approx_bytes);
-        // Room is kept for the note that may have to be appended - unless a
-        // copy is already in the history, where its bytes are counted once
-        // already. Should the shortening remove that copy, room for the new
-        // one is made below, before it is appended.
-        let noted = reminder
-            .as_ref()
-            .is_some_and(|note| plan::already_noted(session, note));
-        let budget = if noted {
-            max_bytes
-        } else {
-            max_bytes.saturating_sub(note_bytes)
-        };
+        let reservation = plan::reserve(self.config.max_history_bytes, session);
+        let budget = reservation.budget;
         let mut compacted = false;
 
         if session.conversation.approx_bytes() > budget
@@ -447,20 +434,16 @@ impl AgentLoop {
             .trim_to_budget(budget, low_water, keep_recent);
 
         if (compacted || dropped > 0)
-            && let Some(reminder) = reminder
-            && !plan::still_visible(session, &reminder)
+            && let Some(restore) = reservation.restore(session)
         {
-            if noted {
-                // The copy the budget counted is gone, and nothing was
-                // reserved for its replacement.
-                let budget = max_bytes.saturating_sub(note_bytes);
+            if let Some(budget) = restore.make_room {
                 dropped += session.conversation.trim_to_budget(
                     budget,
                     trim_low_water(budget),
                     keep_recent,
                 );
             }
-            session.conversation.push(reminder);
+            session.conversation.push(restore.note);
             self.record(session, 1).await;
         }
         if dropped > 0 {

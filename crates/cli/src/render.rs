@@ -399,13 +399,14 @@ fn format_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
     use agent_domain::model::plan::PlanItem;
+    use agent_domain::model::workspace::WorkspacePath;
 
     #[test]
     fn a_dependency_warning_names_the_tool_and_every_file_up_to_a_limit() {
         use agent_domain::model::dependency::{FileChange, ManifestKind};
         let files: Vec<DependencyFileChange> = (0..MAX_FILES_SHOWN + 2)
             .map(|n| DependencyFileChange {
-                path: format!("crate{n}/Cargo.lock"),
+                path: WorkspacePath::parse(&format!("crate{n}/Cargo.lock")).unwrap(),
                 kind: ManifestKind::CargoLock,
                 change: FileChange::Modified,
             })
@@ -572,7 +573,7 @@ mod tests {
             AgentEvent::DependenciesChanged {
                 name: name.clone(),
                 files: vec![DependencyFileChange {
-                    path: EVIL.into(),
+                    path: WorkspacePath::parse(EVIL).unwrap(),
                     kind: ManifestKind::CargoToml,
                     change: FileChange::Modified,
                 }],

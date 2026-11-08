@@ -5,13 +5,14 @@
 
 use std::process::ExitCode;
 
-use agent_application::agent::{Interrupt, Session};
+use agent_application::agent::Session;
 use anyhow::Result;
 
 use crate::args::Resume;
 use crate::commands::tools;
+use crate::commands::turn::run_turn;
 use crate::composition::Application;
-use crate::ctrl_c::{CtrlC, Sigint, TurnEnd, drive};
+use crate::ctrl_c::{CtrlC, Sigint, TurnEnd};
 use crate::input::prompt_line;
 use crate::notify::DRAIN_TIMEOUT;
 use crate::render::{describe_plan, describe_usage};
@@ -77,16 +78,11 @@ async fn repl(app: &Application, resume: Resume) -> Result<ExitCode> {
             Input::Prompt => {}
         }
 
-        app.notifications.begin_turn(&session.id);
-        let interrupt = Interrupt::new();
-        let turn = app.agent.run_until(&mut session, line, &interrupt);
-        let result = match drive(turn, &interrupt, &mut sigint, &mut keys).await {
+        // An interrupted turn is `Ok` and the session carries on from it.
+        let result = match run_turn(app, &mut session, line, &mut sigint, &mut keys).await {
             TurnEnd::Finished(result) => result,
             TurnEnd::Abandoned(code) => return Ok(code),
         };
-        // An interrupted turn is `Ok` and the session carries on from it; the
-        // notifier is told, and its policy is what keeps it quiet.
-        app.notifications.turn_finished(&result);
 
         // A failed turn must not end the session: the user may want to fix the
         // configuration, or simply try a different prompt.

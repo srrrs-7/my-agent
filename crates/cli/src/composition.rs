@@ -219,12 +219,10 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         })
         .context("cannot build the web fetcher")?;
 
-        let mut registry = (*tools).clone();
-        registry.register(TimeoutTool::wrap(
+        tools.register(TimeoutTool::wrap(
             Arc::new(WebFetchTool::new(Arc::new(fetcher))),
             settings.agent_loop.tool_timeout,
         ));
-        tools = Arc::new(registry);
     }
 
     // run_command is opt-in for a stronger reason than web_fetch: a command's
@@ -239,8 +237,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         )
         .await?;
 
-        let mut registry = (*tools).clone();
-        registry.register(TimeoutTool::wrap(
+        tools.register(TimeoutTool::wrap(
             Arc::new(RunCommandTool::new(
                 runner.clone(),
                 &settings.shell.allowed_domains,
@@ -249,30 +246,28 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
             // runner that never returns at all.
             settings.agent_loop.tool_timeout + std::time::Duration::from_secs(600),
         ));
-        tools = Arc::new(registry);
         Some(runner)
     } else {
         None
     };
 
-    // Before the wrapping below, so server tools are watched and redacted
-    // like every other destructive tool.
-    let mut registry = (*tools).clone();
+    // Last of the registrations, so a server tool whose name collides with
+    // any tool above is refused. Before the wrapping below, so server tools
+    // are watched and redacted like every other destructive tool.
     let tool_servers = register_tool_servers(
-        &mut registry,
+        &mut tools,
         mcp_config.as_ref(),
         &settings,
         workspace.as_path(),
     )
     .await?;
-    let tools = Arc::new(registry);
 
     // After every tool is registered, so none can be missed. Unconditional:
     // AGENT_ALLOW_DEPENDENCY_CHANGES skips the question, not the report.
-    let tools = watch_destructive(&tools, &workspace, &events);
+    let tools = watch_destructive(tools, &workspace, &events);
     // Last, so that a tool registered above can never be missed - and so the
     // dependency note is redacted like the rest of the output.
-    let tools = redact_all(&tools, &redactor);
+    let tools = Arc::new(redact_all(tools, &redactor));
 
     // --- the loop ------------------------------------------------------------
     // Disabled means `NullConversationLog`, not a flag the loop checks: there
@@ -479,33 +474,31 @@ fn build_tools(
     searcher: Arc<IgnoreAwareSearcher>,
     workspace: Arc<WorkspaceRoot>,
     timeout: std::time::Duration,
-) -> Arc<ToolRegistry> {
+) -> ToolRegistry {
     let timed = |tool: Arc<dyn Tool>| TimeoutTool::wrap(tool, timeout);
-    Arc::new(
-        ToolRegistry::new()
-            .with(timed(Arc::new(ReadFileTool::new(
-                file_system.clone(),
-                workspace.clone(),
-            ))))
-            .with(timed(Arc::new(WriteFileTool::new(
-                file_system.clone(),
-                workspace.clone(),
-            ))))
-            .with(timed(Arc::new(EditFileTool::new(
-                file_system.clone(),
-                workspace.clone(),
-            ))))
-            .with(timed(Arc::new(ListDirectoryTool::new(
-                file_system,
-                workspace.clone(),
-            ))))
-            .with(timed(Arc::new(SearchFilesTool::new(
-                searcher.clone(),
-                workspace.clone(),
-            ))))
-            .with(timed(Arc::new(GlobTool::new(searcher, workspace))))
-            .with(timed(Arc::new(TodoWriteTool::new()))),
-    )
+    ToolRegistry::new()
+        .with(timed(Arc::new(ReadFileTool::new(
+            file_system.clone(),
+            workspace.clone(),
+        ))))
+        .with(timed(Arc::new(WriteFileTool::new(
+            file_system.clone(),
+            workspace.clone(),
+        ))))
+        .with(timed(Arc::new(EditFileTool::new(
+            file_system.clone(),
+            workspace.clone(),
+        ))))
+        .with(timed(Arc::new(ListDirectoryTool::new(
+            file_system,
+            workspace.clone(),
+        ))))
+        .with(timed(Arc::new(SearchFilesTool::new(
+            searcher.clone(),
+            workspace.clone(),
+        ))))
+        .with(timed(Arc::new(GlobTool::new(searcher, workspace))))
+        .with(timed(Arc::new(TodoWriteTool::new())))
 }
 
 /// Every destructive tool, wrapped so that a change it makes to dependency
@@ -513,34 +506,24 @@ fn build_tools(
 /// [`DependencyWatchTool::watches`]), and wrapped outside the timeout so a
 /// call cut off by it is still compared.
 fn watch_destructive(
-    tools: &ToolRegistry,
+    tools: ToolRegistry,
     workspace: &Arc<WorkspaceRoot>,
     events: &Arc<dyn EventSink>,
-) -> Arc<ToolRegistry> {
-    let mut watched = ToolRegistry::new();
-    for definition in tools.definitions() {
-        if let Some(tool) = tools.get(&definition.name) {
-            watched.register(if DependencyWatchTool::watches(&definition) {
-                DependencyWatchTool::wrap(tool, workspace.clone(), events.clone())
-            } else {
-                tool
-            });
+) -> ToolRegistry {
+    tools.map(|definition, tool| {
+        if DependencyWatchTool::watches(definition) {
+            DependencyWatchTool::wrap(tool, workspace.clone(), events.clone())
+        } else {
+            tool
         }
-    }
-    Arc::new(watched)
+    })
 }
 
 /// Every registered tool, wrapped so that a known secret never reaches the
 /// model through its output. Outermost, so it also covers the timeout's
 /// error.
-fn redact_all(tools: &ToolRegistry, redactor: &Arc<Redactor>) -> Arc<ToolRegistry> {
-    let mut redacted = ToolRegistry::new();
-    for definition in tools.definitions() {
-        if let Some(tool) = tools.get(&definition.name) {
-            redacted.register(RedactingTool::wrap(tool, redactor.clone()));
-        }
-    }
-    Arc::new(redacted)
+fn redact_all(tools: ToolRegistry, redactor: &Arc<Redactor>) -> ToolRegistry {
+    tools.map(|_, tool| RedactingTool::wrap(tool, redactor.clone()))
 }
 
 /// Resolves the operator's prompt configuration into the builder the loop
@@ -732,8 +715,8 @@ mod tests {
             workspace.clone(),
             std::time::Duration::from_secs(5),
         );
-        let tools = watch_destructive(&tools, &workspace, &events);
-        let tools = redact_all(&tools, &Arc::new(Redactor::new(Vec::new())));
+        let tools = watch_destructive(tools, &workspace, &events);
+        let tools = redact_all(tools, &Arc::new(Redactor::new(Vec::new())));
 
         let write = tools.get(&ToolName::new("write_file").unwrap()).unwrap();
         let planned = write

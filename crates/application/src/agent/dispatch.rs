@@ -34,7 +34,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_domain::error::ToolError;
-use agent_domain::model::dependency::{ManifestChange, ManifestKind};
 use agent_domain::model::tool::{ToolCall, ToolDefinition, ToolResult, ToolSafety};
 use agent_domain::ports::approval::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest,
@@ -95,7 +94,7 @@ pub struct ToolDispatcher {
 }
 
 /// What the dispatcher decided to do with one call.
-enum Plan {
+enum Disposition {
     Run {
         tool: Arc<dyn Tool>,
         safety: ToolSafety,
@@ -130,13 +129,13 @@ impl ToolDispatcher {
         // be an interactive prompt, and two prompts at once are unreadable.
         // An interrupt during a prompt abandons it: no answer means no
         // approval, so that call and every one after it is left unrun.
-        let mut plans = Vec::with_capacity(calls.len());
+        let mut dispositions = Vec::with_capacity(calls.len());
         for call in calls {
-            let plan = interrupt
+            let disposition = interrupt
                 .guard(self.plan(call))
                 .await
-                .unwrap_or_else(|| Plan::Short(ToolResult::error(call, NOT_STARTED)));
-            plans.push(plan);
+                .unwrap_or_else(|| Disposition::Short(ToolResult::error(call, NOT_STARTED)));
+            dispositions.push(disposition);
         }
 
         // Phase 2 - split by safety, then run.
@@ -144,10 +143,10 @@ impl ToolDispatcher {
         let mut concurrent = Vec::new();
         let mut sequential = Vec::new();
 
-        for (index, plan) in plans.into_iter().enumerate() {
-            match plan {
-                Plan::Short(result) => results[index] = Some(result),
-                Plan::Run { tool, safety } => {
+        for (index, disposition) in dispositions.into_iter().enumerate() {
+            match disposition {
+                Disposition::Short(result) => results[index] = Some(result),
+                Disposition::Run { tool, safety } => {
                     if self.config.parallel_read_only_tools && safety.is_read_only() {
                         concurrent.push((index, tool, safety));
                     } else {
@@ -199,9 +198,9 @@ impl ToolDispatcher {
             .collect()
     }
 
-    async fn plan(&self, call: &ToolCall) -> Plan {
+    async fn plan(&self, call: &ToolCall) -> Disposition {
         let Some(tool) = self.tools.get(&call.name) else {
-            return Plan::Short(ToolResult::error(
+            return Disposition::Short(ToolResult::error(
                 call,
                 format!(
                     "Unknown tool `{}`. Available tools: {}. Use one of these instead.",
@@ -219,21 +218,15 @@ impl ToolDispatcher {
         };
 
         match self.approval.authorize(&request).await {
-            Ok(ApprovalDecision::Approve) => Plan::Run { tool, safety },
+            Ok(ApprovalDecision::Approve) => Disposition::Run { tool, safety },
             Ok(ApprovalDecision::Deny { reason }) => {
-                self.events.emit(AgentEvent::ToolCallDenied {
-                    name: call.name.clone(),
-                    reason: reason.clone(),
-                });
-                Plan::Short(ToolResult::error(
-                    call,
-                    format!(
-                        "The user declined this tool call: {reason}. \
-                         Do not retry it - propose a different approach or ask how to proceed."
-                    ),
-                ))
+                let message = format!(
+                    "The user declined this tool call: {reason}. \
+                     Do not retry it - propose a different approach or ask how to proceed."
+                );
+                Disposition::Short(self.denied(call, reason, message))
             }
-            Err(error) => Plan::Short(ToolResult::error(
+            Err(error) => Disposition::Short(ToolResult::error(
                 call,
                 format!("Could not obtain approval for this call: {error}"),
             )),
@@ -241,15 +234,8 @@ impl ToolDispatcher {
     }
 
     /// Asks for the dependency approval if `call` would change a dependency
-    /// file. `Err` carries the result to hand back instead of running it.
-    ///
-    /// Whether to ask depends only on which files change - a classified path
-    /// whose content would differ. The parsed description is what the human
-    /// reads; a file that fails to parse is still asked about.
-    ///
-    /// A file counts when either the name the call uses or the file it really
-    /// reaches is a dependency file: `deps.txt -> Cargo.toml` is a write to
-    /// `Cargo.toml`.
+    /// file (see [`supply_chain::manifest_changes`] for which writes count).
+    /// `Err` carries the result to hand back instead of running it.
     async fn confirm_dependencies(
         &self,
         tool: &dyn Tool,
@@ -286,23 +272,7 @@ impl ToolDispatcher {
             }
         };
 
-        let changes: Vec<ManifestChange> = writes
-            .into_iter()
-            .filter(|write| !write.is_no_op())
-            .filter_map(|write| {
-                let kind = ManifestKind::classify(&write.target)
-                    .or_else(|| ManifestKind::classify(&write.path))?;
-                let description = supply_chain::describe(kind, write.before.text(), &write.after);
-                let target = (write.target != write.path).then_some(write.target);
-                Some(ManifestChange {
-                    path: write.path,
-                    target,
-                    kind,
-                    before: write.before,
-                    description,
-                })
-            })
-            .collect();
+        let changes = supply_chain::manifest_changes(writes);
         if changes.is_empty() {
             return Ok(());
         }
@@ -323,20 +293,14 @@ impl ToolDispatcher {
         match self.approval.authorize_dependency_change(&request).await {
             Ok(ApprovalDecision::Approve) => Ok(()),
             Ok(ApprovalDecision::Deny { reason }) => {
-                self.events.emit(AgentEvent::ToolCallDenied {
-                    name: call.name.clone(),
-                    reason: reason.clone(),
-                });
-                Err(ToolResult::error(
-                    call,
-                    format!(
-                        "Not executed: this call changes dependency files ({files}), and the \
-                         change was not approved: {reason}. Nothing was written. Do not retry \
-                         it or make the same change another way (another tool, a command) - \
-                         continue without the new dependency, or tell the user which \
-                         dependencies you need and why, and let them decide."
-                    ),
-                ))
+                let message = format!(
+                    "Not executed: this call changes dependency files ({files}), and the \
+                     change was not approved: {reason}. Nothing was written. Do not retry \
+                     it or make the same change another way (another tool, a command) - \
+                     continue without the new dependency, or tell the user which \
+                     dependencies you need and why, and let them decide."
+                );
+                Err(self.denied(call, reason, message))
             }
             Err(error) => Err(ToolResult::error(
                 call,
@@ -346,6 +310,16 @@ impl ToolDispatcher {
                 ),
             )),
         }
+    }
+
+    /// Records a denial for the human (an event carrying their `reason`) and
+    /// answers the call with `message`, which tells the model what to do next.
+    fn denied(&self, call: &ToolCall, reason: String, message: String) -> ToolResult {
+        self.events.emit(AgentEvent::ToolCallDenied {
+            name: call.name.clone(),
+            reason,
+        });
+        ToolResult::error(call, message)
     }
 
     async fn invoke(

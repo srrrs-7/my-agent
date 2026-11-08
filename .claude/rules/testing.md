@@ -11,9 +11,11 @@
 | infrastructure（HTTP） | `agent-test-support` のモックサーバ | ステータス写像、実際に送出される JSON |
 | 全体 | E2E | HTTP → ループ → 実ファイル書き込み |
 
-フェイクは `crates/application/tests/agent_loop.rs` に揃っています
+フェイクは `crates/application/tests/common/mod.rs` に揃っています
 （`ScriptedProvider`, `MemoryFileSystem`, `AlwaysApprove` / `AlwaysDeny`, `RecordingSink`）。
 新しいフェイクを書く前に、そこにあるものを使えないか確認してください。
+ループのシナリオは関心ごとにファイルを分けています（`agent_loop.rs` / `compaction_trim.rs` /
+`plan.rs` / `interrupt.rs` / `dependency_gate.rs`）。各ファイルは `mod common;` で共通部を取り込みます。
 
 HTTP レベルのモックは `crates/test-support` です。infrastructure と cli の両方から使えます。
 

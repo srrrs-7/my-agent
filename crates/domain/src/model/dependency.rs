@@ -339,11 +339,11 @@ impl FileChange {
     }
 }
 
-/// One dependency file a command changed. The path is workspace-relative and
-/// `/`-separated; it comes from a directory walk, not from a model.
+/// One dependency file a command changed. The path comes from a directory
+/// walk, not from a model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyFileChange {
-    pub path: String,
+    pub path: WorkspacePath,
     pub kind: ManifestKind,
     pub change: FileChange,
 }

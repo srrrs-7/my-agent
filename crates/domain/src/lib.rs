@@ -32,6 +32,7 @@ pub use model::{
         DependencyChange, DependencyChangeDescription, DependencyFileChange, FileChange,
         ManifestChange, ManifestKind,
     },
+    glob::GlobPattern,
     llm::{
         ChatRequest, ChatResponse, GenerationParams, ModelId, ProviderCapabilities, ProviderId,
         RequestMetadata, StopReason, TaskKind, TokenUsage,

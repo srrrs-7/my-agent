@@ -194,8 +194,7 @@ fn walk_start(root: &WorkspaceRoot, subtree: &WorkspacePath) -> Result<WalkStart
 }
 
 fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, FsError> {
-    let pattern = query.pattern.trim();
-    check_glob(pattern)?;
+    let pattern = query.pattern.as_str();
 
     let WalkStart {
         base,
@@ -266,36 +265,6 @@ fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, 
     })
 }
 
-/// Refuses a pattern that reaches outside the subtree it is matched in.
-///
-/// Such a pattern could never match anything the walk visits, so accepting it
-/// would answer "no files" - which reads as "nothing like that exists" rather
-/// than "you asked the wrong way".
-fn check_glob(pattern: &str) -> Result<(), FsError> {
-    let refuse = |reason: &str| Err(FsError::InvalidPattern(reason.to_string()));
-    if pattern.is_empty() {
-        return refuse("the glob is empty. Pass a pattern such as `**/*.rs`");
-    }
-    if pattern.contains('\0') {
-        return refuse("the glob contains a NUL byte");
-    }
-    let bytes = pattern.as_bytes();
-    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    if pattern.starts_with(['/', '\\']) || drive {
-        return refuse(
-            "the glob must be relative to `path`, not absolute. Drop the leading `/` and pass \
-             the directory to search as `path` instead",
-        );
-    }
-    if pattern.split(['/', '\\']).any(|segment| segment == "..") {
-        return refuse(
-            "the glob must not contain `..`: it only matches inside the workspace. Pass the \
-             directory to search as `path` instead",
-        );
-    }
-    Ok(())
-}
-
 /// Whether some segment of the pattern starts with a dot (`.github/*`,
 /// `**/.env*`), i.e. names an entry the walk would otherwise skip as hidden.
 fn names_a_hidden_entry(pattern: &str) -> bool {
@@ -337,6 +306,7 @@ fn permitted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_domain::model::glob::GlobPattern;
     use agent_domain::model::workspace::WorkspacePath;
 
     fn write(dir: &std::path::Path, relative: &str, contents: &str) {
@@ -494,7 +464,7 @@ mod tests {
 
     fn glob(pattern: &str) -> GlobQuery {
         GlobQuery {
-            pattern: pattern.to_string(),
+            pattern: GlobPattern::new(pattern).unwrap(),
             root: WorkspacePath::root(),
             max_results: 100,
         }
@@ -651,27 +621,5 @@ mod tests {
         assert_eq!(found.paths.len(), 2);
         assert_eq!(found.total, 3);
         assert!(found.truncated());
-    }
-
-    #[tokio::test]
-    async fn glob_refuses_patterns_that_reach_outside_the_workspace() {
-        let dir = tempfile::tempdir().unwrap();
-        let searcher = searcher(dir.path());
-
-        for pattern in [
-            "../*.rs",
-            "src/../../etc/*",
-            "/etc/passwd",
-            "\\\\server\\share",
-            "C:/x",
-        ] {
-            let error = searcher.glob(glob(pattern)).await.unwrap_err();
-            assert!(
-                matches!(error, FsError::InvalidPattern(_)),
-                "`{pattern}` must be refused, got {error:?}"
-            );
-        }
-        let error = searcher.glob(glob("  ")).await.unwrap_err();
-        assert!(matches!(error, FsError::InvalidPattern(_)), "got {error:?}");
     }
 }

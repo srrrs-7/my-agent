@@ -57,7 +57,7 @@ use std::sync::Arc;
 use agent_domain::error::ToolError;
 use agent_domain::model::dependency::{DependencyFileChange, FileChange, ManifestKind};
 use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolOutcome, ToolSafety};
-use agent_domain::model::workspace::WorkspaceRoot;
+use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::events::{AgentEvent, EventSink};
 use agent_domain::ports::tool::Tool;
 use agent_domain::text::printable;
@@ -121,7 +121,7 @@ impl DependencyWatchTool {
     }
 
     async fn scan(&self) -> Snapshot {
-        let root = self.root.as_path().to_path_buf();
+        let root = self.root.clone();
         let limit = self.max_entries;
         tokio::task::spawn_blocking(move || Snapshot::take(&root, limit))
             .await
@@ -192,7 +192,7 @@ fn note(changes: &[DependencyFileChange], complete: bool, limit: usize) -> Optio
             .map(|change| {
                 format!(
                     "{} ({} {})",
-                    printable(&change.path),
+                    printable(&change.path.display()),
                     change.kind.label(),
                     change.change.label()
                 )
@@ -220,7 +220,7 @@ fn note(changes: &[DependencyFileChange], complete: bool, limit: usize) -> Optio
 /// so std's SipHash is enough; nothing here needs to resist a collision
 /// crafted in advance.
 struct Snapshot {
-    files: BTreeMap<String, (ManifestKind, Option<u64>)>,
+    files: BTreeMap<WorkspacePath, (ManifestKind, Option<u64>)>,
     /// Every entry was visited.
     complete: bool,
 }
@@ -229,11 +229,11 @@ impl Snapshot {
     /// Directories come from an ignore-aware walk, which prunes them; the
     /// files in each are then listed directly, so no ignore rule ever hides a
     /// file (see the module docs).
-    fn take(root: &Path, limit: usize) -> Self {
+    fn take(root: &WorkspaceRoot, limit: usize) -> Self {
         let mut files = BTreeMap::new();
         let mut visited = 0usize;
 
-        let directories = WalkBuilder::new(root)
+        let directories = WalkBuilder::new(root.as_path())
             .hidden(false)
             .git_ignore(true)
             .git_exclude(true)
@@ -261,7 +261,6 @@ impl Snapshot {
             let Ok(entries) = std::fs::read_dir(directory.path()) else {
                 continue;
             };
-            let prefix = relative_prefix(root, directory.path());
             for entry in entries.flatten() {
                 visited += 1;
                 if visited > limit {
@@ -277,7 +276,12 @@ impl Snapshot {
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if let Some(kind) = ManifestKind::classify_name(&name) {
-                    files.insert(format!("{prefix}{name}"), (kind, hash_file(&entry.path())));
+                    let path = entry.path();
+                    // Unreachable: the walk starts at the root.
+                    let Ok(relative) = root.relativize(&path) else {
+                        continue;
+                    };
+                    files.insert(relative, (kind, hash_file(&path)));
                 }
             }
         }
@@ -296,39 +300,34 @@ impl Snapshot {
         for (path, (kind, hash)) in &self.files {
             match after.files.get(path) {
                 Some((_, new)) if new != hash => {
-                    changes.push(change(path, *kind, FileChange::Modified))
+                    changes.push(file_change(path, *kind, FileChange::Modified))
                 }
                 Some(_) => {}
-                None if complete => changes.push(change(path, *kind, FileChange::Deleted)),
+                None if complete => changes.push(file_change(path, *kind, FileChange::Deleted)),
                 None => {}
             }
         }
         if complete {
             for (path, (kind, _)) in &after.files {
                 if !self.files.contains_key(path) {
-                    changes.push(change(path, *kind, FileChange::Created));
+                    changes.push(file_change(path, *kind, FileChange::Created));
                 }
             }
         }
-        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        // By the `/`-joined text, as the human reads the list - not by
+        // `WorkspacePath`'s component order, which puts `a/` before `a-b/`.
+        changes.sort_by_cached_key(|change| change.path.display());
         changes
     }
 }
 
-/// `directory` relative to `root`, `/`-separated with a trailing `/`, or
-/// empty for the root itself.
-fn relative_prefix(root: &Path, directory: &Path) -> String {
-    directory
-        .strip_prefix(root)
-        .unwrap_or(directory)
-        .components()
-        .map(|component| format!("{}/", component.as_os_str().to_string_lossy()))
-        .collect()
-}
-
-fn change(path: &str, kind: ManifestKind, change: FileChange) -> DependencyFileChange {
+fn file_change(
+    path: &WorkspacePath,
+    kind: ManifestKind,
+    change: FileChange,
+) -> DependencyFileChange {
     DependencyFileChange {
-        path: path.to_string(),
+        path: path.clone(),
         kind,
         change,
     }
@@ -348,6 +347,10 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    fn change(path: &str, kind: ManifestKind, change: FileChange) -> DependencyFileChange {
+        file_change(&WorkspacePath::parse(path).unwrap(), kind, change)
+    }
 
     use agent_domain::model::tool::ToolName;
     use serde_json::json;

@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::FsError;
+use crate::model::glob::GlobPattern;
 use crate::model::workspace::WorkspacePath;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +37,9 @@ pub struct SearchHit {
 pub struct GlobQuery {
     /// Glob matched against paths relative to `root`, in `.gitignore`
     /// syntax: `*.rs` matches at any depth, `src/**/*.rs` is anchored at
-    /// `root`. Never absolute and never containing `..`.
-    pub pattern: String,
+    /// `root`. Never absolute and never containing `..` (see
+    /// [`GlobPattern`]).
+    pub pattern: GlobPattern,
     /// Subtree to search.
     pub root: WorkspacePath,
     pub max_results: usize,

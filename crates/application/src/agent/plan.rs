@@ -45,6 +45,63 @@ pub(crate) fn refresh(session: &mut Session, appended: usize) -> Option<Plan> {
     Some(written)
 }
 
+/// The history budget with room kept for the plan note, and what is needed
+/// to decide afterwards whether the note has to be appended.
+pub(crate) struct Reservation {
+    /// What the history is shortened to before the note is appended.
+    pub budget: usize,
+    max_bytes: usize,
+    reminder: Option<Message>,
+    /// A copy of `reminder` is in the history, so `budget` counts it there
+    /// rather than reserving room for another.
+    noted: bool,
+}
+
+/// The note to append after a shortening.
+pub(crate) struct Restore {
+    pub note: Message,
+    /// `Some` when the history has to be trimmed to this budget first: the
+    /// copy the reservation counted is gone, and nothing was reserved for its
+    /// replacement.
+    pub make_room: Option<usize>,
+}
+
+/// Reserves room in `max_bytes` for the note that may have to be appended -
+/// unless a copy is already in the history, where its bytes are counted once
+/// already. Should the shortening remove that copy, [`Reservation::restore`]
+/// asks for room to be made before the new one is appended.
+pub(crate) fn reserve(max_bytes: usize, session: &Session) -> Reservation {
+    let reminder = reminder(session.plan());
+    let noted = reminder
+        .as_ref()
+        .is_some_and(|note| already_noted(session, note));
+    let budget = match &reminder {
+        Some(note) if !noted => max_bytes.saturating_sub(note.approx_bytes()),
+        _ => max_bytes,
+    };
+    Reservation {
+        budget,
+        max_bytes,
+        reminder,
+        noted,
+    }
+}
+
+impl Reservation {
+    /// Called once the history was shortened: the note to append, or `None`
+    /// when there is no unfinished work or the model can still see the plan.
+    pub(crate) fn restore(self, session: &Session) -> Option<Restore> {
+        let note = self.reminder?;
+        if still_visible(session, &note) {
+            return None;
+        }
+        let make_room = self
+            .noted
+            .then(|| self.max_bytes.saturating_sub(note.approx_bytes()));
+        Some(Restore { note, make_room })
+    }
+}
+
 /// The note that puts `plan` back in front of the model after a shortening, or
 /// `None` when there is nothing left to do and so nothing worth the bytes.
 ///

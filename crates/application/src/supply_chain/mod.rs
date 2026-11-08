@@ -21,8 +21,9 @@ mod python;
 use std::collections::BTreeMap;
 
 use agent_domain::model::dependency::{
-    DependencyChange, DependencyChangeDescription, ManifestKind,
+    DependencyChange, DependencyChangeDescription, ManifestChange, ManifestKind,
 };
+use agent_domain::model::tool::PlannedWrite;
 
 /// Dependency entries of one file: display name to spec.
 pub(crate) type Entries = BTreeMap<String, String>;
@@ -30,6 +31,36 @@ pub(crate) type Entries = BTreeMap<String, String>;
 /// A parser for one format. The error says, for the human, why the file could
 /// not be read as one.
 type Parser = fn(&str) -> Result<Entries, String>;
+
+/// The dependency files among `writes` whose content would change, each
+/// described for the human.
+///
+/// Whether a write counts depends only on which file changes - a classified
+/// path whose content would differ. The parsed description is what the human
+/// reads; a file that fails to parse still counts.
+///
+/// A file counts when either the name the call uses or the file it really
+/// reaches is a dependency file: `deps.txt -> Cargo.toml` is a write to
+/// `Cargo.toml`.
+pub fn manifest_changes(writes: Vec<PlannedWrite>) -> Vec<ManifestChange> {
+    writes
+        .into_iter()
+        .filter(|write| !write.is_no_op())
+        .filter_map(|write| {
+            let kind = ManifestKind::classify(&write.target)
+                .or_else(|| ManifestKind::classify(&write.path))?;
+            let description = describe(kind, write.before.text(), &write.after);
+            let target = (write.target != write.path).then_some(write.target);
+            Some(ManifestChange {
+                path: write.path,
+                target,
+                kind,
+                before: write.before,
+                description,
+            })
+        })
+        .collect()
+}
 
 /// What changes between `before` (absent for a new file) and `after`.
 pub fn describe(

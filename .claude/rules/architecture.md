@@ -47,16 +47,25 @@
 | `SessionStore` | `FileSessionStore`（同じ記録の読み出し・一覧・削除） |
 | `Notifier` | `WebhookNotifier`（ntfy / Slack / json・既定無効）, `NullNotifier`。発火は cli のみ（承認ゲートと run / chat） |
 
-`LlmProvider` が合成パターンになっている点が重要です。ルータもリトライもそれ自体が `LlmProvider` なので、
-呼び出し側は積み方の変化を認識しません。
+`LlmProvider` が合成パターンになっている点が重要です。ルータもフェイルオーバーもリトライもそれ自体が
+`LlmProvider` なので、呼び出し側は積み方の変化を認識しません。積み順は外側から
+Routing → Failover → Retry → クライアントです（`infrastructure/src/llm/mod.rs`, `factory.rs`）。
 
 ```
 Arc<dyn LlmProvider>
-  = RetryingProvider(RoutingProvider({ "local": OpenAi…, "cloud": Anthropic… }))
+  = RoutingProvider({                                   // 宛先をリクエストごとに選ぶ
+      "cloud": FailoverProvider(                        // 宛先をまたぐ（opt-in）
+                 RetryingProvider(Anthropic…),          // 同じ宛先でのバックオフ
+                 [RetryingProvider(OpenAi…)]),
+      "local": RetryingProvider(OpenAi…) })
 ```
 
-将来のルーティング（コスト・レイテンシ・能力ベース、フェイルオーバー、A/B）は
-`LlmRouter` の実装追加だけで足ります。判断材料の `RequestMetadata`
+リトライは宛先ごとの内側、フェイルオーバーはその外側です。各宛先が自分のリトライを使い切ってから
+初めて代替先に移ります。`AGENT_FAILOVER` を設定しなければ宛先は `RetryingProvider(client)` だけです。
+
+将来のルーティング（コスト・レイテンシ・能力ベース、A/B）は `LlmRouter` の実装追加だけで足ります。
+フェイルオーバーはルータではなく `FailoverProvider` 装飾子の側で、宛先の中で代替先を持ちます。
+判断材料の `RequestMetadata`
 （`task_kind` / `iteration` / `requires_tools` / 任意の `hints`）は全リクエストに同行しています。
 **プロンプト文字列を解析して分岐するルータを書かないでください** — その材料は既にあります。
 
@@ -64,6 +73,8 @@ Arc<dyn LlmProvider>
 
 `fit_history` は 2 段です。圧縮（`agent/compaction.rs`）が意味を保つ方、刈り込み
 （`Conversation::trim_to_budget`）が予算を保証する方で、後者は常に走ります。
+計画メモの分の予算の確保と、短くした後にメモを再掲するかの判断は `agent/plan.rs`
+（`plan::reserve` / `Reservation::restore`）にあり、`fit_history` は圧縮 → 刈り込み → 追記だけを行います。
 
 境界の計算は domain（`compaction_split` / `replace_prefix`）にあります。
 「どこで切ってよいか」は `tool_call` / `tool_result` の対を壊さないという不変条件
@@ -102,6 +113,12 @@ Arc<dyn LlmProvider>
 - ツール活動・警告・承認プロンプト → **stderr**
 
 `agent run "..." > answer.md` が期待どおり動くのはこの分離のためです。壊さないでください。
+
+stderr に出す文字列のうち、モデルやサーバ（MCP サーバ・LLM プロバイダ・ファイルの中身）が決めたもの
+— ツール引数、結果の要約、計画の項目、ファイル名、拒否理由など — は、**出口で一度だけ**
+`domain::text::printable` を通します。制御文字・双方向制御・不可視文字が端末の表示を書き換え、
+人間が見たものと承認したものがずれるのを防ぐためです。stdout のモデルの散文には掛けません
+（それは回答そのもので、複数行でありえ、それを根拠に何かを承認するわけではないため）。
 
 ## 設定
 

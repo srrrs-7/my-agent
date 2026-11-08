@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use agent_domain::error::ToolError;
+use agent_domain::model::glob::GlobPattern;
 use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::search::{FileSearcher, GlobQuery};
@@ -93,6 +94,7 @@ impl Tool for GlobTool {
             .root
             .resolve(input.path.as_deref().unwrap_or(""))
             .for_tool(&name)?;
+        let pattern = GlobPattern::new(&input.pattern).for_tool(&name)?;
         let max_results = input
             .max_results
             .unwrap_or(DEFAULT_MAX_RESULTS)
@@ -101,7 +103,7 @@ impl Tool for GlobTool {
         let found = self
             .searcher
             .glob(GlobQuery {
-                pattern: input.pattern.clone(),
+                pattern,
                 root: root.clone(),
                 max_results,
             })
@@ -224,6 +226,19 @@ mod tests {
         let error = run(&tool, json!({"pattern": "*", "path": "../elsewhere"})).unwrap_err();
 
         assert!(matches!(error, ToolError::InvalidInput { .. }), "{error}");
+        assert!(searcher.seen.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_pattern_reaching_outside_the_subtree_is_refused_before_searching() {
+        let (tool, searcher) = tool(&[], 0);
+        let error = run(&tool, json!({"pattern": "../*.rs"})).unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("`path`"),
+            "says what to pass instead: {error}"
+        );
         assert!(searcher.seen.lock().unwrap().is_none());
     }
 }

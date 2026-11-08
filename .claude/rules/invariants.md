@@ -108,7 +108,7 @@ make exec CMD="grep -rn 'tokio\|agent_infrastructure' crates/application/src/ | 
 | 層 | 手法 |
 |---|---|
 | domain | 純粋な単体テスト |
-| application | 全ポートをフェイク（`tests/agent_loop.rs` の `ScriptedProvider` など） |
+| application | 全ポートをフェイク（`tests/common/mod.rs` の `ScriptedProvider` など） |
 | infrastructure（設定） | `MapEnv` を注入。プロセス環境は触らない |
 | infrastructure（HTTP） | `agent-test-support` の生 TCP モックサーバ |
 | E2E | 上記モック + 実ファイルシステム（`crates/cli/tests/end_to_end.rs`） |
