@@ -6,6 +6,7 @@
 
 pub mod chat;
 mod checkpoint;
+mod context;
 pub mod doctor;
 pub mod eval;
 pub mod run;

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent_domain::model::llm::{
-    ChatRequest, ChatResponse, RequestMetadata, StopReason, TaskKind, TokenUsage,
+    ChatRequest, ChatResponse, ModelId, RequestMetadata, StopReason, TaskKind, TokenUsage,
 };
 use agent_domain::model::message::Message;
 use agent_domain::model::tool::{ToolCall, ToolDefinition};
@@ -45,8 +45,9 @@ use agent_domain::ports::prompt::PromptBuilder;
 use futures::StreamExt as _;
 use tracing::{debug, warn};
 
-use super::compaction::{CompactionConfig, HistoryCompactor};
+use super::compaction::{CompactionConfig, CompactionReport, HistoryCompactor, ManualCompaction};
 use super::config::AgentLoopConfig;
+use super::context_report::{ContextReport, PlanNote, definition_bytes};
 use super::dispatch::{DispatchConfig, ToolDispatcher};
 use super::interrupt::Interrupt;
 use super::plan;
@@ -235,7 +236,7 @@ impl AgentLoop {
         self.events.emit(AgentEvent::RunStarted {
             session_id: session.id.clone(),
             provider: self.llm.id(),
-            model: self.config.model.clone(),
+            model: self.model(session),
         });
 
         for iteration in 1..=limit {
@@ -266,6 +267,7 @@ impl AgentLoop {
             let response = response?;
 
             session.usage.accumulate(response.usage);
+            session.last_usage = Some(response.usage);
             self.events.emit(AgentEvent::ModelResponded {
                 provider: response.provider.clone(),
                 model: response.model.clone(),
@@ -442,19 +444,37 @@ impl AgentLoop {
     /// abandoned before it changed anything, and trimming is skipped too: the
     /// turn is ending, and the next one fits the history again first.
     async fn fit_history(&self, session: &mut Session, interrupt: &Interrupt) -> Option<()> {
+        self.shorten(session, interrupt, false).await.map(|_| ())
+    }
+
+    /// [`Self::fit_history`], with the compaction it may run returned - and,
+    /// when `forced`, run whether or not the history is over its budget or
+    /// compaction is switched on. `/compact` and the loop share this so a
+    /// compaction asked for by hand restores the plan exactly as one the loop
+    /// decided on does.
+    async fn shorten(
+        &self,
+        session: &mut Session,
+        interrupt: &Interrupt,
+        forced: bool,
+    ) -> Option<Option<CompactionReport>> {
         let reservation = plan::reserve(self.config.max_history_bytes, session);
         let budget = reservation.budget;
-        let mut compacted = false;
 
-        if session.conversation.approx_bytes() > budget
-            && let Some(report) = interrupt
+        let wanted =
+            forced || (self.compactor.enabled() && session.conversation.approx_bytes() > budget);
+        let mut compaction = None;
+        if wanted {
+            let model = self.model(session);
+            compaction = interrupt
                 .guard(
                     self.compactor
-                        .compact(&session.id, &mut session.conversation),
+                        .fold(&session.id, &mut session.conversation, model),
                 )
-                .await?
-        {
-            compacted = true;
+                .await?;
+        }
+        if let Some(report) = &compaction {
+            session.compactions += 1;
             session.usage.accumulate(report.usage);
             self.events.emit(AgentEvent::HistoryCompacted {
                 folded_messages: report.folded_messages,
@@ -462,6 +482,7 @@ impl AgentLoop {
                 after_bytes: report.after_bytes,
             });
         }
+        let compacted = compaction.is_some();
 
         // A summary just made room on its own terms; trimming below the
         // budget on top of it would delete what was just kept verbatim.
@@ -493,7 +514,64 @@ impl AgentLoop {
                 dropped_messages: dropped,
             });
         }
-        Some(())
+        Some(compaction)
+    }
+
+    /// Folds the session's older history into a summary now, between turns,
+    /// whatever the budget says and even with automatic compaction switched
+    /// off: whoever asks has decided the request is worth it. The summary
+    /// request's usage is added to the session's.
+    ///
+    /// The same procedure the loop runs before a request, plan note included
+    /// - see [`Self::fit_history`].
+    pub async fn compact_now(
+        &self,
+        session: &mut Session,
+        interrupt: &Interrupt,
+    ) -> ManualCompaction {
+        if !self.compactor.has_foldable(&session.conversation) {
+            return ManualCompaction::NothingToFold;
+        }
+        match self.shorten(session, interrupt, true).await {
+            Some(Some(report)) => ManualCompaction::Compacted(report),
+            Some(None) => ManualCompaction::Failed,
+            None => ManualCompaction::Interrupted,
+        }
+    }
+
+    /// The model `session`'s requests go to: the one chosen for it with
+    /// [`Session::switch_model`], else the configured one. `None` leaves the
+    /// choice to the provider.
+    pub fn model(&self, session: &Session) -> Option<ModelId> {
+        session
+            .model_override
+            .clone()
+            .or_else(|| self.config.model.clone())
+    }
+
+    /// Where the bytes of `session`'s next request would go, for `/context`.
+    ///
+    /// Reads only: the system prompt is reported as it was rendered, or as
+    /// not rendered yet - never rendered here, since rendering it fixes it
+    /// for the rest of the session.
+    pub fn context_report(&self, session: &Session) -> ContextReport {
+        let tools = self.advertised_tools();
+        let plan_note = plan::reminder(session.plan()).map(|note| PlanNote {
+            bytes: note.approx_bytes(),
+            in_history: plan::already_noted(session, &note),
+        });
+        ContextReport {
+            model: self.model(session),
+            system_bytes: session.system_prompt.as_ref().map(String::len),
+            tool_count: tools.len(),
+            tools_bytes: tools.iter().map(definition_bytes).sum(),
+            history_bytes: session.conversation.approx_bytes(),
+            messages: session.conversation.len(),
+            history_budget: self.config.max_history_bytes,
+            plan_note,
+            last_usage: session.last_usage,
+            compactions: session.compactions,
+        }
     }
 
     fn build_request(
@@ -506,7 +584,7 @@ impl AgentLoop {
         ChatRequest::new(session.conversation.messages().to_vec())
             .with_system(system_prompt)
             .with_tools(tools.to_vec())
-            .with_model(self.config.model.clone())
+            .with_model(self.model(session))
             .with_params(self.config.params.clone())
             .with_metadata(RequestMetadata {
                 session_id: session.id.clone(),
