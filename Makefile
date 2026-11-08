@@ -29,10 +29,11 @@ CARGO    := $(DEV) cargo
 ARGS  ?=
 CMD   ?=
 Q     ?=
+TASKS ?=
 MODEL ?= qwen3:8b
 BIN   ?= agent
 
-.PHONY: help setup env image build release run ask chat tools doctor test lint fmt \
+.PHONY: help setup env image build release run ask chat tools doctor eval test lint fmt \
         fmt-check fix check ci sh shell cargo exec audit tree deps clean clean-all \
         ollama-up ollama-down ollama-pull ollama-logs ps
 
@@ -94,6 +95,14 @@ tools: ## List the tools exposed to the LLM
 
 doctor: ## Show resolved configuration and ping the LLM endpoint
 	$(APP) doctor
+
+# Written so that `make eval ... > report.json` captures the report alone:
+# `@` keeps make from echoing the command onto stdout, and `-T` drops the
+# pseudo-TTY the `app` service asks for, which would merge the progress on
+# stderr into stdout.
+eval: ## Run a task suite against the LLM. Usage: make eval TASKS=evals/tasks.json [ARGS="--repeat 3"]
+	@if [ -z "$(TASKS)" ]; then echo "usage: make eval TASKS=path/to/tasks.json" >&2; exit 2; fi
+	@$(RUN) -T app eval "$(TASKS)" $(ARGS)
 
 ## ---------------------------------------------------------------------------
 ## Quality gates

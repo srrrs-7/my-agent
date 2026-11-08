@@ -117,6 +117,7 @@ make chat                      # 対話セッション（履歴保持）
 make ask Q="..."               # 単発の質問
 make tools                     # モデルに渡しているツール一覧
 make doctor                    # 設定表示 + 疎通確認
+make eval TASKS=evals/tasks.json > report.json  # タスク集合で評価（下の「eval」）
 make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 ```
 
@@ -237,6 +238,144 @@ AGENT_NOTIFY_FORMAT=ntfy
 >
 > Webhook URL は秘密情報として扱います（Slack の URL や ntfy のトピック名はそれ自体が認証情報です）。
 > `agent doctor` やログには `scheme://host/…` だけが表示されます。
+
+### タスク集合で評価する（eval）
+
+プロンプト・モデル・ループの設定を変えたとき、良くなったかを**数字で**比べるためのコマンドです。
+タスクの集合を実 LLM で流し、成功率・反復回数・トークン・レイテンシを JSON で出します。
+
+```bash
+make eval TASKS=evals/tasks.json > before.json             # 変更前
+make eval TASKS=evals/tasks.json ARGS="--repeat 3" > after.json
+agent eval evals/tasks.json --repeat 3 --out .agent/eval --keep > report.json
+```
+
+| フラグ | 意味 |
+|---|---|
+| `--repeat N` | 各タスクを N 回流す（既定 1）。実 LLM の結果はばらつくので、比べるなら 3 回以上を推奨 |
+| `--out DIR` | 会話ログの置き場所。`<DIR>/sessions/` に試行ごとに 1 ファイル（既定 `.agent/eval`） |
+| `--keep` | 試行ごとの作業ディレクトリを消さずに残し、レポートの `scratch_dir` に場所を書く |
+
+グローバルな `--model` / `--max-iterations` / `--system-prompt-file` / `--append-system-prompt` も効きます。
+
+**タスクファイル**は JSON 1 文書です。`fixture` と `prompt_file` はタスクファイルのあるディレクトリからの相対パスです。
+
+```json
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "write-hello",
+      "fixture": "fixtures/empty",
+      "prompt": "hello.txt を作り、hello と書いてください。",
+      "max_iterations": 5,
+      "checks": [
+        { "type": "file_contains", "path": "hello.txt", "contains": "hello" }
+      ]
+    },
+    {
+      "id": "fix-parser",
+      "fixture": "fixtures/parser",
+      "prompt_file": "prompts/fix-parser.md",
+      "checks": [
+        { "type": "file_contains", "path": "src/parser.rs", "contains": "fn parse" },
+        { "type": "command", "run": "cargo test --offline", "timeout_secs": 300 }
+      ]
+    }
+  ]
+}
+```
+
+| 検査 | 合格の条件 |
+|---|---|
+| `file_contains` | 実行後のワークスペースで `path` のファイルが `contains` を部分文字列として含む。`path` はワークスペース内に限る（`..` や絶対パスは読み込み時に拒否） |
+| `command` | `run` をワークスペース直下で実行し、終了コードが 0（`timeout_secs` 既定 120） |
+
+読み込みは厳格です。未知のフィールド、検査が 0 件のタスク、重複した `id`、`prompt` と `prompt_file` の
+両方または一方もないタスクは、**モデルを 1 回も呼ばずに**エラーで止まります（打ち間違いで検査が
+黙って「常に合格」になるのを防ぐため）。`id` は英数字・`-`・`_` のみです。
+
+各試行は次のように動きます。
+
+- `fixture` を一時ディレクトリ（`$TMPDIR/agent-eval-*`）に複製し、そこをワークスペースにして
+  `agent run` と同じ合成ルートでエージェントを組み立てる。**実ワークスペースもフィクスチャも変更しません**。
+  フィクスチャ内のシンボリックリンクは拒否します（複製先から外を指せてしまうため）
+- 承認は `auto`（使い捨てのコピーなので）。ただし依存ファイルの変更は従来どおり別に問われ、
+  答える人がいないため拒否されます（`AGENT_ALLOW_DEPENDENCY_CHANGES=true` で通す）。Webhook 通知は送りません
+- `command` 検査は `run_command` と同じサンドボックスで、試行ごとの一時ディレクトリをルートに実行します
+  （`cargo test` はモデルが書いた `build.rs` を実行するため）。`AGENT_SHELL_SANDBOX=none` でも検査は
+  封じ込めを要求し、得られない環境（macOS のホストなど）では**最初の LLM 呼び出しより前に**失敗します
+- `AGENT_SHELL=true` でも、`AGENT_SHELL_SANDBOX=none` のときは eval では `run_command` をモデルに渡しません
+
+stdout はレポートの JSON だけです。進捗（`[1/4] write-hello #1 PASS ...`）と失敗した検査の理由は stderr に出ます。
+
+**終了コード**
+
+| コード | 意味 |
+|---|---|
+| `0` | 全タスクの全試行が合格 |
+| `1` | 実行できなかった（タスクファイル不正、フィクスチャがない、設定不正、検査用サンドボックスが得られない） |
+| `3` | 実行はできたが、合格しなかった試行がある |
+
+**レポートの形**（`schema` はフィールドの意味が変わったときに上がります。追加では上がりません）
+
+```jsonc
+{
+  "schema": 1,
+  "fingerprint": {
+    "agent_version": "0.1.0",
+    "provider": "default", "model": "claude-sonnet-5",
+    "tools": ["edit_file", "glob", "..."],
+    "run_command_sandbox": null,          // run_command を渡したときの実際の封じ込め
+    "check_sandbox": "landlock",          // command 検査の封じ込め（検査がなければ null）
+    "settings": { "max_iterations": 25, "max_history_bytes": 200000, "compact": true, "...": "..." },
+    "system_prompt_fnv1a": "9f3c2a7b0e1d4c55"
+  },
+  "summary": {
+    "tasks": 2, "repeat": 3,
+    "attempts": 6, "passed": 5, "pass_rate": 0.8333,
+    "iterations": 31, "mean_iterations": 5.17,
+    "tokens": { "input": 52000, "output": 4100, "cache_read": 0, "cache_write": 0, "total": 56100 },
+    "mean_tokens": 9350.0,
+    "model_latency_ms": 48210, "wall_ms": 61377,
+    "compactions": 0, "trims": 0, "tool_calls": 22, "tool_errors": 1, "denials": 0
+  },
+  "tasks": [
+    {
+      "id": "write-hello",
+      "attempts": 3, "passed": 3, "pass_rate": 1.0, "...": "summary と同じ集計",
+      "runs": [
+        {
+          "attempt": 1, "passed": true, "finish_reason": "completed",
+          "iterations": 2, "tokens": { "...": "..." }, "model_requests": 2,
+          "model_latency_ms": 1830, "wall_ms": 2104,
+          "compactions": 0, "trims": 0, "tool_calls": 1, "tool_errors": 0, "denials": 0,
+          "session_id": "write-hello-1-<uuid>",
+          "checks": [ { "type": "file_contains", "target": "hello.txt", "passed": true, "detail": "found" } ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+- **合格**は「実行がエラーで終わらず、全検査が通った」こと。`finish_reason` が `max_iterations` でも、
+  検査が通っていれば合格です（仕事は済んでいるため）。プロバイダが壊れた試行は `finish_reason: "error"` と
+  `error` を持ち、不合格になります（残りのタスクは続行）
+- `tokens` は圧縮の要約リクエストの分も含みます。`model_latency_ms` はループ本体のモデル応答待ちの合計、
+  `wall_ms` は試行全体の経過時間です
+- `system_prompt_fnv1a` は、システムプロンプトを**固定の文脈**（ワークスペースのパス・日付・ディレクトリ概要を
+  プレースホルダにしたもの）で描画した結果の FNV-1a です。テンプレート・`--system-prompt-file`・
+  `--append-system-prompt`・渡すツールが変わると変わり、日付やフィクスチャでは変わりません
+
+**2 回分を比べる**には、まず `fingerprint` が意図した差分だけかを確かめ、次に `summary` を並べます。
+
+```bash
+jq -s '[.[] | {prompt: .fingerprint.system_prompt_fnv1a, model: .fingerprint.model}]' before.json after.json
+jq -s '[.[] | .summary | {pass_rate, mean_iterations, mean_tokens, wall_ms}]' before.json after.json
+jq -s '[.[0].tasks, .[1].tasks] | transpose | map({id: .[0].id, before: .[0].pass_rate, after: .[1].pass_rate})' \
+  before.json after.json
+```
 
 ---
 

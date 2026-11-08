@@ -9,7 +9,7 @@
 │   render.rs      AgentEvent → 端末出力                        │
 │   approval.rs    対話的な承認ゲート                           │
 │   composition.rs 具象型とポートを結線する唯一の場所           │
-│                  assemble() を run / chat / テストが共有      │
+│                  assemble() を run / chat / eval / テストが共有│
 │   lib.rs / main.rs  lib の上に薄い bin（tests/ から呼べる）   │
 └───────────────┬──────────────────────────┬───────────────────┘
                 │                          │
@@ -22,7 +22,8 @@
 │   agent/session.rs           │ │   llm/retry.rs              │
 │   tools/file/*.rs            │ │   llm/http.rs（共有配管）   │
 │   tools/registry.rs          │ │   llm/sse.rs（SSE 枠組）    │
-│                              │ │   fs/local.rs               │
+│   eval/（検査・計測・集計）  │ │   fs/local.rs               │
+│                              │ │   fs/scratch.rs（使い捨て） │
 │                              │ │   fs/search.rs              │
 │                              │ │   fs/context.rs             │
 │  ※ tokio に依存しない        │ │   config/{kinds,env}.rs     │
@@ -58,7 +59,7 @@
 | `ApprovalGate` | `CliApprovalGate` | human-in-the-loop。依存の変更は `authorize_dependency_change` で別に問う（§3.6.2） |
 | `WebFetcher` | `GuardedWebFetcher` | 外向き HTTP（SSRF ガード・許可リスト・サイズ上限） |
 | `CommandRunner` | `SandboxedCommandRunner` | 子プロセス実行（OS レベルの封じ込め・egress 許可リスト） |
-| `EventSink` | `TerminalRenderer`, `NullEventSink` | 進捗の可観測性 |
+| `EventSink` | `TerminalRenderer`, `NullEventSink`, `MetricsSink`（eval の計測） | 進捗の可観測性 |
 | `ConversationLog` | `FileConversationLog`, `NullConversationLog` | 会話の永続的な記録（§3.2.3） |
 | `SessionStore` | `FileSessionStore` | その記録の読み出しと再開（§3.2.3） |
 
@@ -301,6 +302,33 @@ stdin はランタイム外の専用スレッド + チャネルで読むので�
 `EventSink` の実装が決めます。CLI ではモデルの散文を stdout、
 ツール活動を stderr に出すため、`agent run "..." > answer.md` が期待どおりに動きます。
 将来 Web UI や JSON ログを足す場合も、ループには手を入れません。
+
+### 3.9 評価（`agent eval`）をループの外に置く
+
+プロンプトやループの変更を数字で比べるための `agent eval` は、ループに計測用の口を足さずに作っています。
+
+| 部品 | 場所 | 理由 |
+|---|---|---|
+| タスク定義・検査 `verify`・集計・指紋（FNV-1a） | `application/src/eval/` | 何を成功とみなし、どう数えるかはユースケース。I/O は `FileSystem` / `CommandRunner` ポート越し |
+| 計測 `MetricsSink` | 同上 | ループが既に出している `AgentEvent` を数えるだけの `EventSink`。第 2 の報告経路を作らない |
+| フィクスチャの複製 `ScratchDir` | `infrastructure/src/fs/scratch.rs` | std のみ。シンボリックリンクは拒否、drop で削除（`--keep` で残す） |
+| 試行ごとの組み立て・時間計測・出力 | `cli/src/commands/eval.rs` | エージェントは `composition::assemble` で組む。測っているものが `agent run` の配線そのものであるため |
+
+決めたこと:
+
+- **設定の誤りは LLM を呼ぶ前に落とす。** タスクファイルの検証、フィクスチャと `prompt_file` の存在、
+  空のスクラッチ上での `assemble`、`command` 検査用サンドボックスの起動をすべて先に済ませる
+- **`command` 検査は常に封じ込める。** 検査はモデルが書いたコード（`build.rs`、テスト）を実行するので、
+  `AGENT_SHELL_SANDBOX=none` は検査には適用しない（`confined` に引き上げる）。同じ理由で、
+  eval では封じ込めのない `run_command` をモデルに渡さない
+- **stdout はレポート専用**（§3.8 と同じ分離）。進捗は stderr、会話ログは `--out` 配下
+- **指紋のプロンプトハッシュは固定の文脈で描画したもの。** 実際に送ったプロンプトはスクラッチのパスと
+  日付を含み、実行ごとに変わってしまうため
+- **圧縮の要約リクエストの usage を `session.usage` に積む。** 以前は捨てていたため、
+  圧縮が起きる長いセッションほどトークンが少なく見えていた（`CompactionReport.usage`）
+
+記録の再生（replay）は作っていません。必要になったら `fit_history` を部品として切り出し、
+記録を流すシミュレーションとして別に作る方針です。
 
 ## 4. コンテキストエンジニアリング
 

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -83,6 +83,34 @@ pub enum Command {
 
     /// Show the resolved configuration and check that the LLM answers.
     Doctor,
+
+    /// Run a task suite against the configured model and print a JSON report
+    /// on stdout. Exits 0 when every task passed, 3 when some did not.
+    Eval(EvalArgs),
+}
+
+/// `agent eval`'s own flags. The global ones still apply: `--model`,
+/// `--max-iterations` (a task's `max_iterations` wins) and the prompt flags.
+#[derive(Debug, Clone, Args)]
+pub struct EvalArgs {
+    /// The suite file (JSON). Fixture and prompt paths in it are relative to
+    /// the file's own directory.
+    #[arg(value_name = "TASKS")]
+    pub tasks: PathBuf,
+
+    /// Run every task this many times.
+    #[arg(long, value_name = "N", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    pub repeat: u32,
+
+    /// Directory for the run's session logs (written to `<DIR>/sessions/`).
+    #[arg(long, value_name = "DIR", default_value = ".agent/eval")]
+    pub out: PathBuf,
+
+    /// Keep each attempt's scratch workspace instead of deleting it. The
+    /// report names where each one is.
+    #[arg(long)]
+    pub keep: bool,
 }
 
 /// Which conversation `agent chat` should start from.
@@ -123,6 +151,7 @@ impl Cli {
             },
             Some(Command::Tools) => Command::Tools,
             Some(Command::Doctor) => Command::Doctor,
+            Some(Command::Eval(args)) => Command::Eval(args.clone()),
             // Bare `agent` drops into the REPL, like `psql` or `irb`.
             None => Command::Chat { resume: None },
         }
@@ -200,6 +229,25 @@ mod tests {
             Command::Sessions { delete } => assert_eq!(delete.as_deref(), Some("abc")),
             other => panic!("expected sessions, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn eval_takes_a_suite_and_its_own_flags() {
+        match Cli::parse_from(["agent", "eval", "suite.json", "--repeat", "3", "--keep"])
+            .resolve_command()
+        {
+            Command::Eval(args) => {
+                assert_eq!(args.tasks, PathBuf::from("suite.json"));
+                assert_eq!(args.repeat, 3);
+                assert!(args.keep);
+                assert_eq!(args.out, PathBuf::from(".agent/eval"));
+            }
+            other => panic!("expected eval, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["agent", "eval", "suite.json", "--repeat", "0"]).is_err(),
+            "zero repeats would measure nothing"
+        );
     }
 
     #[test]
