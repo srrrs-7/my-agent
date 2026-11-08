@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use super::{Endpoint, NotifyFormat, WebhookUrl, endpoint};
+use super::{Endpoint, NotifyFormat, NtfyToken, WebhookUrl, endpoint};
 use crate::config::ConfigError;
 
 /// ntfy rejects messages of 4096 bytes and over (it turns them into an
@@ -34,6 +34,8 @@ pub struct WebhookNotifier {
     endpoint: Endpoint,
     format: NotifyFormat,
     timeout: Duration,
+    /// ntfy's access token, for a server that does not let anyone publish.
+    token: Option<NtfyToken>,
 }
 
 impl WebhookNotifier {
@@ -66,7 +68,15 @@ impl WebhookNotifier {
             endpoint,
             format,
             timeout,
+            token: None,
         })
+    }
+
+    /// Sends `token` as a bearer token with every notification.
+    #[must_use]
+    pub fn with_token(mut self, token: Option<NtfyToken>) -> Self {
+        self.token = token;
+        self
     }
 
     fn transport(&self, error: reqwest::Error) -> NotifyError {
@@ -88,10 +98,11 @@ impl Notifier for WebhookNotifier {
     async fn notify(&self, notification: &Notification) -> Result<(), NotifyError> {
         let body = payload(self.format, notification, self.endpoint.topic.as_deref());
 
-        let response = self
-            .client
-            .post(self.endpoint.url.clone())
-            .json(&body)
+        let mut request = self.client.post(self.endpoint.url.clone()).json(&body);
+        if let Some(token) = &self.token {
+            request = request.header(reqwest::header::AUTHORIZATION, token.bearer());
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| self.transport(error))?;
@@ -257,7 +268,7 @@ fn human(elapsed: Duration) -> String {
 /// any linkifier. Bare domains without a scheme are not caught; the clients'
 /// fetch-on-post behaviour is what this closes, and Slack's is also switched
 /// off in the payload.
-fn defang_urls(raw: &str) -> String {
+pub(super) fn defang_urls(raw: &str) -> String {
     raw.replace("://", ":\u{2044}\u{2044}")
 }
 

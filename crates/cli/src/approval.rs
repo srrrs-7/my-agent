@@ -8,24 +8,36 @@
 //! asked whatever the policy and whatever "approve all" said, answered "no" by
 //! a bare Enter, and refused outright when no human is there to ask - unless
 //! the operator set `AGENT_ALLOW_DEPENDENCY_CHANGES`.
+//!
+//! With remote approval on, an ordinary prompt is also put to the phone, and
+//! the first answer wins. The race lives here, after it is settled that a
+//! human must be asked, rather than in a decorator around the gate: whether
+//! to ask at all is decided once, in one place. The remote side can only
+//! approve or deny - never "approve all", never a typed reason - and it never
+//! answers a dependency change, which the phone is only told about. A remote
+//! failure is a warning; the terminal keeps waiting.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_domain::error::ApprovalError;
+use agent_domain::error::{ApprovalError, RemoteApprovalError};
 use agent_domain::model::dependency::DependencyChangeDescription;
 use agent_domain::model::tool::Before;
 use agent_domain::ports::approval::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest,
 };
+use agent_domain::ports::remote_approval::{
+    NullRemoteApprover, RemoteAnswer, RemoteApprovalRequest, RemoteApprover, TerminalOnlyNotice,
+};
 use agent_domain::text::{self, printable};
 use agent_infrastructure::config::ApprovalPolicy;
 use async_trait::async_trait;
+use tracing::warn;
 
 use crate::input::prompt_line;
-use crate::notify::Notifications;
+use crate::notify::{Notifications, remote_detail};
 
 /// Lines of dependency detail shown in one prompt, across all files. A new
 /// lockfile can list hundreds of packages; the human needs to see that it is
@@ -55,6 +67,9 @@ pub struct CliApprovalGate {
     /// prompting path - the only one that pages anyone - cannot otherwise be
     /// reached without a TTY.
     read_line: ReadLine,
+    /// Raced against the terminal for ordinary prompts. Never resolves when
+    /// remote approval is off.
+    remote: Arc<dyn RemoteApprover>,
 }
 
 impl CliApprovalGate {
@@ -70,7 +85,14 @@ impl CliApprovalGate {
             allow_dependency_changes: false,
             notifications,
             read_line: Box::new(|question| Box::pin(async move { prompt_line(&question).await })),
+            remote: Arc::new(NullRemoteApprover),
         }
+    }
+
+    /// Lets ordinary prompts be answered through `remote` as well.
+    pub fn with_remote(mut self, remote: Arc<dyn RemoteApprover>) -> Self {
+        self.remote = remote;
+        self
     }
 
     /// Lets dependency changes through without asking.
@@ -117,16 +139,31 @@ impl ApprovalGate for CliApprovalGate {
         }
 
         let question = call_question(request);
+        let remote_request = RemoteApprovalRequest {
+            session_id: self.notifications.session_id(),
+            tool: request.call.name.clone(),
+            safety: request.safety,
+            detail: remote_detail(&request.summary, self.notifications.redactor()),
+        };
 
         // Only here, once nothing is left that could answer for the human:
         // an auto-approved or auto-denied call blocks nobody. Fire and forget
-        // - a delivery failure must not turn into a denied tool call.
-        self.notifications.approval_pending(request);
+        // - a delivery failure must not turn into a denied tool call. With
+        // remote approval on, its own notification (with the buttons) is the
+        // page, whatever AGENT_NOTIFY_EVENTS says: one prompt, one buzz.
+        if !self.remote.is_active() {
+            self.notifications.approval_pending(request);
+        }
 
-        let answer = (self.read_line)(question)
-            .await
-            .map_err(|error| ApprovalError::Unavailable(error.to_string()))?;
+        let answered = race((self.read_line)(question), self.remote.ask(&remote_request)).await;
         self.notifications.engaged();
+
+        let answer = match answered {
+            Answered::Remote(answer) => return Ok(remote_decision(answer)),
+            Answered::Terminal(line) => {
+                line.map_err(|error| ApprovalError::Unavailable(error.to_string()))?
+            }
+        };
 
         match answer
             .map(|line| line.trim().to_ascii_lowercase())
@@ -173,11 +210,28 @@ impl ApprovalGate for CliApprovalGate {
         }
 
         let question = dependency_question(request);
-        self.notifications.dependency_approval_pending(request);
+        let terminal = (self.read_line)(question);
 
-        let answer = (self.read_line)(question)
-            .await
-            .map_err(|error| ApprovalError::Unavailable(error.to_string()))?;
+        // Never answerable from the phone: the change is shown in full only
+        // here. The phone is told to come back - instead of the ordinary page
+        // when remote approval is on, so it buzzes once either way.
+        let answer = if self.remote.is_active() {
+            let notice = TerminalOnlyNotice {
+                session_id: self.notifications.session_id(),
+                tool: request.call.name.clone(),
+                safety: request.safety,
+            };
+            let announce = async {
+                if let Err(error) = self.remote.announce_terminal_only(&notice).await {
+                    warn!(%error, "could not tell the phone that a prompt is waiting");
+                }
+            };
+            read_while(terminal, announce).await
+        } else {
+            self.notifications.dependency_approval_pending(request);
+            terminal.await
+        }
+        .map_err(|error| ApprovalError::Unavailable(error.to_string()))?;
         self.notifications.engaged();
 
         match answer
@@ -194,6 +248,83 @@ impl ApprovalGate for CliApprovalGate {
                 reason: other.to_string(),
             }),
         }
+    }
+}
+
+/// Which side answered a prompt first.
+enum Answered {
+    Terminal(anyhow::Result<Option<String>>),
+    Remote(RemoteAnswer),
+}
+
+/// Waits for the terminal and the remote side together; the first answer
+/// wins, and the loser's future is dropped. For the terminal that only stops
+/// the waiting - the next line typed is still there for the next prompt (see
+/// `input.rs`). For the remote side it withdraws the question, token and
+/// subscription with it.
+///
+/// A remote failure is not an answer. It is reported once, and the terminal
+/// is waited on alone.
+async fn race(
+    terminal: LineFuture,
+    remote: impl Future<Output = Result<RemoteAnswer, RemoteApprovalError>>,
+) -> Answered {
+    let mut terminal = terminal;
+    let mut remote = std::pin::pin!(remote);
+    let mut remote_live = true;
+    loop {
+        tokio::select! {
+            // A human at the keyboard beats a tap that lands in the same
+            // instant.
+            biased;
+            line = &mut terminal => return Answered::Terminal(line),
+            answer = &mut remote, if remote_live => {
+                match answer {
+                    Ok(answer) => {
+                        // The question is still on the terminal; say what
+                        // happened to it.
+                        eprintln!("\n  answered from the phone: {}", match answer {
+                            RemoteAnswer::Approve => "allowed",
+                            RemoteAnswer::Deny => "denied",
+                        });
+                        return Answered::Remote(answer);
+                    }
+                    Err(error) => {
+                        warn!(%error, "this prompt can no longer be answered from the phone; answer at the terminal");
+                        remote_live = false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Waits for the terminal while `side` runs to completion alongside it.
+/// Whatever `side` has not finished when the terminal answers is dropped.
+async fn read_while(
+    terminal: LineFuture,
+    side: impl Future<Output = ()>,
+) -> anyhow::Result<Option<String>> {
+    let mut terminal = terminal;
+    let mut side = std::pin::pin!(side);
+    let mut side_done = false;
+    loop {
+        tokio::select! {
+            biased;
+            line = &mut terminal => return line,
+            () = &mut side, if !side_done => side_done = true,
+        }
+    }
+}
+
+/// What a remote answer means to the model. A fixed reason: nothing typed on
+/// the phone reaches the model.
+fn remote_decision(answer: RemoteAnswer) -> ApprovalDecision {
+    match answer {
+        RemoteAnswer::Approve => ApprovalDecision::Approve,
+        RemoteAnswer::Deny => ApprovalDecision::Deny {
+            reason: "the user denied this call from their phone".to_string(),
+        },
     }
 }
 
@@ -511,6 +642,278 @@ mod tests {
             }
             other => panic!("expected the gate to be unavailable, got {other:?}"),
         }
+    }
+
+    // --- remote approval ------------------------------------------------------
+
+    use agent_domain::ports::notify::NotificationKind as Kind;
+    use agent_infrastructure::tools::Redactor;
+
+    /// A phone that answers `answer` at once, or never when it is `None`.
+    #[derive(Default)]
+    struct ScriptedRemote {
+        answer: Mutex<Option<Result<RemoteAnswer, RemoteApprovalError>>>,
+        asked: Mutex<Vec<RemoteApprovalRequest>>,
+        announced: Mutex<Vec<TerminalOnlyNotice>>,
+        /// Set when an `ask` future is dropped before it resolved - the
+        /// question withdrawn.
+        withdrawn: Arc<AtomicBool>,
+    }
+
+    impl ScriptedRemote {
+        fn answering(answer: Result<RemoteAnswer, RemoteApprovalError>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: Mutex::new(Some(answer)),
+                ..Default::default()
+            })
+        }
+
+        fn silent() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+    }
+
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl RemoteApprover for ScriptedRemote {
+        fn is_active(&self) -> bool {
+            true
+        }
+
+        async fn ask(
+            &self,
+            request: &RemoteApprovalRequest,
+        ) -> Result<RemoteAnswer, RemoteApprovalError> {
+            self.asked.lock().unwrap().push(request.clone());
+            let answer = self.answer.lock().unwrap().take();
+            match answer {
+                Some(answer) => answer,
+                None => {
+                    let _withdrawn = SetOnDrop(self.withdrawn.clone());
+                    std::future::pending().await
+                }
+            }
+        }
+
+        async fn announce_terminal_only(
+            &self,
+            notice: &TerminalOnlyNotice,
+        ) -> Result<(), RemoteApprovalError> {
+            self.announced.lock().unwrap().push(notice.clone());
+            Ok(())
+        }
+    }
+
+    /// A terminal nobody is sitting at.
+    fn nobody_types() -> ReadLine {
+        Box::new(|_| Box::pin(std::future::pending()))
+    }
+
+    /// A human who types `answer` - not in the very instant the prompt
+    /// appears, so the phone has been asked by then, as it would be.
+    fn typing(answer: &'static str) -> ReadLine {
+        Box::new(move |_| {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                Ok(Some(answer.to_string()))
+            })
+        })
+    }
+
+    fn remote_gate(
+        notifier: &Arc<RecordingNotifier>,
+        read_line: ReadLine,
+        remote: &Arc<ScriptedRemote>,
+    ) -> (CliApprovalGate, Arc<Notifications>) {
+        let (gate, notifications) = prompting(notifier, read_line);
+        (gate.with_remote(remote.clone()), notifications)
+    }
+
+    #[tokio::test]
+    async fn a_remote_answer_settles_the_prompt_when_the_terminal_is_silent() {
+        for (answer, approved) in [(RemoteAnswer::Approve, true), (RemoteAnswer::Deny, false)] {
+            let notifier = Arc::new(RecordingNotifier::default());
+            let remote = ScriptedRemote::answering(Ok(answer));
+            let (gate, notifications) = remote_gate(&notifier, nobody_types(), &remote);
+
+            let decision = gate.authorize(&secret_request()).await.unwrap();
+            notifications.drain(DRAIN_TIMEOUT).await;
+
+            assert_eq!(
+                decision.is_approved(),
+                approved,
+                "{answer:?} -> {decision:?}"
+            );
+            if let ApprovalDecision::Deny { reason } = &decision {
+                assert!(reason.contains("phone"), "{reason}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn with_remote_approval_on_the_prompt_buzzes_once() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let remote = ScriptedRemote::answering(Ok(RemoteAnswer::Approve));
+        let (gate, notifications) = remote_gate(&notifier, nobody_types(), &remote);
+
+        gate.authorize(&secret_request()).await.unwrap();
+        notifications.drain(DRAIN_TIMEOUT).await;
+
+        assert_eq!(remote.asked.lock().unwrap().len(), 1, "the phone was asked");
+        let sent = notifier.sent.lock().unwrap();
+        assert!(
+            sent.iter().all(|sent| sent.kind() != Kind::Approval),
+            "the ordinary page was sent as well: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_phone_is_asked_even_when_approval_notifications_are_unsubscribed() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let notifications = Arc::new(Notifications::new(
+            notifier.clone(),
+            crate::notify::NotifyPolicy::from_settings(&notify_settings_for(&["failed"])),
+        ));
+        let remote = ScriptedRemote::answering(Ok(RemoteAnswer::Approve));
+        let gate = CliApprovalGate::new(ApprovalPolicy::Ask, true, notifications)
+            .with_read_line(nobody_types())
+            .with_remote(remote.clone());
+
+        let decision = gate.authorize(&secret_request()).await.unwrap();
+
+        assert_eq!(decision, ApprovalDecision::Approve);
+        assert_eq!(remote.asked.lock().unwrap().len(), 1);
+    }
+
+    /// `AGENT_NOTIFY_EVENTS` as the operator would write it.
+    fn notify_settings_for(events: &[&str]) -> agent_infrastructure::config::NotifySettings {
+        let joined = events.join(",");
+        agent_infrastructure::config::Settings::from_source(
+            &agent_infrastructure::config::MapEnv::new(&[
+                ("AGENT_WORKSPACE", "/workspace"),
+                ("AGENT_PROVIDER", "ollama"),
+                ("AGENT_MODEL", "m"),
+                ("AGENT_NOTIFY_EVENTS", &joined),
+            ]),
+        )
+        .unwrap()
+        .notify
+    }
+
+    #[tokio::test]
+    async fn the_terminal_answering_first_withdraws_the_remote_question() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let remote = ScriptedRemote::silent();
+        let (gate, notifications) = remote_gate(&notifier, typing("n\n"), &remote);
+
+        let decision = gate.authorize(&secret_request()).await.unwrap();
+        notifications.drain(DRAIN_TIMEOUT).await;
+
+        assert!(
+            matches!(decision, ApprovalDecision::Deny { ref reason } if reason == "the user answered no"),
+            "{decision:?}"
+        );
+        assert!(
+            remote.withdrawn.load(Ordering::SeqCst),
+            "the remote question must be dropped once the terminal answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_failure_keeps_the_terminal_waiting_and_is_not_a_denial() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let remote = ScriptedRemote::answering(Err(RemoteApprovalError::Closed));
+        let (gate, notifications) = remote_gate(&notifier, answering(Some("y\n")), &remote);
+
+        let decision = gate.authorize(&secret_request()).await.unwrap();
+        notifications.drain(DRAIN_TIMEOUT).await;
+
+        assert_eq!(decision, ApprovalDecision::Approve);
+    }
+
+    #[tokio::test]
+    async fn the_phone_sees_the_call_with_secrets_hidden_and_cut_to_size() {
+        const KEY: &str = "sk-live-0123456789abcdef";
+        let notifier = Arc::new(RecordingNotifier::default());
+        let notifications = Arc::new(
+            Notifications::new(notifier.clone(), everything())
+                .with_redactor(Arc::new(Redactor::new([KEY.to_string()]))),
+        );
+        notifications.begin_turn("session-7");
+        let remote = ScriptedRemote::answering(Ok(RemoteAnswer::Deny));
+        let gate = CliApprovalGate::new(ApprovalPolicy::Ask, true, notifications)
+            .with_read_line(nobody_types())
+            .with_remote(remote.clone());
+        let mut request = secret_request();
+        let padding = "x".repeat(crate::notify::MAX_REMOTE_DETAIL_CHARS - 4);
+        request.summary = format!("write_file(content=\"{padding}{KEY}\")");
+
+        gate.authorize(&request).await.unwrap();
+
+        let asked = remote.asked.lock().unwrap();
+        assert_eq!(asked[0].session_id, "session-7");
+        assert_eq!(asked[0].tool.as_str(), "write_file");
+        assert!(!asked[0].detail.contains("sk-live"), "{}", asked[0].detail);
+        assert!(asked[0].detail.starts_with("write_file(content=\"xxx"));
+        assert!(asked[0].detail.ends_with('…'), "{}", asked[0].detail);
+    }
+
+    #[tokio::test]
+    async fn a_dependency_change_is_never_answered_from_the_phone() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let remote = ScriptedRemote::answering(Ok(RemoteAnswer::Approve));
+        let (gate, notifications) = remote_gate(&notifier, typing("n\n"), &remote);
+
+        let decision = gate
+            .authorize_dependency_change(&dependency_request("tokio"))
+            .await
+            .unwrap();
+        notifications.drain(DRAIN_TIMEOUT).await;
+
+        assert!(
+            matches!(decision, ApprovalDecision::Deny { .. }),
+            "{decision:?}"
+        );
+        assert!(
+            remote.asked.lock().unwrap().is_empty(),
+            "the phone must not be asked"
+        );
+        let announced = remote.announced.lock().unwrap();
+        assert_eq!(announced.len(), 1, "the phone is told to come back");
+        assert!(!format!("{announced:?}").contains("tokio"), "{announced:?}");
+        assert!(
+            notifier.sent.lock().unwrap().is_empty(),
+            "one buzz, not two: {:?}",
+            notifier.sent.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_answer_never_turns_on_approve_all() {
+        let notifier = Arc::new(RecordingNotifier::default());
+        let remote = ScriptedRemote::answering(Ok(RemoteAnswer::Approve));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let read_line: ReadLine = Box::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Some("n".to_string())) })
+        });
+        let (gate, _) = prompting(&notifier, nobody_types());
+        let gate = gate.with_remote(remote.clone());
+        gate.authorize(&secret_request()).await.unwrap();
+
+        // The next prompt is asked again, at the terminal.
+        let gate = gate.with_read_line(read_line);
+        let decision = gate.authorize(&secret_request()).await.unwrap();
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        assert!(!decision.is_approved(), "{decision:?}");
     }
 
     // --- dependency changes ---------------------------------------------------

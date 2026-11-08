@@ -9,9 +9,15 @@
 //! What goes into a [`Notification`] leaves the machine, so the vocabulary is
 //! deliberately narrow. [`NotificationEvent::ApprovalPending`] carries the
 //! tool's name and safety class but not the request's summary: that summary
-//! quotes the model's arguments (file contents, commands, URLs), which are the
-//! last thing that should be posted to a chat channel without the operator
-//! reading them first.
+//! quotes the model's arguments (file contents, commands, URLs), and a plain
+//! "come back to the terminal" page does not need them.
+//!
+//! The one place arguments do leave the machine is remote approval
+//! ([`super::remote_approval`]), where a human is asked to decide from the
+//! notification alone and approving unseen would be worse. That goes through
+//! its own port, with the arguments stripped of known secrets and cut to size
+//! by the caller - not through this vocabulary, which stays argument-free so
+//! that no webhook (Slack, a generic JSON receiver) ever gets them.
 //!
 //! The types carry no `Serialize`. The wire format belongs to whichever
 //! adapter speaks to a particular service, and a derive here would make the

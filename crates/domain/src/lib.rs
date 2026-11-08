@@ -22,7 +22,7 @@ pub mod text;
 
 pub use error::{
     ApprovalError, CommandError, DomainError, FetchError, FsError, LlmError, NotifyError,
-    PlanError, ToolError, ToolServerError,
+    PlanError, RemoteApprovalError, ToolError, ToolServerError,
 };
 pub use model::{
     access::{AccessPolicy, FileAccess, PathPattern},

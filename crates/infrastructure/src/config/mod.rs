@@ -29,7 +29,7 @@ use thiserror::Error;
 
 use crate::exec::SandboxRequirement;
 use crate::llm::{Effort, PromptCache, Thinking};
-use crate::notify::{NotifyFormat, WebhookUrl};
+use crate::notify::{NotifyFormat, NtfyToken, WebhookUrl};
 
 pub use access::AccessSettings;
 pub use describe::describe;
@@ -319,10 +319,59 @@ pub struct NotifySettings {
     pub min_turn: Duration,
     /// Characters of the answer to include. `0` sends none.
     pub excerpt_chars: usize,
+    /// `AGENT_NOTIFY_NTFY_TOKEN`: sent with every request to an ntfy server.
+    /// Only meaningful with the ntfy format.
+    pub ntfy_token: Option<NtfyToken>,
+    /// Answering prompts from the phone. `None` unless a reply topic is set.
+    pub remote_approval: Option<RemoteApprovalSettings>,
+}
+
+/// Approving or denying a prompt from the ntfy notification.
+///
+/// Whoever can read the notification topic can approve: the buttons carry
+/// what a reply needs. So this is accepted only together with an access
+/// token, and the server is checked at startup to refuse anonymous readers
+/// of the notification topic and anonymous writers to the reply topic.
+#[derive(Clone)]
+pub struct RemoteApprovalSettings {
+    /// The topic replies are posted to and read from. A credential, like the
+    /// notification topic.
+    pub reply_topic: String,
+    /// Put in the buttons instead of the main token: it then only needs to
+    /// write to the reply topic, which is all a reader of the notification
+    /// topic can do with it.
+    pub reply_token: Option<NtfyToken>,
+    /// How long a prompt's one-time token stays valid. The terminal keeps
+    /// waiting after it lapses.
+    pub ttl: Duration,
+}
+
+impl std::fmt::Debug for RemoteApprovalSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteApprovalSettings")
+            .field("reply_topic", &"(hidden)")
+            .field("reply_token", &self.reply_token)
+            .field("ttl", &self.ttl)
+            .finish()
+    }
 }
 
 const NOTIFY_URL_KEY: &str = "AGENT_NOTIFY_WEBHOOK_URL";
 const NOTIFY_EVENTS_KEY: &str = "AGENT_NOTIFY_EVENTS";
+const NTFY_TOKEN_KEY: &str = "AGENT_NOTIFY_NTFY_TOKEN";
+const NTFY_REPLY_TOPIC_KEY: &str = "AGENT_NOTIFY_NTFY_REPLY_TOPIC";
+const NTFY_REPLY_TOKEN_KEY: &str = "AGENT_NOTIFY_NTFY_REPLY_TOKEN";
+const NTFY_TTL_KEY: &str = "AGENT_NOTIFY_APPROVAL_TTL_SECS";
+
+/// Reads a token without ever repeating it in an error.
+fn ntfy_token(reader: &Reader<'_>, key: &str) -> Result<Option<NtfyToken>, ConfigError> {
+    reader
+        .string(key)
+        .map(|raw| {
+            NtfyToken::parse(&raw).map_err(|reason| ConfigError::invalid(key, "(hidden)", reason))
+        })
+        .transpose()
+}
 
 impl NotifySettings {
     fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
@@ -348,19 +397,114 @@ impl NotifySettings {
                 .as_ref()
                 .map_or(NotifyFormat::Json, NotifyFormat::infer),
         };
-        if let Some(url) = &webhook {
-            crate::notify::endpoint(url, format)
-                .map_err(|reason| ConfigError::invalid(NOTIFY_URL_KEY, url.redacted(), reason))?;
+        let notify_topic = match &webhook {
+            Some(url) => {
+                crate::notify::endpoint(url, format)
+                    .map_err(|reason| ConfigError::invalid(NOTIFY_URL_KEY, url.redacted(), reason))?
+                    .topic
+            }
+            None => None,
+        };
+
+        let ntfy_token = ntfy_token(reader, NTFY_TOKEN_KEY)?;
+        if ntfy_token.is_some() && format != NotifyFormat::Ntfy {
+            return Err(ConfigError::invalid(
+                NTFY_TOKEN_KEY,
+                "(hidden)",
+                "only used with ntfy; set AGENT_NOTIFY_FORMAT=ntfy or unset the token",
+            ));
         }
 
         Ok(Self {
+            remote_approval: remote_approval(
+                reader,
+                notify_topic.as_deref(),
+                ntfy_token.is_some(),
+            )?,
             webhook,
             format,
             events: notify_events(reader)?,
             min_turn: Duration::from_secs(reader.parsed("AGENT_NOTIFY_MIN_SECS", 30)?),
             excerpt_chars: reader.parsed("AGENT_NOTIFY_EXCERPT_CHARS", 100)?,
+            ntfy_token,
         })
     }
+}
+
+/// Remote approval, when a reply topic is set. `notify_topic` is the ntfy
+/// topic notifications go to, `None` when the webhook is not ntfy.
+///
+/// Every requirement is checked here rather than left to fail at the first
+/// prompt: a reply topic the operator set and the agent quietly ignored would
+/// look like a phone that never gets buttons.
+fn remote_approval(
+    reader: &Reader<'_>,
+    notify_topic: Option<&str>,
+    has_token: bool,
+) -> Result<Option<RemoteApprovalSettings>, ConfigError> {
+    let reply_token = ntfy_token(reader, NTFY_REPLY_TOKEN_KEY)?;
+    let Some(reply_topic) = reader.string(NTFY_REPLY_TOPIC_KEY) else {
+        if reply_token.is_some() {
+            return Err(ConfigError::invalid(
+                NTFY_REPLY_TOKEN_KEY,
+                "(hidden)",
+                format!("only used for remote approval; set {NTFY_REPLY_TOPIC_KEY} as well"),
+            ));
+        }
+        return Ok(None);
+    };
+
+    let Some(notify_topic) = notify_topic else {
+        return Err(ConfigError::invalid(
+            NTFY_REPLY_TOPIC_KEY,
+            "(hidden)",
+            format!(
+                "remote approval needs ntfy notifications: set {NOTIFY_URL_KEY} to \
+                 https://<ntfy server>/<topic>, with AGENT_NOTIFY_FORMAT=ntfy for a \
+                 self-hosted server"
+            ),
+        ));
+    };
+    if !crate::notify::is_valid_topic(&reply_topic) {
+        return Err(ConfigError::invalid(
+            NTFY_REPLY_TOPIC_KEY,
+            "(hidden)",
+            "an ntfy topic may only contain [A-Za-z0-9_-], up to 64 characters",
+        ));
+    }
+    if reply_topic == notify_topic {
+        return Err(ConfigError::invalid(
+            NTFY_REPLY_TOPIC_KEY,
+            "(hidden)",
+            "must differ from the notification topic, or every notification would be read \
+             back as a reply",
+        ));
+    }
+    if !has_token {
+        return Err(ConfigError::missing(
+            NTFY_TOKEN_KEY,
+            format!(
+                "Remote approval ({NTFY_REPLY_TOPIC_KEY}) needs an ntfy access token (tk_...) \
+                 for a server where anonymous users can neither read the notification topic \
+                 nor write to the reply topic."
+            ),
+        ));
+    }
+
+    let ttl: u64 = reader.parsed(NTFY_TTL_KEY, 900)?;
+    if ttl == 0 {
+        return Err(ConfigError::invalid(
+            NTFY_TTL_KEY,
+            "0",
+            "a token that expires at once could never be used; e.g. 900 for 15 minutes",
+        ));
+    }
+
+    Ok(Some(RemoteApprovalSettings {
+        reply_topic,
+        reply_token,
+        ttl: Duration::from_secs(ttl),
+    }))
 }
 
 /// Absent or blank means every kind: someone who set a URL and nothing else
@@ -490,6 +634,12 @@ impl Settings {
             .collect();
         if let Some(url) = &self.notify.webhook {
             secrets.extend(url.secrets(self.notify.format));
+        }
+        secrets.extend(self.notify.ntfy_token.as_ref().map(NtfyToken::secret));
+        if let Some(remote) = &self.notify.remote_approval {
+            // Knowing the reply topic is half of what it takes to post a reply.
+            secrets.push(remote.reply_topic.clone());
+            secrets.extend(remote.reply_token.as_ref().map(NtfyToken::secret));
         }
         secrets
     }
@@ -1234,6 +1384,110 @@ mod tests {
         ])
         .expect_err("ntfy without a topic");
         assert!(error.to_string().contains("topic"), "{error}");
+    }
+
+    const NTFY_TOKEN: &str = "tk_0123456789abcdefghijklmnopq";
+
+    fn remote(extra: &[(&str, &str)]) -> Result<Settings, ConfigError> {
+        let mut pairs = vec![
+            ("AGENT_MODEL", "m"),
+            (
+                "AGENT_NOTIFY_WEBHOOK_URL",
+                "https://ntfy.example.com/alerts-42",
+            ),
+            ("AGENT_NOTIFY_FORMAT", "ntfy"),
+            ("AGENT_NOTIFY_NTFY_TOKEN", NTFY_TOKEN),
+            ("AGENT_NOTIFY_NTFY_REPLY_TOPIC", "replies-from-phone"),
+        ];
+        pairs.retain(|(key, _)| !extra.iter().any(|(extra, _)| extra == key));
+        pairs.extend(extra.iter().filter(|(_, value)| !value.is_empty()));
+        settings(&pairs)
+    }
+
+    #[test]
+    fn remote_approval_is_off_unless_a_reply_topic_is_set() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_NOTIFY_WEBHOOK_URL", "https://ntfy.sh/alerts-42"),
+        ])
+        .unwrap();
+        assert!(settings.notify.remote_approval.is_none());
+        assert!(describe(&settings)["remote approval"].starts_with("disabled"));
+    }
+
+    #[test]
+    fn remote_approval_reads_its_topic_tokens_and_lifetime() {
+        let settings = remote(&[
+            (
+                "AGENT_NOTIFY_NTFY_REPLY_TOKEN",
+                "tk_replyreplyreplyreplyreply",
+            ),
+            ("AGENT_NOTIFY_APPROVAL_TTL_SECS", "120"),
+        ])
+        .unwrap();
+        let remote = settings.notify.remote_approval.as_ref().unwrap();
+        assert_eq!(remote.reply_topic, "replies-from-phone");
+        assert!(remote.reply_token.is_some());
+        assert_eq!(remote.ttl, Duration::from_secs(120));
+
+        let default = self::remote(&[]).unwrap();
+        assert_eq!(
+            default.notify.remote_approval.unwrap().ttl,
+            Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn remote_approval_without_a_token_or_without_ntfy_aborts_startup() {
+        let error = remote(&[("AGENT_NOTIFY_NTFY_TOKEN", "")]).expect_err("no token");
+        assert!(
+            error.to_string().contains("AGENT_NOTIFY_NTFY_TOKEN"),
+            "{error}"
+        );
+
+        let error = remote(&[
+            ("AGENT_NOTIFY_FORMAT", "json"),
+            ("AGENT_NOTIFY_NTFY_TOKEN", ""),
+        ])
+        .expect_err("not ntfy");
+        assert!(error.to_string().contains("ntfy"), "{error}");
+
+        let error =
+            remote(&[("AGENT_NOTIFY_NTFY_REPLY_TOPIC", "alerts-42")]).expect_err("same topic");
+        assert!(error.to_string().contains("differ"), "{error}");
+
+        let error =
+            remote(&[("AGENT_NOTIFY_NTFY_REPLY_TOPIC", "bad.topic")]).expect_err("invalid topic");
+        assert!(!error.to_string().contains("bad.topic"), "{error}");
+
+        let error = remote(&[("AGENT_NOTIFY_APPROVAL_TTL_SECS", "0")]).expect_err("zero ttl");
+        assert!(
+            error.to_string().contains("AGENT_NOTIFY_APPROVAL_TTL_SECS"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn ntfy_tokens_and_the_reply_topic_are_secrets_and_never_printed() {
+        let settings = remote(&[(
+            "AGENT_NOTIFY_NTFY_REPLY_TOKEN",
+            "tk_replyreplyreplyreplyreply",
+        )])
+        .unwrap();
+
+        let secrets = settings.configured_secrets();
+        for secret in [
+            NTFY_TOKEN,
+            "tk_replyreplyreplyreplyreply",
+            "replies-from-phone",
+        ] {
+            assert!(secrets.iter().any(|s| s == secret), "{secret}: {secrets:?}");
+        }
+
+        let shown = format!("{settings:?} {:?}", describe(&settings));
+        for secret in [NTFY_TOKEN, "tk_reply", "replies-from-phone"] {
+            assert!(!shown.contains(secret), "`{secret}` leaked: {shown}");
+        }
     }
 
     #[test]

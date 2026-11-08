@@ -45,11 +45,35 @@ fn describe_notify(notify: &NotifySettings) -> String {
     } else {
         format!("first {} chars of each answer", notify.excerpt_chars)
     };
+    let auth = if notify.ntfy_token.is_some() {
+        "; with an access token"
+    } else {
+        ""
+    };
     format!(
-        "{} to {} ({events}; turns >= {}s; {excerpt})",
+        "{} to {} ({events}; turns >= {}s; {excerpt}{auth})",
         notify.format.as_str(),
         url.redacted(),
         notify.min_turn.as_secs()
+    )
+}
+
+/// Whether a prompt can be answered from the notification. Said plainly,
+/// because it is a second way to approve and the operator should never be
+/// surprised by it.
+fn describe_remote_approval(notify: &NotifySettings) -> String {
+    let Some(remote) = &notify.remote_approval else {
+        return "disabled (prompts are answered at the terminal only)".to_string();
+    };
+    let buttons = if remote.reply_token.is_some() {
+        "a separate reply token in the buttons"
+    } else {
+        "the main token in the buttons - set AGENT_NOTIFY_NTFY_REPLY_TOKEN to a write-only one"
+    };
+    format!(
+        "approve/deny from the ntfy notification, which shows the call's arguments with known \
+         secrets hidden; tokens expire after {}s; {buttons}; interactive sessions only",
+        remote.ttl.as_secs()
     )
 }
 
@@ -143,6 +167,10 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         },
     );
     description.insert("notify".into(), describe_notify(&settings.notify));
+    description.insert(
+        "remote approval".into(),
+        describe_remote_approval(&settings.notify),
+    );
     description.insert(
         "file access".into(),
         match settings.access_policy(&settings.workspace) {

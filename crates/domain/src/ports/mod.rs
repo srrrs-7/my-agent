@@ -14,6 +14,7 @@ pub mod file_system;
 pub mod llm;
 pub mod notify;
 pub mod prompt;
+pub mod remote_approval;
 pub mod search;
 pub mod session_store;
 pub mod tool;
@@ -29,6 +30,9 @@ pub use file_system::{DirEntry, EntryKind, FileSystem};
 pub use llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent};
 pub use notify::{Notification, NotificationEvent, NotificationKind, Notifier, NullNotifier};
 pub use prompt::PromptBuilder;
+pub use remote_approval::{
+    NullRemoteApprover, RemoteAnswer, RemoteApprovalRequest, RemoteApprover, TerminalOnlyNotice,
+};
 pub use search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery};
 pub use session_store::{SessionStore, SessionSummary};
 pub use tool::Tool;
