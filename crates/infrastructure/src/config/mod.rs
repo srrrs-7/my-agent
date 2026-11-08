@@ -144,6 +144,35 @@ pub struct PromptSettings {
     /// Append these instructions to the end of the prompt (after the project
     /// instruction file; combined with `replace_file`, appends to that text).
     pub append: Option<String>,
+    /// The operator's own instruction file, merged in front of the
+    /// workspace's (`AGENT_GLOBAL_INSTRUCTIONS`). Always absolute: there is
+    /// no directory a relative path could sensibly be read against, since
+    /// the same file is meant for every workspace.
+    pub global_instructions: Option<PathBuf>,
+}
+
+const GLOBAL_INSTRUCTIONS_KEY: &str = "AGENT_GLOBAL_INSTRUCTIONS";
+
+impl PromptSettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        let global_instructions = match reader.string(GLOBAL_INSTRUCTIONS_KEY) {
+            None => None,
+            Some(raw) if Path::new(&raw).is_absolute() => Some(PathBuf::from(raw)),
+            Some(raw) => {
+                return Err(ConfigError::invalid(
+                    GLOBAL_INSTRUCTIONS_KEY,
+                    raw,
+                    "must be an absolute path (`~` is not expanded), e.g. \
+                     /home/me/.config/agent/AGENTS.md",
+                ));
+            }
+        };
+        Ok(Self {
+            replace_file: reader.string("AGENT_SYSTEM_PROMPT_FILE").map(PathBuf::from),
+            append: reader.string("AGENT_APPEND_SYSTEM_PROMPT"),
+            global_instructions,
+        })
+    }
 }
 
 /// Outbound web access for the `web_fetch` tool.
@@ -409,10 +438,7 @@ impl Settings {
                         .map(|days| Duration::from_secs(days as u64 * 24 * 60 * 60)),
                 },
             },
-            prompt: PromptSettings {
-                replace_file: reader.string("AGENT_SYSTEM_PROMPT_FILE").map(PathBuf::from),
-                append: reader.string("AGENT_APPEND_SYSTEM_PROMPT"),
-            },
+            prompt: PromptSettings::read(&reader)?,
             web_fetch: WebFetchSettings {
                 enabled: reader.parsed("AGENT_WEB_FETCH", false)?,
                 allowed_domains: reader.list("AGENT_WEB_FETCH_ALLOW"),
@@ -779,6 +805,14 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         },
     );
     description.insert(
+        "global instructions".into(),
+        settings
+            .prompt
+            .global_instructions
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |path| path.display().to_string()),
+    );
+    description.insert(
         "history".into(),
         format!(
             "{} bytes; {}",
@@ -1116,6 +1150,45 @@ mod tests {
         assert_eq!(settings.prompt.replace_file, None);
         assert_eq!(settings.prompt.append, None);
         assert_eq!(describe(&settings)["system prompt"], "built-in");
+        assert_eq!(settings.prompt.global_instructions, None);
+        assert_eq!(describe(&settings)["global instructions"], "none");
+    }
+
+    #[test]
+    fn global_instructions_are_read_from_an_absolute_path() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            (
+                "AGENT_GLOBAL_INSTRUCTIONS",
+                "/home/me/.config/agent/AGENTS.md",
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            settings.prompt.global_instructions,
+            Some(PathBuf::from("/home/me/.config/agent/AGENTS.md"))
+        );
+        assert_eq!(
+            describe(&settings)["global instructions"],
+            "/home/me/.config/agent/AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn a_relative_global_instructions_path_aborts_startup_and_says_why() {
+        for relative in ["AGENTS.md", "~/.config/agent/AGENTS.md"] {
+            let error = settings(&[
+                ("AGENT_MODEL", "m"),
+                ("AGENT_GLOBAL_INSTRUCTIONS", relative),
+            ])
+            .err()
+            .unwrap_or_else(|| panic!("`{relative}` must be refused"));
+            let message = error.to_string();
+            assert!(
+                message.contains("AGENT_GLOBAL_INSTRUCTIONS") && message.contains("absolute"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

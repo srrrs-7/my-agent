@@ -145,6 +145,7 @@ impl ContextProvider for FakeContext {
             today: "2026-08-13".into(),
             is_git_repository: true,
             project_instructions: None,
+            nested_instructions: Vec::new(),
             directory_overview: vec!["src/".into()],
         })
     }
