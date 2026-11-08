@@ -55,12 +55,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agent_domain::error::ToolError;
-use agent_domain::model::dependency::{DependencyFileChange, FileChange, ManifestKind};
+use agent_domain::model::dependency::{
+    DependencyFileChange, DependencyReport, FileChange, ManifestKind,
+};
 use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolOutcome, ToolSafety};
 use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::events::{AgentEvent, EventSink};
 use agent_domain::ports::tool::Tool;
-use agent_domain::text::printable;
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde_json::Value;
@@ -128,10 +129,7 @@ impl DependencyWatchTool {
             // A scan that panicked saw nothing. Marked incomplete, so the
             // result says the check did not happen rather than that nothing
             // changed.
-            .unwrap_or_else(|_| Snapshot {
-                files: BTreeMap::new(),
-                complete: false,
-            })
+            .unwrap_or_else(|_| Snapshot::incomplete())
     }
 }
 
@@ -185,33 +183,12 @@ impl Tool for DependencyWatchTool {
 
 /// What the model is told. `None` when there is nothing to say.
 fn note(changes: &[DependencyFileChange], complete: bool, limit: usize) -> Option<String> {
-    let mut lines = Vec::new();
-    if !changes.is_empty() {
-        let files = changes
-            .iter()
-            .map(|change| {
-                format!(
-                    "{} ({} {})",
-                    printable(&change.path.display()),
-                    change.kind.label(),
-                    change.change.label()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        lines.push(format!(
-            "[dependency files changed by this call: {files}. Nobody reviewed this change \
-             before it happened. Tell the user in your reply which dependencies were added, \
-             removed or upgraded and why; do not hide it among other work.]"
-        ));
+    DependencyReport {
+        changes: changes.to_vec(),
+        complete,
+        limit,
     }
-    if !complete {
-        lines.push(format!(
-            "[dependency check incomplete: the workspace scan stopped after {limit} entries, so \
-             changes to dependency files beyond that point are not reported.]"
-        ));
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
+    .note("by this call")
 }
 
 /// The dependency files of a workspace at one moment, by content hash.
@@ -219,13 +196,21 @@ fn note(changes: &[DependencyFileChange], complete: bool, limit: usize) -> Optio
 /// The hash only has to notice a change between two scans in one process,
 /// so std's SipHash is enough; nothing here needs to resist a collision
 /// crafted in advance.
-struct Snapshot {
+pub(crate) struct Snapshot {
     files: BTreeMap<WorkspacePath, (ManifestKind, Option<u64>)>,
     /// Every entry was visited.
     complete: bool,
 }
 
 impl Snapshot {
+    /// A scan that saw nothing, for one that could not run.
+    pub(crate) fn incomplete() -> Self {
+        Self {
+            files: BTreeMap::new(),
+            complete: false,
+        }
+    }
+
     /// Directories come from an ignore-aware walk, which prunes them; the
     /// files in each are then listed directly, so no ignore rule ever hides a
     /// file (see the module docs).
@@ -234,7 +219,7 @@ impl Snapshot {
     /// workspace and skips hidden directories, where `.github/` and `.cargo/`
     /// keep manifests this check exists to watch, and it would let a global
     /// excludes file make the check differ by machine.
-    fn take(root: &WorkspaceRoot, limit: usize) -> Self {
+    pub(crate) fn take(root: &WorkspaceRoot, limit: usize) -> Self {
         let mut files = BTreeMap::new();
         let mut visited = 0usize;
 
@@ -293,6 +278,15 @@ impl Snapshot {
         Self {
             files,
             complete: true,
+        }
+    }
+
+    /// What changed between this scan and `after`, as the model is told it.
+    pub(crate) fn report_to(&self, after: &Self, limit: usize) -> DependencyReport {
+        DependencyReport {
+            changes: self.changes_to(after),
+            complete: self.complete && after.complete,
+            limit,
         }
     }
 

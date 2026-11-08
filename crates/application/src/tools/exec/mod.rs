@@ -1,7 +1,8 @@
 //! Command execution.
 //!
-//! One tool, and the only one that hands work to a process this agent does not
-//! control. Its safety class is
+//! `run_command`, and the background trio built on the same confinement
+//! (`start_command`, `read_output`, `kill_command`). The only tools that hand
+//! work to a process this agent does not control. Starting one is
 //! [`agent_domain::model::tool::ToolSafety::Destructive`] for that reason
 //! alone: what a command does cannot be read off its arguments, so the human
 //! approves the literal shell line before it runs.
@@ -11,6 +12,8 @@
 //! between a model's arguments and that port, and the rendering of a result
 //! that tells the model what actually happened.
 
+mod background;
 mod run;
 
+pub use background::{KillCommandTool, ReadOutputTool, StartCommandTool};
 pub use run::RunCommandTool;

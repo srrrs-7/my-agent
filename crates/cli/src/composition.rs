@@ -14,7 +14,9 @@ use agent_application::agent::{
 };
 use agent_application::checkpoint::{CheckpointJournal, CheckpointingTool};
 use agent_application::tools::ToolRegistry;
-use agent_application::tools::exec::RunCommandTool;
+use agent_application::tools::exec::{
+    KillCommandTool, ReadOutputTool, RunCommandTool, StartCommandTool,
+};
 use agent_application::tools::file::{
     EditFileTool, GlobTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
 };
@@ -25,6 +27,8 @@ use agent_domain::model::llm::{GenerationParams, ModelId};
 use agent_domain::model::tool::ToolSafety;
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::approval::ApprovalGate;
+use agent_domain::ports::background::{BackgroundCommands, JobLimits};
+use agent_domain::ports::command::CommandRunner as _;
 use agent_domain::ports::conversation_log::{ConversationLog, NullConversationLog};
 use agent_domain::ports::events::EventSink;
 use agent_domain::ports::llm::LlmProvider;
@@ -37,6 +41,7 @@ use agent_domain::ports::tool_server::ToolServer;
 use agent_infrastructure::config::{
     ApprovalPolicy, NotifySettings, PromptSettings, Settings, ShellSettings, SystemEnv,
 };
+use agent_infrastructure::exec::background::BackgroundSupervisor;
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
@@ -68,6 +73,9 @@ pub struct Application {
     /// port, and the commands it confines refer to that port by number.
     /// `doctor` also reads its reported sandbox rather than the configuration.
     pub commands: Option<Arc<SandboxedCommandRunner>>,
+    /// The background jobs, when offered. `/reset` stops them all; dropping
+    /// the last handle at exit kills any still running.
+    pub background: Option<Arc<BackgroundSupervisor>>,
     /// The same instance the approval gate holds: the gate restarts the turn
     /// clock when a prompt is answered, and the subcommands read it.
     pub notifications: Arc<Notifications>,
@@ -292,6 +300,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     } else {
         None
     };
+    let background = register_background(&mut tools, commands.as_ref(), &settings, &events)?;
 
     // Last of the registrations, so a server tool whose name collides with
     // any tool above is refused. Before the wrapping below, so server tools
@@ -371,12 +380,63 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         agent,
         sessions,
         commands,
+        background,
         notifications,
         remote_approval,
         tool_servers,
         redactor,
         checkpoints,
     })
+}
+
+/// The background-job tools, when the shell is on, the operator has not
+/// turned them off, and the shell's sandbox actually confines.
+///
+/// A sandbox the operator disabled does not fail startup here as it would
+/// for a requirement the platform cannot meet: `run_command` is still offered
+/// as asked, and only the tools that run unattended between calls are not.
+fn register_background(
+    tools: &mut ToolRegistry,
+    runner: Option<&Arc<SandboxedCommandRunner>>,
+    settings: &Settings,
+    events: &Arc<dyn EventSink>,
+) -> Result<Option<Arc<BackgroundSupervisor>>> {
+    let background = &settings.shell.background;
+    let Some(runner) = runner.filter(|runner| background.enabled && runner.sandbox().confines())
+    else {
+        return Ok(None);
+    };
+    let supervisor = Arc::new(
+        BackgroundSupervisor::new(
+            runner.clone(),
+            JobLimits {
+                max_jobs: background.max_jobs,
+                max_lifetime: background.max_lifetime,
+                buffer_bytes: background.buffer_bytes,
+            },
+        )
+        .context("cannot start the background job supervisor")?,
+    );
+    let jobs: Arc<dyn BackgroundCommands> = supervisor.clone();
+    // `kill_command` waits for the job to be reaped and compared, which the
+    // supervisor bounds on its own; this only catches one that never returns.
+    let timeout = settings.agent_loop.tool_timeout + std::time::Duration::from_secs(60);
+    tools.register(TimeoutTool::wrap(
+        Arc::new(StartCommandTool::new(
+            jobs.clone(),
+            &settings.shell.allowed_domains,
+        )),
+        timeout,
+    ));
+    tools.register(TimeoutTool::wrap(
+        Arc::new(ReadOutputTool::new(jobs.clone(), events.clone())),
+        timeout,
+    ));
+    tools.register(TimeoutTool::wrap(
+        Arc::new(KillCommandTool::new(jobs, events.clone())),
+        timeout,
+    ));
+    Ok(Some(supervisor))
 }
 
 /// The MCP configuration, when `AGENT_MCP_CONFIG` names one. Checked against

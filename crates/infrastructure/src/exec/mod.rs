@@ -11,6 +11,7 @@
 //! user to install anything. That is the difference between a sandbox that is
 //! present and one that is merely documented.
 
+pub mod background;
 pub(crate) mod capture;
 pub(crate) mod confined;
 pub(crate) mod env;
@@ -331,6 +332,34 @@ impl SandboxedCommandRunner {
     }
 }
 
+impl SandboxedCommandRunner {
+    /// `request` as a confined `/bin/sh -c` line, ready to spawn. Shared with
+    /// [`background::BackgroundSupervisor`], so a background job is confined
+    /// by exactly the rules a one-shot command is.
+    pub(crate) fn shell_command(&self, request: &CommandRequest) -> Result<Command, CommandError> {
+        if request.command.trim().is_empty() {
+            return Err(CommandError::Refused {
+                reason: "the command is empty".to_string(),
+            });
+        }
+
+        let cwd = self.workspace.absolute(&request.cwd);
+        if !cwd.is_dir() {
+            return Err(CommandError::Refused {
+                reason: format!("`{}` is not a directory in the workspace", request.cwd),
+            });
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(&request.command).current_dir(&cwd);
+        confined::confine_command(command, &self.policy())
+    }
+
+    pub(crate) fn workspace(&self) -> &std::sync::Arc<WorkspaceRoot> {
+        &self.workspace
+    }
+}
+
 impl Drop for SandboxedCommandRunner {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.session_temp);
@@ -348,23 +377,7 @@ impl CommandRunner for SandboxedCommandRunner {
     }
 
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, CommandError> {
-        if request.command.trim().is_empty() {
-            return Err(CommandError::Refused {
-                reason: "the command is empty".to_string(),
-            });
-        }
-
-        let cwd = self.workspace.absolute(&request.cwd);
-        if !cwd.is_dir() {
-            return Err(CommandError::Refused {
-                reason: format!("`{}` is not a directory in the workspace", request.cwd),
-            });
-        }
-
-        let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg(&request.command).current_dir(&cwd);
-        let command = confined::confine_command(command, &self.policy())?;
-
+        let command = self.shell_command(&request)?;
         capture::run_capped(command, request.timeout, request.max_output_bytes).await
     }
 }

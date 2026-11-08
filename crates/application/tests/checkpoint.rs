@@ -8,13 +8,16 @@ use std::sync::{Arc, Mutex};
 use agent_application::agent::{AgentLoop, Session};
 use agent_application::checkpoint::{CheckpointError, CheckpointJournal, CheckpointingTool};
 use agent_application::tools::ToolRegistry;
+use agent_application::tools::exec::StartCommandTool;
 use agent_application::tools::file::{EditFileTool, WriteFileTool};
-use agent_domain::error::ToolError;
+use agent_domain::error::{JobError, ToolError};
 use agent_domain::model::message::Role;
 use agent_domain::model::tool::{
     Before, PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety,
 };
 use agent_domain::model::workspace::WorkspacePath;
+use agent_domain::ports::background::{BackgroundCommands, JobId, JobLimits, JobOutput};
+use agent_domain::ports::command::{CommandRequest, SandboxKind};
 use agent_domain::ports::conversation_log::ConversationLog;
 use agent_domain::ports::file_system::FileSystem;
 use agent_domain::ports::tool::Tool;
@@ -462,4 +465,59 @@ async fn a_loop_without_a_journal_says_so() {
         agent.undo(&mut session).await.unwrap_err(),
         CheckpointError::Disabled
     );
+}
+
+/// A job supervisor that starts nothing - the call is all that matters here.
+struct NoJobs;
+
+#[async_trait]
+impl BackgroundCommands for NoJobs {
+    fn sandbox(&self) -> SandboxKind {
+        SandboxKind::LandlockConfined
+    }
+
+    fn limits(&self) -> JobLimits {
+        JobLimits {
+            max_jobs: 1,
+            max_lifetime: std::time::Duration::from_secs(60),
+            buffer_bytes: 1024,
+        }
+    }
+
+    async fn start(&self, _request: CommandRequest) -> Result<JobId, JobError> {
+        Ok(JobId::new(1))
+    }
+
+    async fn read(&self, id: JobId, _since: u64, _max: usize) -> Result<JobOutput, JobError> {
+        Err(JobError::Unknown { id: id.get() })
+    }
+
+    async fn kill(&self, id: JobId, _max: usize) -> Result<JobOutput, JobError> {
+        Err(JobError::Unknown { id: id.get() })
+    }
+}
+
+/// A background job keeps changing things after its call returns, so nothing
+/// it does can be claimed as checkpointed. `start_command` is destructive -
+/// the class the composition root wraps for `/undo` - and plans no writes,
+/// which is what puts it on the "not undone" list.
+#[tokio::test]
+async fn a_started_background_job_is_listed_as_not_undone() {
+    let tool = StartCommandTool::new(Arc::new(NoJobs), &[]);
+    assert_eq!(tool.definition().safety, ToolSafety::Destructive);
+    let h = harness(
+        &[],
+        vec![
+            tool_use("c1", "start_command", json!({"command": "npm run dev"})),
+            assistant("started"),
+        ],
+        vec![Arc::new(tool)],
+    );
+    let mut session = Session::new("s");
+    h.agent.run(&mut session, "go").await.unwrap();
+
+    let report = h.agent.undo(&mut session).await.unwrap();
+
+    assert_eq!(report.not_undone, [ToolName::new("start_command").unwrap()]);
+    assert!(!report.changed_files());
 }

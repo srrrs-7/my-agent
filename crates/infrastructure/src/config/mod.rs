@@ -267,6 +267,69 @@ pub struct ShellSettings {
     /// Writable roots outside the workspace - build caches such as a
     /// `CARGO_TARGET_DIR` that points elsewhere.
     pub extra_writable: Vec<PathBuf>,
+    /// `start_command` / `read_output` / `kill_command`.
+    pub background: BackgroundSettings,
+}
+
+/// Background jobs. Offered only alongside `run_command`, and only where its
+/// sandbox actually confines - a job runs unattended between calls.
+///
+/// Every limit is finite: there is no setting for "no lifetime" or "keep all
+/// output", because a job without them is a process the agent no longer
+/// controls.
+#[derive(Debug, Clone)]
+pub struct BackgroundSettings {
+    /// On by default once the shell is: the shell switch is the decision
+    /// about running commands at all.
+    pub enabled: bool,
+    pub max_jobs: usize,
+    pub max_lifetime: Duration,
+    pub buffer_bytes: usize,
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_jobs: crate::exec::background::DEFAULT_MAX_JOBS,
+            max_lifetime: crate::exec::background::DEFAULT_MAX_LIFETIME,
+            buffer_bytes: crate::exec::background::DEFAULT_BUFFER_BYTES,
+        }
+    }
+}
+
+const BACKGROUND_KEY: &str = "AGENT_SHELL_BACKGROUND";
+const BACKGROUND_MAX_JOBS_KEY: &str = "AGENT_SHELL_BACKGROUND_MAX_JOBS";
+const BACKGROUND_LIFETIME_KEY: &str = "AGENT_SHELL_BACKGROUND_LIFETIME_SECS";
+const BACKGROUND_BUFFER_KEY: &str = "AGENT_SHELL_BACKGROUND_BUFFER_BYTES";
+
+impl BackgroundSettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        // Zero would mean "no jobs", "dead on arrival" or "no output" - none
+        // of them what an operator typing a number meant. The off switch is
+        // its own variable.
+        let positive = |key: &str, fallback: usize| -> Result<usize, ConfigError> {
+            match reader.parsed(key, fallback)? {
+                0 => Err(ConfigError::invalid(
+                    key,
+                    "0",
+                    "must be at least 1; set AGENT_SHELL_BACKGROUND=false to turn background \
+                     jobs off",
+                )),
+                value => Ok(value),
+            }
+        };
+        Ok(Self {
+            enabled: reader.parsed(BACKGROUND_KEY, defaults.enabled)?,
+            max_jobs: positive(BACKGROUND_MAX_JOBS_KEY, defaults.max_jobs)?,
+            max_lifetime: Duration::from_secs(positive(
+                BACKGROUND_LIFETIME_KEY,
+                defaults.max_lifetime.as_secs() as usize,
+            )? as u64),
+            buffer_bytes: positive(BACKGROUND_BUFFER_KEY, defaults.buffer_bytes)?,
+        })
+    }
 }
 
 /// MCP servers (stdio), each started inside the OS sandbox.
@@ -647,6 +710,7 @@ impl Settings {
                     .into_iter()
                     .map(PathBuf::from)
                     .collect(),
+                background: BackgroundSettings::read(&reader)?,
             },
             mcp: McpSettings::read(&reader)?,
             notify: NotifySettings::read(&reader)?,
@@ -971,6 +1035,38 @@ mod tests {
         assert!(!settings.shell.enabled);
         assert!(settings.shell.allowed_domains.is_empty());
         assert_eq!(settings.shell.sandbox, SandboxRequirement::Confined);
+    }
+
+    #[test]
+    fn background_jobs_have_finite_limits_by_default() {
+        let background = settings(&[("AGENT_MODEL", "m")]).unwrap().shell.background;
+        assert!(background.enabled);
+        assert_eq!(background.max_jobs, 4);
+        assert_eq!(background.max_lifetime, Duration::from_secs(30 * 60));
+        assert_eq!(background.buffer_bytes, 256 * 1024);
+    }
+
+    #[test]
+    fn a_zero_background_limit_is_refused_rather_than_read_as_off() {
+        for key in [
+            "AGENT_SHELL_BACKGROUND_MAX_JOBS",
+            "AGENT_SHELL_BACKGROUND_LIFETIME_SECS",
+            "AGENT_SHELL_BACKGROUND_BUFFER_BYTES",
+        ] {
+            let error =
+                settings(&[("AGENT_MODEL", "m"), (key, "0")]).expect_err("zero must abort startup");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+        let background = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_SHELL_BACKGROUND", "false"),
+            ("AGENT_SHELL_BACKGROUND_LIFETIME_SECS", "90"),
+        ])
+        .unwrap()
+        .shell
+        .background;
+        assert!(!background.enabled);
+        assert_eq!(background.max_lifetime, Duration::from_secs(90));
     }
 
     #[test]
