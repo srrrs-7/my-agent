@@ -87,6 +87,20 @@ impl GroupGuard {
         }
     }
 
+    /// Kills the group and every descendant that left it, and leaves the
+    /// guard armed: the pid stays registered as tokio's, so the caller can
+    /// reap the child and only then [`Self::disarm`]. Returns what
+    /// [`reaper::settle`] should wait for.
+    ///
+    /// The child must still be unreaped.
+    pub(crate) fn kill(&self) -> HashSet<i32> {
+        let Some(pid) = self.pid else {
+            return HashSet::new();
+        };
+        kill_group(Some(pid));
+        reaper::sweep(&[pid])
+    }
+
     /// Kills the group and every descendant that left it, and gives the pid
     /// back to tokio. Returns what [`reaper::settle`] should wait for.
     ///

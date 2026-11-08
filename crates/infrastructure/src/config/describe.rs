@@ -163,6 +163,21 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
             format!("enabled (sandbox: {}; {egress})", settings.shell.sandbox)
         },
     );
+    let background = &settings.shell.background;
+    description.insert(
+        "background jobs".into(),
+        if !settings.shell.enabled || !background.enabled {
+            "disabled".to_string()
+        } else {
+            format!(
+                "up to {} at a time, {}s lifetime, {} bytes of output each (only under a \
+                 confining sandbox)",
+                background.max_jobs,
+                background.max_lifetime.as_secs(),
+                background.buffer_bytes
+            )
+        },
+    );
     description.insert(
         "mcp servers".into(),
         match &settings.mcp.config {

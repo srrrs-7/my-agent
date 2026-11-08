@@ -40,6 +40,10 @@ pub const DENIED: &[&str] = &[
     "AGENT_SHELL_SANDBOX",
     "AGENT_SHELL_NETWORK_ALLOW",
     "AGENT_SHELL_WRITABLE",
+    // Commands that keep running between calls, and for how long.
+    "AGENT_SHELL_BACKGROUND",
+    "AGENT_SHELL_BACKGROUND_MAX_JOBS",
+    "AGENT_SHELL_BACKGROUND_LIFETIME_SECS",
     // Who approves.
     "AGENT_APPROVAL",
     "AGENT_ALLOW_DEPENDENCY_CHANGES",
@@ -310,6 +314,9 @@ mod tests {
             "AGENT_SHELL_SANDBOX",
             "AGENT_SHELL_NETWORK_ALLOW",
             "AGENT_SHELL_WRITABLE",
+            "AGENT_SHELL_BACKGROUND",
+            "AGENT_SHELL_BACKGROUND_MAX_JOBS",
+            "AGENT_SHELL_BACKGROUND_LIFETIME_SECS",
             "AGENT_APPROVAL",
             "AGENT_WEB_FETCH",
             "AGENT_WEB_FETCH_ALLOW",

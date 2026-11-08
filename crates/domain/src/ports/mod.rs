@@ -6,6 +6,7 @@
 //! terminal prompt for an auto-approving policy in CI.
 
 pub mod approval;
+pub mod background;
 pub mod command;
 pub mod context;
 pub mod conversation_log;
@@ -22,6 +23,7 @@ pub mod tool_server;
 pub mod web;
 
 pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest};
+pub use background::{BackgroundCommands, JobId, JobLimits, JobOutput, JobStop};
 pub use command::{CommandOutput, CommandRequest, CommandRunner, SandboxKind};
 pub use context::ContextProvider;
 pub use conversation_log::{ConversationLog, NullConversationLog};

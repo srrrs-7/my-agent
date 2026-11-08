@@ -245,6 +245,34 @@ pub enum CommandError {
     Io { message: String },
 }
 
+/// Failures produced by [`crate::ports::background::BackgroundCommands`].
+///
+/// Read by the model, so each says what to do next. A job that ran and
+/// failed is not one of these - its exit code is output like any other.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum JobError {
+    /// The job could not be started at all (empty command, a cwd that does
+    /// not exist, a spawn failure).
+    #[error(transparent)]
+    Command(#[from] CommandError),
+
+    /// The concurrency cap is reached.
+    #[error(
+        "{limit} background jobs are already running, which is the limit. Wait for one to \
+         finish (`read_output`) or stop one you no longer need (`kill_command`), then start \
+         this one again"
+    )]
+    TooMany { limit: usize },
+
+    /// No job by that id: never started, or finished long enough ago that its
+    /// output was discarded to make room.
+    #[error(
+        "there is no background job {id}. Use the id `start_command` returned; a job that \
+         finished long ago may have been forgotten to make room for newer ones"
+    )]
+    Unknown { id: u64 },
+}
+
 /// Failures produced by [`crate::ports::tool_server::ToolServer`].
 ///
 /// A tool that ran and reported failure is not one of these - that comes back

@@ -351,9 +351,87 @@ pub struct DependencyFileChange {
     pub change: FileChange,
 }
 
+/// The outcome of comparing the workspace's dependency files across some
+/// stretch of work - one command call, or the life of a background job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyReport {
+    pub changes: Vec<DependencyFileChange>,
+    /// Both scans visited every entry. When not, a change beyond the limit
+    /// may have gone unseen, and the note says so rather than implying
+    /// "nothing changed".
+    pub complete: bool,
+    /// The scan's entry limit, the usual reason it stopped.
+    pub limit: usize,
+}
+
+impl DependencyReport {
+    /// What the model is told, put at the head of the result it belongs to.
+    /// `None` when there is nothing to say.
+    ///
+    /// `during` completes "dependency files changed ..." - `by this call`,
+    /// `while background job 3 ran` - because whom the change is attributed
+    /// to differs, and a background job's window also covers whatever else
+    /// happened meanwhile.
+    pub fn note(&self, during: &str) -> Option<String> {
+        let mut lines = Vec::new();
+        if !self.changes.is_empty() {
+            let files = self
+                .changes
+                .iter()
+                .map(|change| {
+                    format!(
+                        "{} ({} {})",
+                        crate::text::printable(&change.path.display()),
+                        change.kind.label(),
+                        change.change.label()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!(
+                "[dependency files changed {during}: {files}. Nobody reviewed this change \
+                 before it happened. Tell the user in your reply which dependencies were added, \
+                 removed or upgraded and why; do not hide it among other work.]"
+            ));
+        }
+        if !self.complete {
+            lines.push(format!(
+                "[dependency check incomplete: the workspace scan stopped after {} entries, so \
+                 changes to dependency files beyond that point are not reported.]",
+                self.limit
+            ));
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_report_names_whom_the_change_is_attributed_to() {
+        let report = DependencyReport {
+            changes: vec![DependencyFileChange {
+                path: WorkspacePath::parse("Cargo.toml").unwrap(),
+                kind: ManifestKind::CargoToml,
+                change: FileChange::Modified,
+            }],
+            complete: true,
+            limit: 10,
+        };
+        let note = report.note("while background job 3 ran").unwrap();
+        assert!(
+            note.starts_with("[dependency files changed while background job 3 ran: Cargo.toml"),
+            "{note}"
+        );
+        let quiet = DependencyReport {
+            changes: Vec::new(),
+            complete: true,
+            limit: 10,
+        };
+        assert_eq!(quiet.note("by this call"), None);
+    }
 
     fn classify(raw: &str) -> Option<ManifestKind> {
         ManifestKind::classify(&WorkspacePath::parse(raw).unwrap())

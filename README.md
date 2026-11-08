@@ -136,6 +136,7 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 結果を返す前だったツール呼び出しには「ユーザーが中断した（実行していない／途中まで反映されたかもしれない）」
 という結果が付くので、次の入力でモデルはそれを踏まえて続けられます。ストリーミング途中の応答は履歴に残しません。
 実行中の `run_command` はプロセスグループごと（孫プロセスと、`setsid` でグループから抜けた子孫を含めて）止まります。
+`start_command` で起動したバックグラウンドジョブは止まりません（`/reset` と終了時に止まります）。
 承認プロンプトの途中で止めても、次に打った 1 行はチャットのプロンプトにそのまま届きます。
 中断は通知しません（押した本人が端末の前にいるため）。
 
@@ -155,8 +156,8 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 戻すのは「エージェントが書いた内容がまだそのまま残っているファイル」だけです。その後に手で編集した・
 コマンドが書き換えた・消えたファイルは**衝突として上書きせずに**報告します。新しく作られたファイルは削除し
 （空になったディレクトリは残します）、書き込み前の内容を読めなかったファイル（大きすぎる・テキストでない）は
-「戻せない」と報告します。そのターンに `run_command` や MCP ツールの呼び出しがあれば、その効果は記録して
-いないので「戻していない」として一覧に出ます。
+「戻せない」と報告します。そのターンに `run_command`・`start_command`（バックグラウンド実行）や MCP ツールの
+呼び出しがあれば、その効果は記録していないので「戻していない」として一覧に出ます。
 
 記録はプロセスのメモリ上にだけあります。終了すると消え、`--resume` したセッションでは再開前のターンは
 取り消せません。`/reset` でも消えます。git は使いません（ワークスペース内の `.git/config` 経由で
@@ -630,6 +631,9 @@ jq -s '[.[0].tasks, .[1].tasks] | transpose | map({id: .[0].id, before: .[0].pas
 | `web_fetch` | network | URL の内容をテキスト取得（**既定で無効**。`AGENT_WEB_FETCH=true` で有効化） |
 | `web_search` | network | Brave Search API で検索し、タイトル・URL・抜粋を番号付きで返す（最大 10 件。**既定で無効**。`AGENT_WEB_SEARCH=true` と `AGENT_WEB_SEARCH_API_KEY` で有効化） |
 | `run_command` | destructive | シェルコマンドをサンドボックス内で実行（**既定で無効**。`AGENT_SHELL=true` で有効化） |
+| `start_command` | destructive | シェルコマンドをバックグラウンドで起動し、ジョブ番号をすぐ返す（`run_command` と同じ封じ込め。下記） |
+| `read_output` | read-only | ジョブの出力（stdout と stderr を到着順に混ぜたもの）を `since` 以降だけ読む。待たずに返る |
+| `kill_command` | mutating | ジョブを子孫ごと止め、出力の末尾を返す |
 | `mcp__<サーバ>__<ツール>` | destructive | 設定した MCP サーバのツール（**既定で無効**。`AGENT_MCP_CONFIG` で有効化。§5） |
 
 `edit_file` を曖昧一致にしないのは意図的です。モデルが `read_file` で見た文字列と
@@ -674,6 +678,23 @@ jq -s '[.[0].tasks, .[1].tasks] | transpose | map({id: .[0].id, before: .[0].pas
 封じ込めはコマンド文字列の検査ではなく OS が行います（§5）。許可リスト方式の
 コマンド検査を採用しなかったのは、`make` のようなエントリが 1 つ入るだけで
 `make exec CMD="..."` により任意実行と等価になり、リストが安全性を保証しないためです。
+
+`start_command` / `read_output` / `kill_command` は、開発サーバや長いテストのように 1 回の呼び出しに
+収まらないコマンドのためのツールです。`AGENT_SHELL=true` で、かつサンドボックスが実際に効いている
+ときだけ渡します（`AGENT_SHELL_SANDBOX=none` では渡しません。呼び出しの合間も無人で動き続けるため）。
+起動は `run_command` と同じく `destructive`（承認プロンプトにシェル行がそのまま出る）、読み取りは
+`read-only`、停止は自分が起動したものを止めるだけなので `mutating` です。
+
+- 封じ込め・egress プロキシ・環境変数の除去は `run_command` と同じです。各ジョブは自分のセッションを持ち、
+  止めるときは `setsid` で抜けた子孫まで回収します
+- **上限はすべて有限です**: 同時ジョブ数、ジョブごとの出力バッファ（末尾だけを保持し、捨てた量を
+  `read_output` が報告）、ジョブの最大寿命（過ぎたら止めて、次の読み取りで「寿命で止めた」と報告）。
+  終わったジョブも古いものから忘れます
+- Ctrl-C はターンを止めるだけで、ジョブは止めません。`/reset` と終了時にはすべて止めます
+- 依存ファイルの変更は事後検知です。起動時と終了時（子孫の回収後）のワークスペースを比べ、
+  終了を最初に観測した `read_output` / `kill_command` の結果の先頭で一度だけ報告し、端末にも表示します。
+  比較はジョブが動いていた**期間**の差分なので、その間に他の作業が変えた分も含みます
+- ジョブが変えたファイルは `/undo` / `/rewind` では戻りません（`start_command` は「戻していない」一覧に出ます）
 
 ### context
 
@@ -1294,6 +1315,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 |---|---|
 | `AGENT_MCP_CONFIG`, `AGENT_MCP_SANDBOX` | 任意のプログラムを起動できる |
 | `AGENT_SHELL`, `AGENT_SHELL_SANDBOX`, `AGENT_SHELL_NETWORK_ALLOW`, `AGENT_SHELL_WRITABLE` | コマンド実行を有効にする・封じ込めを緩める |
+| `AGENT_SHELL_BACKGROUND`, `AGENT_SHELL_BACKGROUND_MAX_JOBS`, `AGENT_SHELL_BACKGROUND_LIFETIME_SECS` | 呼び出しの後も動き続けるコマンドを有効にする・その数と寿命を広げる |
 | `AGENT_APPROVAL`, `AGENT_ALLOW_DEPENDENCY_CHANGES`, `AGENT_PERMISSIONS` | 人間の承認を省く |
 | `AGENT_WEB_FETCH`, `AGENT_WEB_FETCH_ALLOW`, `AGENT_WEB_FETCH_ALLOW_PRIVATE`, `AGENT_WEB_SEARCH`, `AGENT_WEB_SEARCH_API_KEY`, `AGENT_NOTIFY_WEBHOOK_URL` | 外部へ送る経路を開く |
 | `AGENT_NOTIFY_NTFY_TOKEN`, `AGENT_NOTIFY_NTFY_REPLY_TOPIC`, `AGENT_NOTIFY_NTFY_REPLY_TOKEN` | スマホから承認できる人を決める（同梱 `.env` が攻撃者のトークンを差し込めないように） |
@@ -1393,6 +1415,10 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_SHELL_SANDBOX` | `confined` | 必須とする封じ込め。`confined`（その OS で使える封じ込め。Linux 6.7+ は Landlock）\| `isolated`（プロキシ以外に到達できない層。**まだどの OS にも実装がなく、常に起動失敗**）\| `none`（封じ込めなし。使い捨てのコンテナ内でのみ）。満たせない環境では**起動失敗**（黙って弱くならない） |
 | `AGENT_SHELL_NETWORK_ALLOW` | —（**通信不可**） | コマンドが到達できるドメインのカンマ区切り。空なら egress プロキシを起動せず全拒否 |
 | `AGENT_SHELL_WRITABLE` | — | ワークスペース外で書き込みを許可するパスのカンマ区切り（外部のビルドキャッシュ用） |
+| `AGENT_SHELL_BACKGROUND` | `true` | バックグラウンド実行ツール（`start_command` / `read_output` / `kill_command`）の有効化。`AGENT_SHELL=true` かつ実際にサンドボックスが効いている（`AGENT_SHELL_SANDBOX=none` でない）ときだけ渡す（§4） |
+| `AGENT_SHELL_BACKGROUND_MAX_JOBS` | `4` | 同時に実行できるジョブ数。超えた開始はモデル向けのエラーで拒否。0 は不可 |
+| `AGENT_SHELL_BACKGROUND_LIFETIME_SECS` | `1800` | ジョブの最大寿命（秒）。過ぎたジョブは子孫ごと止め、次の読み取りで報告。0 は不可（無期限の設定はない） |
+| `AGENT_SHELL_BACKGROUND_BUFFER_BYTES` | `262144` | ジョブごとに保持する出力のバイト数（末尾を保持し、捨てた量を報告）。0 は不可 |
 | `AGENT_MCP_CONFIG` | —（**無効**） | MCP サーバの設定ファイル（JSON、**絶対パス**、ワークスペース外）。§5 参照。ワークスペース内なら起動失敗 |
 | `AGENT_MCP_SANDBOX` | `confined` | MCP サーバに必須とする封じ込め。`confined` \| `isolated`（`AGENT_SHELL_SANDBOX` と同じ意味）。**`none` は指定できない**（`AGENT_SHELL_SANDBOX` とは独立） |
 | `AGENT_PERMISSIONS` | —（ルールなし） | 権限ルールの JSON（**絶対パス**、ワークスペース外）。§3「権限ルール」参照。ワークスペース内・解釈できないルール・`run_command` の `allow` は起動失敗 |

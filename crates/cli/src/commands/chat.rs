@@ -244,6 +244,8 @@ fn run_meta(app: &Application, session: &mut Session, command: &str) {
             *session = Session::new(session_id());
             // Its turns belong to the conversation that just ended.
             app.checkpoints.clear();
+            // So are its background jobs; the new conversation cannot name them.
+            app.background.iter().for_each(|jobs| jobs.stop_all());
             eprintln!("  conversation cleared");
         }
         "usage" => eprintln!(
