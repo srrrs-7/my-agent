@@ -12,9 +12,11 @@
 //! present and one that is merely documented.
 
 pub(crate) mod capture;
+pub(crate) mod confined;
 pub(crate) mod env;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+pub(crate) mod process;
 pub(crate) mod proxy;
 
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ use tokio::process::Command;
 use tracing::warn;
 
 use crate::net::guard::HostPolicy;
+use confined::ConfinementPolicy;
 use proxy::EgressProxy;
 
 /// How much confinement the operator insists on.
@@ -166,6 +169,34 @@ pub fn detect_sandbox() -> SandboxAvailability {
     }
 }
 
+/// The mechanism to put a child under, given what the operator requires.
+///
+/// Fails when the platform cannot reach `requirement`, so a weaker
+/// environment can never silently downgrade the protection. Resolve once, at
+/// startup, and hand the result to [`confined::confine_command`] for every
+/// child.
+pub(crate) fn resolve_sandbox(
+    requirement: SandboxRequirement,
+) -> Result<SandboxKind, CommandError> {
+    if requirement == SandboxRequirement::Disabled {
+        warn!("running commands without a sandbox at the operator's request");
+        return Ok(SandboxKind::None);
+    }
+    let available = detect_sandbox();
+    if !requirement.is_satisfied_by(available.kind) {
+        return Err(CommandError::SandboxUnavailable {
+            reason: available.shortfall.unwrap_or_else(|| {
+                format!(
+                    "this platform offers `{}`, which does not provide {}",
+                    available.kind.as_str(),
+                    requirement.describe()
+                )
+            }),
+        });
+    }
+    Ok(available.kind)
+}
+
 /// Runs commands under whatever confinement [`detect_sandbox`] found.
 pub struct SandboxedCommandRunner {
     workspace: std::sync::Arc<WorkspaceRoot>,
@@ -193,28 +224,7 @@ impl SandboxedCommandRunner {
         workspace: std::sync::Arc<WorkspaceRoot>,
         config: ExecConfig,
     ) -> Result<Self, CommandError> {
-        let available = detect_sandbox();
-
-        let kind = match config.sandbox {
-            SandboxRequirement::Disabled => {
-                warn!("running commands without a sandbox at the operator's request");
-                SandboxKind::None
-            }
-            requirement => {
-                if !requirement.is_satisfied_by(available.kind) {
-                    return Err(CommandError::SandboxUnavailable {
-                        reason: available.shortfall.unwrap_or_else(|| {
-                            format!(
-                                "this platform offers `{}`, which does not provide {}",
-                                available.kind.as_str(),
-                                requirement.describe()
-                            )
-                        }),
-                    });
-                }
-                available.kind
-            }
-        };
+        let kind = resolve_sandbox(config.sandbox)?;
 
         // Toolchains need scratch space, but handing them the shared `/tmp`
         // would let a command reach every other tenant of it. A directory per
@@ -259,15 +269,21 @@ impl SandboxedCommandRunner {
         self.egress.as_ref().map(EgressProxy::port)
     }
 
-    /// Roots the child may write to: the workspace, its own scratch directory,
-    /// and whatever the operator added.
-    fn writable_roots(&self) -> Vec<PathBuf> {
-        let mut roots = vec![
+    /// What every command gets: write access to the workspace, its own
+    /// scratch directory and whatever the operator added; network only
+    /// through this runner's proxy.
+    fn policy(&self) -> ConfinementPolicy {
+        let mut writable = vec![
             self.workspace.as_path().to_path_buf(),
             self.session_temp.clone(),
         ];
-        roots.extend(self.config.extra_writable.iter().cloned());
-        roots
+        writable.extend(self.config.extra_writable.iter().cloned());
+        ConfinementPolicy {
+            kind: self.kind,
+            writable,
+            scratch: self.session_temp.clone(),
+            proxy_port: self.egress_port(),
+        }
     }
 }
 
@@ -299,59 +315,7 @@ impl CommandRunner for SandboxedCommandRunner {
 
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(&request.command).current_dir(&cwd);
-
-        env::scrub(&mut command);
-
-        // Point every temp convention at the scratch directory the sandbox
-        // actually allows, or the first thing a toolchain does is fail.
-        for name in ["TMPDIR", "TMP", "TEMP"] {
-            command.env(name, &self.session_temp);
-        }
-
-        // Proxy-aware tools pick these up and route through the allowlist.
-        // An inherited `NO_PROXY` would carve holes in it, so it goes either
-        // way - with no proxy there is nothing for it to except.
-        for name in ["NO_PROXY", "no_proxy"] {
-            command.env_remove(name);
-        }
-        match self.egress_port() {
-            Some(port) => {
-                let url = format!("http://127.0.0.1:{port}");
-                for name in [
-                    "HTTP_PROXY",
-                    "HTTPS_PROXY",
-                    "ALL_PROXY",
-                    "http_proxy",
-                    "https_proxy",
-                    "all_proxy",
-                ] {
-                    command.env(name, &url);
-                }
-            }
-            None => {
-                for name in [
-                    "HTTP_PROXY",
-                    "HTTPS_PROXY",
-                    "ALL_PROXY",
-                    "http_proxy",
-                    "https_proxy",
-                    "all_proxy",
-                ] {
-                    command.env_remove(name);
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        if self.kind == SandboxKind::LandlockConfined {
-            linux::confine(
-                &mut command,
-                &linux::LinuxSandboxPolicy {
-                    writable: self.writable_roots(),
-                    proxy_port: self.egress_port(),
-                },
-            )?;
-        }
+        let command = confined::confine_command(command, &self.policy())?;
 
         capture::run_capped(command, request.timeout, request.max_output_bytes).await
     }
