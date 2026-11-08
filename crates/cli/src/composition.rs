@@ -15,7 +15,7 @@ use agent_application::agent::{
 use agent_application::tools::ToolRegistry;
 use agent_application::tools::exec::RunCommandTool;
 use agent_application::tools::file::{
-    EditFileTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
+    EditFileTool, GlobTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
 };
 use agent_application::tools::plan::TodoWriteTool;
 use agent_application::tools::web::WebFetchTool;
@@ -331,7 +331,11 @@ fn build_tools(
                 file_system,
                 workspace.clone(),
             ))))
-            .with(timed(Arc::new(SearchFilesTool::new(searcher, workspace))))
+            .with(timed(Arc::new(SearchFilesTool::new(
+                searcher.clone(),
+                workspace.clone(),
+            ))))
+            .with(timed(Arc::new(GlobTool::new(searcher, workspace))))
             .with(timed(Arc::new(TodoWriteTool::new()))),
     )
 }

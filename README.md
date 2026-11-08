@@ -219,6 +219,7 @@ AGENT_NOTIFY_FORMAT=ntfy
 | `read_file` | read-only | 行番号付きで読む。`offset` / `limit` でページング |
 | `list_directory` | read-only | 1 階層のリスト |
 | `search_files` | read-only | 正規表現検索（`.gitignore` 準拠・バイナリ除外） |
+| `glob` | read-only | パスのパターン（`src/**/*.rs`）でファイルを探す。更新が新しい順・既定 100 件で打ち切り（打ち切ったことと総数を表示）。`.gitignore` 準拠 |
 | `write_file` | mutating | 全文書き込み（親ディレクトリ自動作成） |
 | `edit_file` | mutating | 完全一致の部分置換。一致 0 件／複数件はエラー |
 | `todo_write` | read-only | 作業計画（手順と pending / in_progress / completed）を丸ごと書き換える。ワークスペースには触れない |
@@ -414,6 +415,8 @@ jq -r 'select(.role=="tool") | .content[].content' .agent/sessions/*.jsonl
 - **`.env` は書き込みも拒否します。** 書き換えられると、モデルが `AGENT_BASE_URL` を
   自分の用意したサーバに向け、次回の起動で API キーがそこへ送られます
 - `search_files` は拒否対象の中身を返しません（`include` で明示しても同じです）。
+  `glob` は拒否対象をパスとしても一覧に出しません（`**/.env*` と明示しても同じです）。
+  どちらもシンボリックリンクは辿らず、一致としても返しません。
   `list_directory` は名前だけなので表示します
 - 起動時に読む指示ファイル（`AGENTS.md` など）も同じ検査を通します。リポジトリが
   `AGENTS.md -> .env` を置いても、システムプロンプトには入りません

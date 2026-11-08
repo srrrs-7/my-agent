@@ -1,4 +1,4 @@
-//! Content search over the workspace.
+//! Content and path search over the workspace.
 //!
 //! Built on the `ignore` crate (the walker behind ripgrep) so that `.gitignore`
 //! is honoured for free: without it, the first search in any Rust project would
@@ -7,15 +7,22 @@
 //! `.gitignore` is a convenience, not a protection - an include glob such as
 //! `.env*` overrides it. Files the workspace's access policy refuses to read
 //! are skipped on their own account, checked by name and by where they really
-//! are, just as `read_file` checks them.
+//! are, just as `read_file` checks them. That holds for [`FileSearcher::glob`]
+//! too: a path is not a secret's contents, but listing `.env` invites the next
+//! call to try reading it, and the session log's file names are conversation
+//! ids.
+//!
+//! Neither search follows symlinks below its starting point, so a link is
+//! never a match: it is neither read nor listed, wherever it leads.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use agent_domain::error::FsError;
 use agent_domain::model::access::FileAccess;
 use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
-use agent_domain::ports::search::{FileSearcher, SearchHit, SearchQuery};
+use agent_domain::ports::search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
@@ -49,6 +56,16 @@ impl FileSearcher for IgnoreAwareSearcher {
                 message: format!("search task failed: {error}"),
             })?
     }
+
+    async fn glob(&self, query: GlobQuery) -> Result<GlobMatches, FsError> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || glob_blocking(&root, query))
+            .await
+            .map_err(|error| FsError::Io {
+                path: ".".to_string(),
+                message: format!("glob task failed: {error}"),
+            })?
+    }
 }
 
 fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<SearchHit>, FsError> {
@@ -57,36 +74,11 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
         .build()
         .map_err(|error| FsError::InvalidPattern(error.to_string()))?;
 
-    let base = root.absolute(&query.root);
-    if !base.exists() {
-        return Err(FsError::NotFound {
-            path: query.root.display(),
-        });
-    }
-
-    // The walker follows a symlink given as its starting point, so the root
-    // of the search is resolved and checked like any other path: a link to a
-    // directory outside the workspace, or to a protected one, would otherwise
-    // be searched in full.
-    let real_root = super::canonical_root(root)?;
-    let real_base = std::fs::canonicalize(&base).map_err(|error| FsError::Io {
-        path: query.root.display(),
-        message: error.to_string(),
-    })?;
-    let real_query_root =
-        real_root
-            .relativize(&real_base)
-            .map_err(|_| FsError::OutsideWorkspace {
-                path: query.root.display(),
-            })?;
-    if !root.permits(&query.root, FileAccess::Read)
-        || !real_root.permits(&real_query_root, FileAccess::Read)
-    {
-        return Err(FsError::AccessDenied {
-            path: query.root.display(),
-            access: FileAccess::Read,
-        });
-    }
+    let WalkStart {
+        base,
+        real_root,
+        real_base,
+    } = walk_start(root, &query.root)?;
 
     let mut builder = WalkBuilder::new(&base);
     builder
@@ -153,6 +145,163 @@ fn search_blocking(root: &WorkspaceRoot, query: SearchQuery) -> Result<Vec<Searc
     }
 
     Ok(hits)
+}
+
+/// Where a walk begins, checked: the subtree as configured and as the
+/// filesystem really resolves it.
+struct WalkStart {
+    base: PathBuf,
+    real_root: WorkspaceRoot,
+    real_base: PathBuf,
+}
+
+fn walk_start(root: &WorkspaceRoot, subtree: &WorkspacePath) -> Result<WalkStart, FsError> {
+    let base = root.absolute(subtree);
+    if !base.exists() {
+        return Err(FsError::NotFound {
+            path: subtree.display(),
+        });
+    }
+
+    // The walker follows a symlink given as its starting point, so the root
+    // of the search is resolved and checked like any other path: a link to a
+    // directory outside the workspace, or to a protected one, would otherwise
+    // be searched in full.
+    let real_root = super::canonical_root(root)?;
+    let real_base = std::fs::canonicalize(&base).map_err(|error| FsError::Io {
+        path: subtree.display(),
+        message: error.to_string(),
+    })?;
+    let real_subtree = real_root
+        .relativize(&real_base)
+        .map_err(|_| FsError::OutsideWorkspace {
+            path: subtree.display(),
+        })?;
+    if !root.permits(subtree, FileAccess::Read)
+        || !real_root.permits(&real_subtree, FileAccess::Read)
+    {
+        return Err(FsError::AccessDenied {
+            path: subtree.display(),
+            access: FileAccess::Read,
+        });
+    }
+
+    Ok(WalkStart {
+        base,
+        real_root,
+        real_base,
+    })
+}
+
+fn glob_blocking(root: &WorkspaceRoot, query: GlobQuery) -> Result<GlobMatches, FsError> {
+    let pattern = query.pattern.trim();
+    check_glob(pattern)?;
+
+    let WalkStart {
+        base,
+        real_root,
+        real_base,
+    } = walk_start(root, &query.root)?;
+
+    // `Override` is the ignore crate's gitignore-syntax matcher, used here on
+    // its own rather than handed to the walker: as a walker override a match
+    // would also *un-ignore* the file, and `glob` must honour `.gitignore`
+    // exactly as an unfiltered walk does.
+    let matcher = {
+        let mut builder = OverrideBuilder::new(&base);
+        builder
+            .add(pattern)
+            .map_err(|error| FsError::InvalidPattern(format!("glob: {error}")))?;
+        builder
+            .build()
+            .map_err(|error| FsError::InvalidPattern(format!("glob: {error}")))?
+    };
+
+    let mut builder = WalkBuilder::new(&base);
+    builder
+        // Hidden entries are walked only when the pattern names one: `*.yml`
+        // should not surface every file under `.github/` and `.cargo/`, but
+        // `.github/**/*.yml` has to be able to match at all.
+        .hidden(!names_a_hidden_entry(pattern))
+        .git_ignore(true)
+        .git_exclude(true)
+        .require_git(false)
+        .follow_links(false)
+        // Git's object store is never what a path search is looking for, and
+        // walking it is most of the cost once hidden entries are included.
+        .filter_entry(|entry| entry.file_name() != ".git");
+
+    let mut found: Vec<(SystemTime, WorkspacePath)> = Vec::new();
+    for entry in builder.build() {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if !matcher.matched(entry.path(), false).is_whitelist() {
+            continue;
+        }
+        let Ok(path) = root.relativize(entry.path()) else {
+            continue;
+        };
+        if !permitted(root, &path, &real_root, &base, &real_base, entry.path()) {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        found.push((modified, path));
+    }
+
+    found.sort_by(|(a_time, a_path), (b_time, b_path)| {
+        b_time.cmp(a_time).then_with(|| a_path.cmp(b_path))
+    });
+    let total = found.len();
+    found.truncate(query.max_results);
+
+    Ok(GlobMatches {
+        paths: found.into_iter().map(|(_, path)| path).collect(),
+        total,
+    })
+}
+
+/// Refuses a pattern that reaches outside the subtree it is matched in.
+///
+/// Such a pattern could never match anything the walk visits, so accepting it
+/// would answer "no files" - which reads as "nothing like that exists" rather
+/// than "you asked the wrong way".
+fn check_glob(pattern: &str) -> Result<(), FsError> {
+    let refuse = |reason: &str| Err(FsError::InvalidPattern(reason.to_string()));
+    if pattern.is_empty() {
+        return refuse("the glob is empty. Pass a pattern such as `**/*.rs`");
+    }
+    if pattern.contains('\0') {
+        return refuse("the glob contains a NUL byte");
+    }
+    let bytes = pattern.as_bytes();
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if pattern.starts_with(['/', '\\']) || drive {
+        return refuse(
+            "the glob must be relative to `path`, not absolute. Drop the leading `/` and pass \
+             the directory to search as `path` instead",
+        );
+    }
+    if pattern.split(['/', '\\']).any(|segment| segment == "..") {
+        return refuse(
+            "the glob must not contain `..`: it only matches inside the workspace. Pass the \
+             directory to search as `path` instead",
+        );
+    }
+    Ok(())
+}
+
+/// Whether some segment of the pattern starts with a dot (`.github/*`,
+/// `**/.env*`), i.e. names an entry the walk would otherwise skip as hidden.
+fn names_a_hidden_entry(pattern: &str) -> bool {
+    pattern
+        .split('/')
+        .any(|segment| segment.starts_with('.') && segment != "." && segment != "..")
 }
 
 /// Whether a file the walk found may be read, by its name and by where it
@@ -339,5 +488,190 @@ mod tests {
             matches!(error, FsError::AccessDenied { .. }),
             "got {error:?}"
         );
+    }
+
+    // --- glob ----------------------------------------------------------------
+
+    fn glob(pattern: &str) -> GlobQuery {
+        GlobQuery {
+            pattern: pattern.to_string(),
+            root: WorkspacePath::root(),
+            max_results: 100,
+        }
+    }
+
+    fn shown(matches: &GlobMatches) -> Vec<String> {
+        matches.paths.iter().map(WorkspacePath::display).collect()
+    }
+
+    /// Sets a file's modification time without waiting for the clock.
+    fn touch(dir: &std::path::Path, relative: &str, seconds_after_epoch: u64) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(dir.join(relative))
+            .unwrap();
+        file.set_modified(
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds_after_epoch),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn glob_lists_matching_files_newest_first_then_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["src/a.rs", "src/b.rs", "src/nested/c.rs", "README.md"] {
+            write(dir.path(), file, "");
+        }
+        touch(dir.path(), "src/a.rs", 1_000);
+        touch(dir.path(), "src/b.rs", 1_000);
+        touch(dir.path(), "src/nested/c.rs", 2_000);
+
+        let found = searcher(dir.path())
+            .glob(glob("src/**/*.rs"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            shown(&found),
+            vec!["src/nested/c.rs", "src/a.rs", "src/b.rs"],
+            "newest first, equal times by path"
+        );
+        assert!(!found.truncated());
+
+        let anywhere = searcher(dir.path()).glob(glob("*.md")).await.unwrap();
+        assert_eq!(
+            shown(&anywhere),
+            vec!["README.md"],
+            "a pattern without `/` matches at any depth, and only files"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_matches_inside_the_given_subtree_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "crates/a/lib.rs", "");
+        write(dir.path(), "tools/lib.rs", "");
+
+        let mut scoped = glob("*.rs");
+        scoped.root = WorkspacePath::parse("crates").unwrap();
+        let found = searcher(dir.path()).glob(scoped).await.unwrap();
+
+        assert_eq!(shown(&found), vec!["crates/a/lib.rs"]);
+    }
+
+    #[tokio::test]
+    async fn glob_honours_gitignore_even_for_a_pattern_naming_the_ignored_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".gitignore", "target/\n*.log\n");
+        write(dir.path(), "src/main.rs", "");
+        write(dir.path(), "target/debug/build.rs", "");
+        write(dir.path(), "debug.log", "");
+
+        let searcher = searcher(dir.path());
+        assert_eq!(
+            shown(&searcher.glob(glob("**/*.rs")).await.unwrap()),
+            vec!["src/main.rs"]
+        );
+        assert!(
+            searcher.glob(glob("*.log")).await.unwrap().paths.is_empty(),
+            "unlike an include glob, a glob pattern does not un-ignore a file"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_never_lists_protected_files_or_the_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".env", "API_KEY=sk-1");
+        write(dir.path(), "apps/web/.env.local", "API_KEY=sk-2");
+        write(dir.path(), ".env.example", "API_KEY=");
+        write(dir.path(), "certs/server.pem", "");
+        write(dir.path(), ".agent/sessions/0193-abc.jsonl", "{}");
+        write(dir.path(), ".agent/instructions.md", "");
+        let policy = agent_domain::model::access::AccessPolicy::standard().with_read_denied(
+            agent_domain::model::access::PathPattern::directory(
+                &WorkspacePath::parse(".agent/sessions").unwrap(),
+            )
+            .unwrap(),
+        );
+        let root = WorkspaceRoot::new(dir.path().to_path_buf())
+            .unwrap()
+            .with_policy(policy);
+        let searcher = IgnoreAwareSearcher::new(Arc::new(root));
+
+        let env = searcher.glob(glob("**/.env*")).await.unwrap();
+        assert_eq!(shown(&env), vec![".env.example"], "got {env:?}");
+
+        let agent = searcher.glob(glob(".agent/**/*")).await.unwrap();
+        assert_eq!(
+            shown(&agent),
+            vec![".agent/instructions.md"],
+            "got {agent:?}"
+        );
+
+        let pem = searcher.glob(glob("**/*.pem")).await.unwrap();
+        assert!(pem.paths.is_empty(), "got {pem:?}");
+        assert_eq!(pem.total, 0, "a refused file is not even counted");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_does_not_list_a_symlink_that_leads_to_a_protected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".env", "API_KEY=sk-1");
+        write(dir.path(), "secrets.key/token.txt", "sk-2");
+        write(dir.path(), "plain.txt", "");
+        std::os::unix::fs::symlink(".env", dir.path().join("notes.txt")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secrets.key"), dir.path().join("vault"))
+            .unwrap();
+        let searcher = searcher(dir.path());
+
+        let found = searcher.glob(glob("**/*.txt")).await.unwrap();
+        assert_eq!(shown(&found), vec!["plain.txt"], "got {found:?}");
+
+        let mut through_link = glob("*.txt");
+        through_link.root = WorkspacePath::parse("vault").unwrap();
+        let error = searcher.glob(through_link).await.unwrap_err();
+        assert!(
+            matches!(error, FsError::AccessDenied { .. }),
+            "a linked subtree is checked where it leads, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_caps_the_list_and_reports_how_many_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["a.rs", "b.rs", "c.rs"] {
+            write(dir.path(), file, "");
+        }
+
+        let mut capped = glob("*.rs");
+        capped.max_results = 2;
+        let found = searcher(dir.path()).glob(capped).await.unwrap();
+
+        assert_eq!(found.paths.len(), 2);
+        assert_eq!(found.total, 3);
+        assert!(found.truncated());
+    }
+
+    #[tokio::test]
+    async fn glob_refuses_patterns_that_reach_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let searcher = searcher(dir.path());
+
+        for pattern in [
+            "../*.rs",
+            "src/../../etc/*",
+            "/etc/passwd",
+            "\\\\server\\share",
+            "C:/x",
+        ] {
+            let error = searcher.glob(glob(pattern)).await.unwrap_err();
+            assert!(
+                matches!(error, FsError::InvalidPattern(_)),
+                "`{pattern}` must be refused, got {error:?}"
+            );
+        }
+        let error = searcher.glob(glob("  ")).await.unwrap_err();
+        assert!(matches!(error, FsError::InvalidPattern(_)), "got {error:?}");
     }
 }

@@ -28,7 +28,7 @@ pub use file_system::{DirEntry, EntryKind, FileSystem};
 pub use llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent};
 pub use notify::{Notification, NotificationEvent, NotificationKind, Notifier, NullNotifier};
 pub use prompt::PromptBuilder;
-pub use search::{FileSearcher, SearchHit, SearchQuery};
+pub use search::{FileSearcher, GlobMatches, GlobQuery, SearchHit, SearchQuery};
 pub use session_store::{SessionStore, SessionSummary};
 pub use tool::Tool;
 pub use web::{FetchedContent, WebFetcher};
