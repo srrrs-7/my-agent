@@ -117,6 +117,10 @@ impl CommandRunner for ScriptedRunner {
         SandboxKind::LandlockConfined
     }
 
+    fn stops_detached_descendants(&self) -> bool {
+        true
+    }
+
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, CommandError> {
         self.ran.lock().unwrap().push(request);
         Ok(CommandOutput {

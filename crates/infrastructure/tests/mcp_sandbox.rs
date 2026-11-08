@@ -40,7 +40,7 @@ while IFS= read -r line; do
     *'"method":"tools/list"'*)
       case "$line" in
         *'"cursor":"p2"'*)
-          reply "$id" '{"tools":[{"name":"spawn","inputSchema":{"type":"object"}},{"name":"crash"},{"name":"env","inputSchema":{"type":"object"}}]}' ;;
+          reply "$id" '{"tools":[{"name":"spawn","inputSchema":{"type":"object"}},{"name":"crash"},{"name":"env","inputSchema":{"type":"object"}},{"name":"detach"},{"name":"peek"}]}' ;;
         *)
           reply "$id" '{"tools":[{"name":"write","description":"Writes.","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"connect"},{"name":"fetch"}],"nextCursor":"p2"}' ;;
       esac ;;
@@ -57,6 +57,11 @@ while IFS= read -r line; do
         *'"name":"spawn"'*)
           sleep 100 >/dev/null 2>&1 &
           text "$id" "pid=$!" ;;
+        *'"name":"detach"'*)
+          setsid sleep 100 >/dev/null 2>&1 &
+          text "$id" "pid=$!" ;;
+        *'"name":"peek"'*)
+          if cat "/proc/$(arg pid)/environ" >/dev/null 2>&1; then text "$id" read; else text "$id" denied; fi ;;
         *'"name":"env"'*)
           text "$id" "value=$(printenv "$(arg var)")" ;;
         *'"name":"crash"'*)
@@ -139,7 +144,9 @@ async fn the_handshake_lists_every_page_of_tools() {
     let names: Vec<String> = server.tools().into_iter().map(|tool| tool.name).collect();
     assert_eq!(
         names,
-        ["write", "connect", "fetch", "spawn", "crash", "env"],
+        [
+            "write", "connect", "fetch", "spawn", "crash", "env", "detach", "peek"
+        ],
         "both pages, in order"
     );
     assert_eq!(server.sandbox(), SandboxKind::LandlockConfined);
@@ -376,6 +383,84 @@ async fn dropping_the_server_takes_its_grandchildren_with_it() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(!directory.exists(), "the server's directory is removed");
+}
+
+/// The session in `/proc/<pid>/stat`, or `None` once the process has been
+/// reaped. A zombie still has one: it is not gone yet.
+fn session_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(3)?.parse().ok()
+}
+
+/// `setsid` takes a grandchild out of the server's process group, where the
+/// group kill cannot reach it. Stopping the server must stop it anyway.
+#[tokio::test]
+async fn a_grandchild_that_calls_setsid_dies_with_the_server() {
+    let fixture = fixture();
+    let server = start(&fixture, &config(&fixture.script)).await;
+
+    let report = call(&server, "detach", json!({})).await;
+    let detached: i32 = report
+        .strip_prefix("pid=")
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("expected `pid=N`, got {report}"));
+
+    // `setsid` runs in the forked child before it execs `sleep`, so the
+    // session may still be the server's for a moment.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session_of(detached) != Some(detached) {
+        assert!(
+            Instant::now() < deadline,
+            "the probe never left the server's session: {:?}",
+            session_of(detached)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    drop(server);
+
+    // The kill is synchronous in the drop; being reaped is not.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session_of(detached).is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "detached grandchild {detached} survived the dropped server"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A confined server cannot read the agent's environment, where the provider
+/// keys and every other server's `env_from` values are. Landlock's ptrace
+/// scoping refuses it; the unconfined control shows the same probe works.
+#[tokio::test]
+async fn a_confined_server_cannot_read_the_agents_environment() {
+    let fixture = fixture();
+    let agent = std::process::id();
+
+    let control = McpServer::start(
+        "probe",
+        &config(&fixture.script),
+        SandboxKind::None,
+        &fixture.workspace,
+        &[],
+    )
+    .await
+    .expect("the unconfined control starts");
+    assert_eq!(
+        call(&control, "peek", json!({"pid": agent})).await,
+        "read",
+        "unconfined and dumpable, the agent's environment is readable"
+    );
+    drop(control);
+
+    let server = start(&fixture, &config(&fixture.script)).await;
+    assert_eq!(
+        call(&server, "peek", json!({"pid": agent})).await,
+        "denied",
+        "Landlock must keep a confined server out of the agent's environment"
+    );
 }
 
 #[tokio::test]

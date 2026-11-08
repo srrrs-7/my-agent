@@ -18,6 +18,7 @@ pub(crate) mod env;
 pub(crate) mod linux;
 pub(crate) mod process;
 pub(crate) mod proxy;
+pub(crate) mod reaper;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -173,6 +174,41 @@ pub fn detect_sandbox() -> SandboxAvailability {
     }
 }
 
+/// Whether descendants that leave their process group (`setsid`, `setpgid`)
+/// are stopped together with the command or server that started them.
+///
+/// `Err` says why not. This is reported rather than required: it is a
+/// defence on top of the sandbox, not part of what `AGENT_SHELL_SANDBOX`
+/// asks for, and its absence weakens nothing that was promised before it
+/// existed. The first call makes this process a subreaper.
+pub fn detached_reaping() -> Result<(), String> {
+    reaper::enable()
+}
+
+/// Keeps other processes of the same user - the agent's own children above
+/// all - from reading this process's memory and `/proc/<pid>/environ`, where
+/// the provider keys live.
+///
+/// Clears `PR_SET_DUMPABLE`, which hands `/proc/<pid>/*` to root and makes the
+/// ptrace access check fail without `CAP_SYS_PTRACE`. A confined child is
+/// kept out by Landlock already (`tests/sandbox.rs` proves it); this is what
+/// covers an unconfined one (`AGENT_SHELL_SANDBOX=none`). Side effects, all
+/// intended: no core dumps, and no `gdb -p` / `strace -p` as the same user.
+/// Children are unaffected - `execve` makes them dumpable again.
+///
+/// Call it first thing in `main`, before secrets are loaded into the
+/// environment.
+pub fn protect_agent_process() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a plain prctl with integer arguments on this process.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// The mechanism to put a child under, given what the operator requires.
 ///
 /// Fails when the platform cannot reach `requirement`, so a weaker
@@ -211,6 +247,8 @@ pub struct SandboxedCommandRunner {
     /// The one destination the child may connect to. Absent when the allowlist
     /// is empty, which is also the only way the child gets no network at all.
     egress: Option<EgressProxy>,
+    /// What [`detached_reaping`] found at startup.
+    detached: Result<(), String>,
 }
 
 /// Distinguishes concurrent runners in the same process.
@@ -264,6 +302,7 @@ impl SandboxedCommandRunner {
             kind,
             session_temp,
             egress,
+            detached: detached_reaping(),
         })
     }
 
@@ -302,6 +341,10 @@ impl Drop for SandboxedCommandRunner {
 impl CommandRunner for SandboxedCommandRunner {
     fn sandbox(&self) -> SandboxKind {
         self.kind
+    }
+
+    fn stops_detached_descendants(&self) -> bool {
+        self.detached.is_ok()
     }
 
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, CommandError> {

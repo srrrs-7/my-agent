@@ -201,7 +201,8 @@ application（`agent/compaction.rs`）にあります。
   stdin に書くのは専用の writer タスクだけで、呼び出し側は行全体をキュー（上限 64 件）に渡す。`write_all` は
   キャンセル安全でないため、呼び出し側の future が書く形だと drop で半端な行が残り、次のメッセージがそこへ連結される。
   サーバが stdin を読まずに要求を送り続けて上限を超えたら停止扱いにする。
-  1 メッセージ 4 MiB、stderr は読み捨て続け、drop で stdin を閉じてからプロセスグループを kill する。
+  1 メッセージ 4 MiB、stderr は読み捨て続け、drop で stdin を閉じてからプロセスグループを kill し、
+  グループから抜けた子孫も止める（`exec/reaper.rs`）。
   プロセスは `run_command` と同じ `exec::confined::confine_command` で封じ込めるが、書き込み可能なのは
   サーバ専用ディレクトリだけ（ワークスペースは設定で明示したときだけ）。サーバは呼び出しの合間にも動けるので、
   承認ゲートも依存ファイルの検知も通らない書き込みを既定では許さない
@@ -287,7 +288,8 @@ pub struct RequestMetadata {
 cli 側（`cli/src/ctrl_c.rs`）は「プロンプト待ち → 終了(0) / ターン中 → 発火 / 後始末中にもう一度 → 放棄して終了(130)」
 の状態機械で、時間窓ではなく状態で判定します。SIGINT のハンドラは `chat` と `run` の中だけで登録します。
 stdin はランタイム外の専用スレッド + チャネルで読むので、中断で放棄した承認プロンプトが次の 1 行を飲み込みません。
-`run_command` の子は drop guard（`infrastructure/src/exec/capture.rs`）が reap 前にプロセスグループごと止めます。
+`run_command` の子は drop guard（`infrastructure/src/exec/capture.rs`）が reap 前にプロセスグループごと止め、
+`setsid` でグループから抜けた子孫も subreaper 経由で探して止めます（`infrastructure/src/exec/reaper.rs`）。
 
 ### 3.6.2 依存ファイルの変更を別に承認する
 

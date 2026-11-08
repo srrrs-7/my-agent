@@ -16,7 +16,9 @@
 //! Started once, handshaken once, and its tool list fixed. A server that
 //! crashes stays down: every later call fails with the reason. Dropping the
 //! handle closes the server's stdin (the protocol's shutdown signal) and then
-//! kills its process group, grandchildren included.
+//! kills its process group, grandchildren included - and, where
+//! [`crate::exec::detached_reaping`] holds, the descendants that left the
+//! group with `setsid` as well.
 //!
 //! The child is never reaped before that. A process that has exited but not
 //! been waited for keeps its pid, and with it the process-group id the kill is

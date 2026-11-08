@@ -17,10 +17,15 @@
 //! Dropping the handle kills the group, not only the direct child:
 //! `kill_on_drop` alone would leave a shell's grandchildren running. The guard
 //! fires first, while the child is still unreaped, so the group id cannot yet
-//! belong to anyone else.
+//! belong to anyone else. It then sweeps for descendants that left the group
+//! ([`super::reaper`]), which no group signal reaches.
+
+use std::collections::HashSet;
 
 use agent_domain::error::CommandError;
 use tokio::process::{Child, Command};
+
+use super::reaper;
 
 /// A spawned child and the guard that kills its process group.
 ///
@@ -56,8 +61,10 @@ impl GuardedChild {
             });
         }
 
-        let child = command.spawn().map_err(|error| CommandError::SpawnFailed {
-            message: error.to_string(),
+        let child = reaper::register_spawn(|| command.spawn(), Child::id).map_err(|error| {
+            CommandError::SpawnFailed {
+                message: error.to_string(),
+            }
         })?;
         Ok(Self {
             group: GroupGuard { pid: child.id() },
@@ -75,13 +82,33 @@ impl GroupGuard {
     /// Call once the child has been reaped: from then on its pid may be
     /// reused, and signalling its group could hit a stranger.
     pub(crate) fn disarm(&mut self) {
-        self.pid = None;
+        if let Some(pid) = self.pid.take() {
+            reaper::unregister(pid);
+        }
+    }
+
+    /// Kills the group and every descendant that left it, and gives the pid
+    /// back to tokio. Returns what [`reaper::settle`] should wait for.
+    ///
+    /// The child must still be unreaped; after this the guard is spent.
+    pub(crate) fn stop(&mut self) -> HashSet<i32> {
+        let Some(pid) = self.pid.take() else {
+            return HashSet::new();
+        };
+        kill_group(Some(pid));
+        // While the leader is unreaped, so its pid still names our child.
+        let found = reaper::sweep(&[pid]);
+        reaper::unregister(pid);
+        found
     }
 }
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        kill_group(self.pid.take());
+        let found = self.stop();
+        if !found.is_empty() {
+            reaper::settle_in_background(found);
+        }
     }
 }
 
