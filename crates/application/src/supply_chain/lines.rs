@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use agent_domain::model::dependency::DependencyChangeDescription;
+use agent_domain::model::dependency::{ChangedLines, DependencyChangeDescription};
 
 /// Lines kept on each side. A new lockfile can be thousands of lines; the
 /// human needs to see that it is large and what it starts with, not all of it.
@@ -11,13 +11,32 @@ const MAX_LINES: usize = 200;
 /// Lines of `after` that `before` lacks and vice versa, compared as multisets
 /// so that a moved line is not reported. Blank lines are left out.
 pub(super) fn describe(reason: String, before: &str, after: &str) -> DependencyChangeDescription {
+    let ChangedLines {
+        added,
+        removed,
+        omitted,
+    } = changed(significant(before), significant(after));
+    DependencyChangeDescription::Lines {
+        reason,
+        added,
+        removed,
+        omitted,
+    }
+}
+
+/// The lines in `after` that `before` lacks and vice versa, as multisets, the
+/// first [`MAX_LINES`] of each side kept.
+pub(super) fn changed<'a>(
+    before: impl Iterator<Item = &'a str> + Clone,
+    after: impl Iterator<Item = &'a str>,
+) -> ChangedLines {
     let mut remaining: HashMap<&str, usize> = HashMap::new();
-    for line in significant(before) {
+    for line in before.clone() {
         *remaining.entry(line).or_default() += 1;
     }
 
     let mut added = Vec::new();
-    for line in significant(after) {
+    for line in after {
         match remaining.get_mut(line) {
             Some(count) if *count > 0 => *count -= 1,
             _ => added.push(line),
@@ -25,7 +44,7 @@ pub(super) fn describe(reason: String, before: &str, after: &str) -> DependencyC
     }
 
     let mut removed = Vec::new();
-    for line in significant(before) {
+    for line in before {
         match remaining.get_mut(line) {
             Some(count) if *count > 0 => {
                 *count -= 1;
@@ -43,15 +62,14 @@ pub(super) fn describe(reason: String, before: &str, after: &str) -> DependencyC
             .map(str::to_string)
             .collect()
     };
-    DependencyChangeDescription::Lines {
-        reason,
+    ChangedLines {
         added: keep(added),
         removed: keep(removed),
         omitted,
     }
 }
 
-fn significant(text: &str) -> impl Iterator<Item = &str> {
+pub(super) fn significant(text: &str) -> impl Iterator<Item = &str> + Clone {
     text.lines()
         .map(str::trim_end)
         .filter(|line| !line.is_empty())

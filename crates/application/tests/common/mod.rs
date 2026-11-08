@@ -222,6 +222,14 @@ pub struct AlwaysApprove;
 
 #[async_trait]
 impl ApprovalGate for AlwaysApprove {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
         Ok(ApprovalDecision::Approve)
     }
@@ -231,6 +239,14 @@ pub struct AlwaysDeny;
 
 #[async_trait]
 impl ApprovalGate for AlwaysDeny {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
         Ok(ApprovalDecision::Deny {
             reason: "not this time".into(),

@@ -2,6 +2,9 @@
 
 use super::{Entries, insert};
 
+/// The directives [`module`] lists as entries.
+const ENTRY_DIRECTIVES: [&str; 3] = ["require", "replace", "exclude"];
+
 /// The `require`, `replace` and `exclude` directives of a `go.mod`, in both
 /// their single-line and block forms.
 pub(super) fn module(text: &str) -> Result<Entries, String> {
@@ -35,6 +38,36 @@ pub(super) fn module(text: &str) -> Result<Entries, String> {
         return Err("a `(` block is never closed".to_string());
     }
     Ok(entries)
+}
+
+/// The directives of a `go.mod` that [`module`] does not read as entries
+/// (`module`, `go`, `toolchain`, `retract`, `godebug`, ...), one per line, a
+/// block's lines each prefixed with its directive.
+pub(super) fn other(text: &str) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    let mut block: Option<String> = None;
+    for raw in text.lines() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(directive) = &block {
+            if line == ")" {
+                block = None;
+            } else if !ENTRY_DIRECTIVES.contains(&directive.as_str()) {
+                lines.push(format!("{directive} {line}"));
+            }
+            continue;
+        }
+        let (directive, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let rest = rest.trim();
+        if rest == "(" {
+            block = Some(directive.to_string());
+        } else if !ENTRY_DIRECTIVES.contains(&directive) {
+            lines.push(line.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+    }
+    Ok(lines)
 }
 
 fn record(directive: &str, line: &str, entries: &mut Entries) {

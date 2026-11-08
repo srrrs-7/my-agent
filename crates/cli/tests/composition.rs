@@ -554,6 +554,109 @@ async fn a_deny_rule_follows_a_link_to_the_file_it_protects() {
     );
 }
 
+/// One model response asking for `ln -s <target> notes.txt` and then a
+/// write to `notes.txt` - two calls approved together, before either runs.
+#[cfg(unix)]
+fn link_then_write(target: &str) -> Response {
+    let link = json!({"command": format!("ln -s {target} notes.txt")}).to_string();
+    let write = json!({"path": "notes.txt", "content": "overwritten"}).to_string();
+    Response::ok(
+        json!({
+            "model": "mock",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function",
+                         "function": {"name": "run_command", "arguments": link}},
+                        {"id": "call_2", "type": "function",
+                         "function": {"name": "write_file", "arguments": write}},
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20}
+        })
+        .to_string(),
+    )
+}
+
+/// Runs [`link_then_write`] under `rules`, unattended with auto approval, in
+/// a workspace whose `protected/real.txt` says "keep". Returns the file's
+/// content afterwards and what the model was told about the write.
+#[cfg(unix)]
+async fn a_turn_that_links_then_writes(rules: &str) -> (String, String) {
+    let llm = MockLlmServer::start(vec![
+        link_then_write("protected/real.txt"),
+        Response::assistant_text("Done."),
+    ])
+    .await;
+    let setup = Setup::new()
+        .model(&llm)
+        .with("AGENT_APPROVAL", "auto")
+        .with("AGENT_SHELL", "true")
+        .with("AGENT_SHELL_SANDBOX", "none")
+        .permissions(rules);
+    std::fs::create_dir(setup.path().join("protected")).unwrap();
+    std::fs::write(setup.path().join("protected/real.txt"), "keep").unwrap();
+    let (app, _) = setup.assemble().await.unwrap();
+
+    app.agent
+        .run(&mut Session::new("composition-test"), "update the notes")
+        .await
+        .expect("a refused call is a tool result, not a failed turn");
+
+    assert!(
+        setup.path().join("notes.txt").is_symlink(),
+        "the command ran first"
+    );
+    let content = std::fs::read_to_string(setup.path().join("protected/real.txt")).unwrap();
+    let requests = llm.json_requests().await;
+    let answer = requests[1]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_2")
+        .expect("the write was answered")["content"]
+        .to_string();
+    (content, answer)
+}
+
+/// At the first approval `notes.txt` does not exist yet; by the time the
+/// write runs, the command has made it a link into `protected/`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_made_earlier_in_the_turn_cannot_carry_a_write_past_a_deny_rule() {
+    let (content, answer) = a_turn_that_links_then_writes(
+        r#"{"rules": [{"tool": "write_file", "path": "protected/", "effect": "deny"}]}"#,
+    )
+    .await;
+
+    assert_eq!(content, "keep", "the protected file was not written");
+    assert!(
+        answer.contains("checked again right before it ran")
+            && answer.contains("deny write_file path `protected/`"),
+        "{answer}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_made_earlier_in_the_turn_cannot_carry_a_write_past_an_ask_rule() {
+    let (content, answer) = a_turn_that_links_then_writes(
+        r#"{"rules": [{"tool": "write_file", "path": "protected/", "effect": "ask"}]}"#,
+    )
+    .await;
+
+    assert_eq!(content, "keep", "nobody was there to answer the question");
+    assert!(
+        answer.contains("permission rules require a human"),
+        "{answer}"
+    );
+}
+
 #[tokio::test]
 async fn the_dependency_question_passes_through_every_layer_to_the_human_gate() {
     let llm = MockLlmServer::start(vec![

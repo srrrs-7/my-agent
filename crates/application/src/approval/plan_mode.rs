@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_domain::error::ApprovalError;
-use agent_domain::model::tool::ToolSafety;
+use agent_domain::model::tool::{PlannedWrite, ToolSafety};
 use agent_domain::ports::approval::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest,
 };
@@ -113,6 +113,16 @@ impl ApprovalGate for PlanModeGate {
         self.inner.authorize(request).await
     }
 
+    /// Straight through: plan mode judges a call by its safety class, and
+    /// where a write lands does not change that.
+    async fn reauthorize_write(
+        &self,
+        request: &ApprovalRequest,
+        writes: &[PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.inner.reauthorize_write(request, writes).await
+    }
+
     async fn authorize_dependency_change(
         &self,
         request: &DependencyApprovalRequest,
@@ -159,6 +169,18 @@ mod tests {
         ) -> Result<ApprovalDecision, ApprovalError> {
             *self.dependency_questions.lock().unwrap() += 1;
             Ok(ApprovalDecision::Approve)
+        }
+
+        /// Refuses, so that a gate in front which answered itself - the
+        /// trait's default approves - is caught.
+        async fn reauthorize_write(
+            &self,
+            _request: &ApprovalRequest,
+            _writes: &[PlannedWrite],
+        ) -> Result<ApprovalDecision, ApprovalError> {
+            Ok(ApprovalDecision::Deny {
+                reason: "looked again".into(),
+            })
         }
     }
 
@@ -256,6 +278,22 @@ mod tests {
         let decision = gate.authorize_dependency_change(&request).await.unwrap();
         assert!(decision.is_approved(), "{decision:?}");
         assert_eq!(*inner.dependency_questions.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_second_look_at_a_write_is_forwarded_to_the_inner_gate() {
+        let (gate, _, mut session) = planning();
+        gate.mode.set(&mut session, false);
+        let decision = gate
+            .reauthorize_write(&request("write_file", ToolSafety::Mutating), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny {
+                reason: "looked again".into()
+            }
+        );
     }
 
     #[test]

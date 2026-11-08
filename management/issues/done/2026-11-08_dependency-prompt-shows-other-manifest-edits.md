@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: low
 importance: high
 priority: P2
+started: 2026-11-08
+completed: 2026-11-08
 scope: [application, cli, docs]
 ---
 
@@ -44,14 +46,14 @@ scope: [application, cli, docs]
 
 ## 達成条件
 
-- [ ] `Cargo.toml` に依存 1 つと `build = "x.rs"` を同時に足す書き込みで、プロンプトに両方が
+- [x] `Cargo.toml` に依存 1 つと `build = "x.rs"` を同時に足す書き込みで、プロンプトに両方が
       出ることを `approval.rs` のテストで固定する
-- [ ] `package.json` で依存の追加と install フック以外の `scripts` の変更を同時に行う書き込みで、
+- [x] `package.json` で依存の追加と install フック以外の `scripts` の変更を同時に行う書き込みで、
       両方が出ることを固定する
-- [ ] 依存以外の差分が行数上限を超えたとき、省略されたことと省略した行数がプロンプトに出る
+- [x] 依存以外の差分が行数上限を超えたとき、省略されたことと省略した行数がプロンプトに出る
       （黙って切らない）
-- [ ] 依存の一覧が変わらない書き込みの表示（変更行）は退行しない
-- [ ] `make check` が緑
+- [x] 依存の一覧が変わらない書き込みの表示（変更行）は退行しない
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -69,3 +71,10 @@ scope: [application, cli, docs]
   依存扱いにする）方向もあるが、一覧が騒がしくなるので行差分で見せる方が筋がよさそう
 - 関連: `done/2026-11-08_dependency-change-gate.md`
 - 出典: 2026-11-08 のレビュー（security）で見送ったもの
+- 2026-11-08 実装: `DependencyChangeDescription::Dependencies` を `{ changes, other: ChangedLines }` に変更。
+  `other` は生の行差分ではなく、パーサが「依存の項目以外の文」を `package.build = "x.rs"` /
+  `scripts.test = "..."` の形で読み出したものの多重集合差分（`lines::changed` を共用）。
+  一覧と重複しないので「一覧に出した行を除く」判断は不要になった。読み出しに失敗したら生の行差分
+  （重複あり・安全側）。対象は `Cargo.toml` / `package.json` / `go.mod`。ロックファイルと
+  `requirements*.txt` は対象外。表示は 1 ファイル 10 行（`MAX_OTHER_LINES`）+ 省略行数。
+  通知（`notify.rs`）はツール名と safety のみのまま変更なし

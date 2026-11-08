@@ -43,6 +43,14 @@ impl DependencyGate {
 
 #[async_trait]
 impl ApprovalGate for DependencyGate {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
         Ok(ApprovalDecision::Approve)
     }
@@ -63,6 +71,14 @@ struct InterruptedDependencyPrompt {
 
 #[async_trait]
 impl ApprovalGate for InterruptedDependencyPrompt {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
         Ok(ApprovalDecision::Approve)
     }
@@ -105,7 +121,7 @@ fn shown(request: &DependencyApprovalRequest) -> Vec<String> {
         .changes
         .iter()
         .flat_map(|change| match &change.description {
-            DependencyChangeDescription::Dependencies(changes) => {
+            DependencyChangeDescription::Dependencies { changes, .. } => {
                 changes.iter().map(ToString::to_string).collect::<Vec<_>>()
             }
             other => panic!("expected parsed dependencies, got {other:?}"),

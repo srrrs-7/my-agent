@@ -142,6 +142,18 @@ impl ApprovalGate for Inner {
         *self.dependency_questions.lock().unwrap() += 1;
         Ok(self.decision.clone())
     }
+
+    async fn reauthorize_write(
+        &self,
+        request: &ApprovalRequest,
+        _writes: &[PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push(format!("again: {}", request.call.name));
+        Ok(self.decision.clone())
+    }
 }
 
 fn call(id: &str, tool: &str, arguments: Value) -> ToolCall {
@@ -289,6 +301,39 @@ async fn only_hooks_whose_match_names_the_tool_run() {
         !fixture.ran("for-commands"),
         "a hook on another tool must not run"
     );
+}
+
+#[tokio::test]
+async fn the_second_look_at_a_write_goes_to_the_inner_gate_without_running_hooks_again() {
+    let fixture = fixture();
+    let hooks = fixture.confined(json!({"pre_tool_use": [{
+        "match": "*", "command": "touch asked; exit 1",
+    }]}));
+    let inner = Inner::answering(ApprovalDecision::Deny {
+        reason: "looked again".into(),
+    });
+    let gate = HookGate::new(inner.clone(), hooks);
+
+    let decision = gate
+        .reauthorize_write(
+            &request(
+                call("c1", "write_file", json!({"path": "a"})),
+                ToolSafety::Mutating,
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision,
+        ApprovalDecision::Deny {
+            reason: "looked again".into()
+        },
+        "the inner gate's answer, not the trait's default"
+    );
+    assert_eq!(inner.asked(), ["again: write_file"]);
+    assert!(!fixture.ran("asked"), "the hooks judged the call already");
 }
 
 #[tokio::test]

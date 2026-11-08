@@ -29,6 +29,12 @@
 //!   out is not run - unless its arguments are invalid, which `execute`
 //!   refuses before writing anything - and is reported as a failed call
 //!   carrying the tool's own error, not as a denial.
+//! * **Where a write lands is judged again right before it is made.** The
+//!   first approval is given before any call of the turn runs, so an earlier
+//!   call - a command that turns a path into a link - can change which file
+//!   a later write reaches. The gate is asked again with the writes worked
+//!   out at that moment ([`ApprovalGate::reauthorize_write`]), from the same
+//!   preview the dependency check uses, before that check.
 //! * **A call runs inside its [`CallScope`].** A tool that has to know which
 //!   call it is running for - `spawn_agent` names its sub-agent's session
 //!   after it - reads it from there (see [`super::call_scope`]); the tool
@@ -42,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use agent_domain::error::ToolError;
 use agent_domain::model::llm::TokenUsage;
-use agent_domain::model::tool::{ToolCall, ToolDefinition, ToolResult, ToolSafety};
+use agent_domain::model::tool::{PlannedWrite, ToolCall, ToolDefinition, ToolResult, ToolSafety};
 use agent_domain::ports::approval::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest,
 };
@@ -233,7 +239,7 @@ impl ToolDispatcher {
             // Guarded like the first approval: an interrupt while this prompt
             // is open means the human never answered, so nothing runs.
             let result = match interrupt
-                .guard(self.confirm_dependencies(tool.as_ref(), call, safety))
+                .guard(self.confirm_writes(tool.as_ref(), call, safety))
                 .await
             {
                 None => ToolResult::error(call, NOT_STARTED),
@@ -304,10 +310,12 @@ impl ToolDispatcher {
         }
     }
 
-    /// Asks for the dependency approval if `call` would change a dependency
-    /// file (see [`supply_chain::manifest_changes`] for which writes count).
-    /// `Err` carries the result to hand back instead of running it.
-    async fn confirm_dependencies(
+    /// The checks made right before `call` runs, against what it would
+    /// write now: the gate looks again at where the writes land, then the
+    /// dependency approval is asked for if a dependency file would change.
+    /// One preview serves both. `Err` carries the result to hand back
+    /// instead of running the call.
+    async fn confirm_writes(
         &self,
         tool: &dyn Tool,
         call: &ToolCall,
@@ -331,6 +339,59 @@ impl ToolDispatcher {
             }
         };
 
+        if writes.is_empty() {
+            return Ok(());
+        }
+        self.reconfirm(call, safety, &writes).await?;
+        self.confirm_dependencies(call, safety, writes).await
+    }
+
+    /// Lets the gate look again at `call` now that `writes` say where it
+    /// lands (see [`ApprovalGate::reauthorize_write`]).
+    async fn reconfirm(
+        &self,
+        call: &ToolCall,
+        safety: ToolSafety,
+        writes: &[PlannedWrite],
+    ) -> Result<(), ToolResult> {
+        // The request the first approval was given, rebuilt: it is a pure
+        // function of the call.
+        let request = ApprovalRequest {
+            call: call.clone(),
+            safety,
+            summary: summarize(call, safety),
+            must_ask: false,
+        };
+        match self.approval.reauthorize_write(&request, writes).await {
+            Ok(ApprovalDecision::Approve) => Ok(()),
+            Ok(ApprovalDecision::Deny { reason }) => {
+                let message = format!(
+                    "Not executed: checked again right before it ran - after the earlier calls \
+                     of this turn - this call was declined: {reason}. Nothing was written. Do \
+                     not retry it - propose a different approach or ask how to proceed."
+                );
+                Err(self.denied(call, reason, message))
+            }
+            Err(error) => Err(self.failed(
+                call,
+                safety,
+                format!(
+                    "Not executed: approval could not be confirmed right before this call ran: \
+                     {error}. Nothing was written."
+                ),
+            )),
+        }
+    }
+
+    /// Asks for the dependency approval if `writes` would change a
+    /// dependency file (see [`supply_chain::manifest_changes`] for which
+    /// writes count).
+    async fn confirm_dependencies(
+        &self,
+        call: &ToolCall,
+        safety: ToolSafety,
+        writes: Vec<PlannedWrite>,
+    ) -> Result<(), ToolResult> {
         let changes = supply_chain::manifest_changes(writes);
         if changes.is_empty() {
             return Ok(());

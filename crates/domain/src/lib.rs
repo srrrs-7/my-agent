@@ -29,8 +29,8 @@ pub use model::{
     context::ContextSnapshot,
     conversation::Conversation,
     dependency::{
-        DependencyChange, DependencyChangeDescription, DependencyFileChange, FileChange,
-        ManifestChange, ManifestKind,
+        ChangedLines, DependencyChange, DependencyChangeDescription, DependencyFileChange,
+        FileChange, ManifestChange, ManifestKind,
     },
     glob::GlobPattern,
     image::{Image, ImageMediaType},

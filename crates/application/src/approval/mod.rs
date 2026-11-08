@@ -10,8 +10,15 @@
 //! untouched - the trait's default refuses, and a decorator that forgot to
 //! forward would silently refuse every dependency change.
 //!
+//! [`ApprovalGate::reauthorize_write`] - the second look right before a
+//! write, against where it lands - is forwarded the same way. A decorator
+//! that answered it itself would quietly stop the rules inside from ever
+//! looking again, so the trait gives it no default: a missing forward does
+//! not compile. Only [`RuleGate`] answers it itself.
+//!
 //! [`ApprovalGate`]: agent_domain::ports::approval::ApprovalGate
 //! [`ApprovalGate::authorize_dependency_change`]: agent_domain::ports::approval::ApprovalGate::authorize_dependency_change
+//! [`ApprovalGate::reauthorize_write`]: agent_domain::ports::approval::ApprovalGate::reauthorize_write
 
 mod plan_mode;
 mod rules;

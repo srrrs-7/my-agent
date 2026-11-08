@@ -39,6 +39,14 @@ struct ApproveAll;
 
 #[async_trait]
 impl ApprovalGate for ApproveAll {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
         Ok(ApprovalDecision::Approve)
     }
@@ -846,6 +854,14 @@ struct RefuseDependencies {
 
 #[async_trait]
 impl ApprovalGate for RefuseDependencies {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
         Ok(ApprovalDecision::Approve)
     }

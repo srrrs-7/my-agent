@@ -15,6 +15,9 @@ const DEPENDENCY_SECTIONS: [&str; 4] = [
 /// Sections that redirect what other entries resolve to.
 const OVERRIDE_SECTIONS: [&str; 2] = ["overrides", "resolutions"];
 
+/// Lists of packages shipped inside this one's tarball.
+const BUNDLE_SECTIONS: [&str; 2] = ["bundleDependencies", "bundledDependencies"];
+
 /// Scripts that npm runs by itself during an install. Adding one is how a
 /// package gets code executed without anyone calling it, so it is listed next
 /// to the dependencies even though it is not one.
@@ -55,7 +58,7 @@ pub(super) fn manifest(text: &str) -> Result<Entries, String> {
         }
     }
 
-    for section in ["bundleDependencies", "bundledDependencies"] {
+    for section in BUNDLE_SECTIONS {
         if let Some(value) = root.get(section) {
             insert(&mut entries, format!("({section})"), value.to_string());
         }
@@ -73,6 +76,48 @@ pub(super) fn manifest(text: &str) -> Result<Entries, String> {
         }
     }
     Ok(entries)
+}
+
+/// Everything in a `package.json` that [`manifest`] does not read as an
+/// entry, flattened to `key.path = value` - `scripts.test = "..."`,
+/// `bin.tool = "./x.js"`. Objects are walked so that one changed script is
+/// one changed line, not the whole `scripts` object; arrays stay whole.
+pub(super) fn other(text: &str) -> Result<Vec<String>, String> {
+    let root = object(text)?;
+    let mut lines = Vec::new();
+    for (key, value) in &root {
+        let is_entry = DEPENDENCY_SECTIONS
+            .iter()
+            .chain(&OVERRIDE_SECTIONS)
+            .chain(&BUNDLE_SECTIONS)
+            .any(|section| *section == key.as_str());
+        if is_entry {
+            continue;
+        }
+        if key == "scripts"
+            && let Value::Object(scripts) = value
+        {
+            for (script, command) in scripts {
+                if !INSTALL_SCRIPTS.contains(&script.as_str()) {
+                    flatten(&format!("scripts.{script}"), command, &mut lines);
+                }
+            }
+            continue;
+        }
+        flatten(key, value, &mut lines);
+    }
+    Ok(lines)
+}
+
+fn flatten(path: &str, value: &Value, lines: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) if !fields.is_empty() => {
+            for (key, value) in fields {
+                flatten(&format!("{path}.{key}"), value, lines);
+            }
+        }
+        other => lines.push(format!("{path} = {other}")),
+    }
 }
 
 /// The installed packages a lockfile pins. Lockfile v2/v3 list them under

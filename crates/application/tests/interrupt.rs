@@ -67,6 +67,14 @@ struct InterruptedPrompt {
 
 #[async_trait]
 impl ApprovalGate for InterruptedPrompt {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
         self.interrupt.fire();
         std::future::pending().await

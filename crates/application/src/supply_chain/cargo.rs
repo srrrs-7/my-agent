@@ -89,6 +89,32 @@ pub(super) fn manifest(text: &str) -> Result<Entries, String> {
     Ok(entries)
 }
 
+/// Every statement of a `Cargo.toml` that [`manifest`] does not read as a
+/// dependency entry, as `table.key = value` - `package.build = "x.rs"`,
+/// `lib.proc-macro = true`. Comments are gone; whitespace in values is
+/// collapsed as it is for entries.
+pub(super) fn other(text: &str) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    let mut header: Vec<String> = Vec::new();
+    for statement in statements(text)? {
+        if let Some(inner) = table_header(&statement) {
+            header = split_dotted(inner)?;
+            continue;
+        }
+        let (key, value) = split_assignment(&statement)?;
+        let mut path = header.clone();
+        path.extend(split_dotted(key)?);
+        if dependency_table(&path).is_none() {
+            lines.push(format!(
+                "{} = {}",
+                path.join("."),
+                collapse_whitespace(value)
+            ));
+        }
+    }
+    Ok(lines)
+}
+
 /// Where in `path` the dependency table is, if it is in one.
 fn dependency_table(path: &[String]) -> Option<usize> {
     if path.first().map(String::as_str) == Some("patch") && path.len() >= 2 {

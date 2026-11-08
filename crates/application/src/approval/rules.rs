@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use agent_domain::error::{ApprovalError, DomainError};
 use agent_domain::model::permission::{
-    Effect, PermissionRules, Subject, SubjectKind, Verdict, url_host,
+    Effect, PermissionRule, PermissionRules, Subject, SubjectKind, Verdict, url_host,
 };
-use agent_domain::model::tool::{ToolCall, ToolName};
+use agent_domain::model::tool::{PlannedWrite, ToolCall, ToolName};
 use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::approval::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest,
@@ -174,7 +174,26 @@ impl RuleGate {
     /// every file its writes really reach. A path the tool would refuse is
     /// unreadable: it meets every `deny`, and the call fails anyway.
     async fn paths(&self, call: &ToolCall, named: Option<&Value>) -> Vec<Subject> {
-        let mut subjects = vec![match named {
+        // An error here is the dispatcher's to report: arguments `execute`
+        // rejects anyway, or a write it refuses to run unchecked.
+        let writes = match self.tools.get(&call.name) {
+            Some(tool) => tool.preview(&call.arguments).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let (mut subjects, targets) = self.write_subjects(named, &writes);
+        subjects.extend(targets);
+        subjects
+    }
+
+    /// What a write call is about, split in two: the path it names and the
+    /// paths its writes name - fixed by the arguments - and the files those
+    /// writes really reach, which a link made since can change.
+    fn write_subjects(
+        &self,
+        named: Option<&Value>,
+        writes: &[PlannedWrite],
+    ) -> (Vec<Subject>, Vec<Subject>) {
+        let mut named_paths = vec![match named {
             // Optional for the listing tools, where it means the root.
             None => Subject::Path(WorkspacePath::root()),
             Some(Value::String(raw)) => self
@@ -183,17 +202,43 @@ impl RuleGate {
                 .map_or(Subject::Unreadable(SubjectKind::Path), Subject::Path),
             Some(_) => Subject::Unreadable(SubjectKind::Path),
         }];
-        // An error here is the dispatcher's to report: arguments `execute`
-        // rejects anyway, or a write it refuses to run unchecked.
-        let writes = match self.tools.get(&call.name) {
-            Some(tool) => tool.preview(&call.arguments).await.unwrap_or_default(),
-            None => Vec::new(),
-        };
-        for write in writes {
-            subjects.push(Subject::Path(write.path));
-            subjects.push(Subject::Path(write.target));
-        }
-        subjects
+        named_paths.extend(writes.iter().map(|write| Subject::Path(write.path.clone())));
+        let targets = writes
+            .iter()
+            .map(|write| Subject::Path(write.target.clone()))
+            .collect();
+        (named_paths, targets)
+    }
+}
+
+/// What the model is told when `rule` refuses a call of `tool`.
+fn refusal(rule: &PermissionRule, tool: &ToolName) -> ApprovalDecision {
+    ApprovalDecision::Deny {
+        reason: format!(
+            "the operator's permission rule `{rule}` refuses this call. It is a standing rule, \
+             not the user's answer, and asking again will not change it - do not {} another \
+             way (another tool, a command). Continue without it, or tell the user what you \
+             need and why so they can change the rules",
+            reached(subject_kind(tool))
+        ),
+    }
+}
+
+/// `request`, with where its writes really land added to what the human
+/// reads - the reason they are being asked again.
+fn retold(request: &ApprovalRequest, writes: &[PlannedWrite], must_ask: bool) -> ApprovalRequest {
+    let targets = writes
+        .iter()
+        .map(|write| format!("`{}`", write.target))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ApprovalRequest {
+        summary: format!(
+            "{} - asked again right before it runs: its write now reaches {targets}",
+            request.summary
+        ),
+        must_ask,
+        ..request.clone()
     }
 }
 
@@ -218,15 +263,7 @@ impl ApprovalGate for RuleGate {
         }
         let subjects = self.subjects(&request.call).await;
         match self.rules.evaluate(&request.call.name, &subjects) {
-            Verdict::Deny(rule) => Ok(ApprovalDecision::Deny {
-                reason: format!(
-                    "the operator's permission rule `{rule}` refuses this call. It is a standing \
-                     rule, not the user's answer, and asking again will not change it - do not \
-                     {} another way (another tool, a command). Continue without it, or tell \
-                     the user what you need and why so they can change the rules",
-                    reached(subject_kind(&request.call.name))
-                ),
-            }),
+            Verdict::Deny(rule) => Ok(refusal(rule, &request.call.name)),
             Verdict::Ask(_) => {
                 let request = ApprovalRequest {
                     must_ask: true,
@@ -236,6 +273,50 @@ impl ApprovalGate for RuleGate {
             }
             Verdict::Allow => Ok(ApprovalDecision::Approve),
             Verdict::Unruled => self.inner.authorize(request).await,
+        }
+    }
+
+    /// The path rules again, against where the writes land now.
+    ///
+    /// What the first look saw is not kept; it is bounded instead. The
+    /// named paths cannot have changed since, so the verdict without the
+    /// targets is the least the first look can have said. Only what the
+    /// targets make stricter than that is acted on: a `deny` refuses, an
+    /// `ask` puts the call to the human, and a target an `allow` no longer
+    /// covers goes to the gate inside as an unruled call would have. When a
+    /// link was already there at the first look, the human is asked a second
+    /// time - now told where the write lands, which the first question did
+    /// not say.
+    async fn reauthorize_write(
+        &self,
+        request: &ApprovalRequest,
+        writes: &[PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        let tool = &request.call.name;
+        let judged_by_path = subject_kind(tool) == Some(SubjectKind::Path)
+            && self.rules.compares(tool, SubjectKind::Path);
+        if writes.is_empty() || !judged_by_path {
+            return self.inner.reauthorize_write(request, writes).await;
+        }
+        let named = request
+            .call
+            .arguments
+            .get("path")
+            .filter(|value| !value.is_null());
+        let (mut subjects, targets) = self.write_subjects(named, writes);
+        let at_least = self.rules.evaluate(tool, &subjects);
+        subjects.extend(targets);
+        match (self.rules.evaluate(tool, &subjects), at_least) {
+            (Verdict::Deny(rule), _) => Ok(refusal(rule, tool)),
+            (Verdict::Ask(_), Verdict::Allow | Verdict::Unruled) => {
+                self.inner.authorize(&retold(request, writes, true)).await
+            }
+            (Verdict::Unruled, Verdict::Allow) => {
+                self.inner
+                    .authorize(&retold(request, writes, request.must_ask))
+                    .await
+            }
+            _ => self.inner.reauthorize_write(request, writes).await,
         }
     }
 
@@ -256,12 +337,8 @@ mod tests {
     use agent_domain::model::dependency::{
         DependencyChangeDescription, ManifestChange, ManifestKind,
     };
-    use agent_domain::model::permission::{
-        CommandPrefix, DomainPattern, PermissionRule, SubjectPattern,
-    };
-    use agent_domain::model::tool::{
-        Before, PlannedWrite, ToolCallId, ToolDefinition, ToolOutcome, ToolSafety,
-    };
+    use agent_domain::model::permission::{CommandPrefix, DomainPattern, SubjectPattern};
+    use agent_domain::model::tool::{Before, ToolCallId, ToolDefinition, ToolOutcome, ToolSafety};
     use agent_domain::ports::tool::Tool;
     use serde_json::json;
 
@@ -276,6 +353,14 @@ mod tests {
 
     #[async_trait]
     impl ApprovalGate for Recording {
+        async fn reauthorize_write(
+            &self,
+            _request: &ApprovalRequest,
+            _writes: &[PlannedWrite],
+        ) -> Result<ApprovalDecision, ApprovalError> {
+            Ok(ApprovalDecision::Approve)
+        }
+
         async fn authorize(
             &self,
             request: &ApprovalRequest,

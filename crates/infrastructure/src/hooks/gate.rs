@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use agent_domain::error::{ApprovalError, CommandError};
+use agent_domain::model::tool::PlannedWrite;
 use agent_domain::ports::approval::{
     ApprovalDecision, ApprovalGate, ApprovalRequest, DependencyApprovalRequest,
 };
@@ -106,6 +107,17 @@ impl ApprovalGate for HookGate {
             self.hooks.note(&call.name, &call.arguments, &call.id);
         }
         Ok(decision)
+    }
+
+    /// Straight through, without running the hooks again: they judged the
+    /// call, which has not changed. Only where its writes land may have,
+    /// and that is for the gates inside to judge.
+    async fn reauthorize_write(
+        &self,
+        request: &ApprovalRequest,
+        writes: &[PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.inner.reauthorize_write(request, writes).await
     }
 
     /// Straight through: no hook answers this, in either direction. A hook

@@ -291,10 +291,19 @@ impl fmt::Display for DependencyChange {
 /// a change goes through unseen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencyChangeDescription {
-    /// The entries that differ. Never empty: an edit that changed no entry
-    /// is described by its lines instead, so that the human is never told
-    /// "nothing changed" by a parser that may simply have missed it.
-    Dependencies(Vec<DependencyChange>),
+    /// The entries that differ, and whatever else the same write changes in
+    /// the file.
+    Dependencies {
+        /// Never empty: an edit that changed no entry is described by its
+        /// lines instead, so that the human is never told "nothing changed"
+        /// by a parser that may simply have missed it.
+        changes: Vec<DependencyChange>,
+        /// The rest of the file's changes - `[package] build = "x.rs"`, an
+        /// npm script that is not an install hook. Without it, a list of
+        /// entries is a summary that leaves out the part of the write that
+        /// runs code at build time. Empty when the write changes nothing else.
+        other: ChangedLines,
+    },
     /// The changed lines, when the entries could not be compared - the
     /// format is not understood, this version of the file did not parse, or
     /// no entry differs. `reason` says which. Only the first lines are kept;
@@ -305,6 +314,21 @@ pub enum DependencyChangeDescription {
         removed: Vec<String>,
         omitted: usize,
     },
+}
+
+/// Lines one version of a file has and the other lacks. Only the first are
+/// kept; `omitted` counts the rest, so a cut is never silent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangedLines {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub omitted: usize,
+}
+
+impl ChangedLines {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.omitted == 0
+    }
 }
 
 /// A planned write to one dependency file.

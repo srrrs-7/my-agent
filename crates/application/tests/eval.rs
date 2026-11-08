@@ -375,6 +375,14 @@ struct DenyWrites;
 
 #[async_trait]
 impl ApprovalGate for DenyWrites {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(
         &self,
         request: &ApprovalRequest,
@@ -442,6 +450,14 @@ struct BrokenGate;
 
 #[async_trait]
 impl ApprovalGate for BrokenGate {
+    async fn reauthorize_write(
+        &self,
+        _request: &ApprovalRequest,
+        _writes: &[agent_domain::model::tool::PlannedWrite],
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
     async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
         Err(ApprovalError::Unavailable("the terminal went away".into()))
     }

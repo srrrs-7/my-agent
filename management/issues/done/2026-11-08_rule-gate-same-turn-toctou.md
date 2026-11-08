@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: low
 importance: medium
 priority: P2
+started: 2026-11-08
+completed: 2026-11-08
 scope: [application, cli]
 ---
 
@@ -37,11 +39,11 @@ scope: [application, cli]
 
 ## 達成条件
 
-- [ ] 同じターンで先にシンボリックリンクを作り、続く書き込みで `deny` のファイルに届く順序が拒否される
+- [x] 同じターンで先にシンボリックリンクを作り、続く書き込みで `deny` のファイルに届く順序が拒否される
       （実ファイルシステムの E2E で固定）
-- [ ] フェーズ 1 で `allow` だった呼び出しが、invoke 直前に `ask` 対象になっていれば改めて確認する
-- [ ] 依存ゲートとプランモードの既存の振る舞いに退行がない
-- [ ] `make check` が緑
+- [x] フェーズ 1 で `allow` だった呼び出しが、invoke 直前に `ask` 対象になっていれば改めて確認する
+- [x] 依存ゲートとプランモードの既存の振る舞いに退行がない
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -54,3 +56,11 @@ scope: [application, cli]
 - 2026-11-08 §2 権限ルールの実装担当が発見・報告（root が起票）
 - 依存ゲートの `confirm_dependencies`（フェーズ 2）と同じ位置で `preview` 結果を共有すれば、
   preview の二重実行を避けられる
+- 2026-11-08 実装: `ApprovalGate::reauthorize_write(&request, &[PlannedWrite])` を既定実装なしで追加（案 A。転送漏れはコンパイルエラー。人間ゲートとフェイクは Approve を明示実装）。
+  ディスパッチャのフェーズ 2 で 1 回の preview を再照合と依存ゲートで共有（再照合が先）。
+  `PlanModeGate` / `HookGate` は素通し（フックは再実行しない）、`RuleGate` だけが判定する。
+  1 回目の判定は保持せず、「名前のパスだけで評価した verdict」を 1 回目の下限として比較する
+  （名前のパスはフェーズ間で変わらないため）。既知の副作用: 既にリンクがあり実体が `ask` の
+  書き込みは確認が 2 回出る（2 回目は届き先を表示）
+- E2E: `crates/cli/tests/composition.rs` の `a_link_made_earlier_in_the_turn_cannot_carry_a_write_past_*`
+  （実 FS + `run_command`、sandbox none）
