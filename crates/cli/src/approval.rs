@@ -198,8 +198,11 @@ impl ApprovalGate for CliApprovalGate {
                 reason: "the user answered no".to_string(),
             }),
             // Anything else is treated as free-form feedback and forwarded.
+            // Said to be the user's, because the dispatcher no longer
+            // assumes every denial came from a person (rules and hooks deny
+            // too).
             Some(other) => Ok(ApprovalDecision::Deny {
-                reason: other.to_string(),
+                reason: format!("the user said: {other}"),
             }),
         }
     }
@@ -260,8 +263,11 @@ impl ApprovalGate for CliApprovalGate {
             None | Some("") | Some("n") | Some("no") => Ok(ApprovalDecision::Deny {
                 reason: "the user answered no".to_string(),
             }),
+            // Said to be the user's, because the dispatcher no longer
+            // assumes every denial came from a person (rules and hooks deny
+            // too).
             Some(other) => Ok(ApprovalDecision::Deny {
-                reason: other.to_string(),
+                reason: format!("the user said: {other}"),
             }),
         }
     }

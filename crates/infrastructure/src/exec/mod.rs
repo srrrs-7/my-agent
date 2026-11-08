@@ -350,14 +350,21 @@ impl SandboxedCommandRunner {
             });
         }
 
-        let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg(&request.command).current_dir(&cwd);
-        confined::confine_command(command, &self.policy())
+        confined::confine_command(shell_line(&request.command, &cwd), &self.policy())
     }
 
     pub(crate) fn workspace(&self) -> &std::sync::Arc<WorkspaceRoot> {
         &self.workspace
     }
+}
+
+/// `line` as `/bin/sh -c` would run it in `cwd`, not yet confined. Shared
+/// with the hooks, so that an operator's hook line is interpreted exactly as
+/// a command line the model sends.
+pub(crate) fn shell_line(line: &str, cwd: &std::path::Path) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(line).current_dir(cwd);
+    command
 }
 
 impl Drop for SandboxedCommandRunner {

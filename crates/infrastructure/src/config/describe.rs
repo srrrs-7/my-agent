@@ -190,6 +190,17 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         },
     );
     description.insert(
+        "hooks".into(),
+        match &settings.hooks.config {
+            None => "none".to_string(),
+            Some(path) => format!(
+                "from {} (sandbox: {})",
+                path.display(),
+                settings.hooks.sandbox
+            ),
+        },
+    );
+    description.insert(
         "permission rules".into(),
         match &settings.permissions {
             None => "none".to_string(),

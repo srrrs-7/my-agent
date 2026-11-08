@@ -103,6 +103,18 @@ impl Setup {
         self.with("AGENT_PERMISSIONS", &path)
     }
 
+    /// Writes `hooks` to a file outside the workspace and points
+    /// `AGENT_HOOKS` at it. Unconfined: these tests are about where the
+    /// hooks sit in the wiring, and `tests/hooks.rs` in the infrastructure
+    /// crate proves the confinement on the platform that has it.
+    fn hooks(self, hooks: Value) -> Self {
+        let path = self.outside.path().join("hooks.json");
+        std::fs::write(&path, hooks.to_string()).unwrap();
+        let path = path.display().to_string();
+        self.with("AGENT_HOOKS", &path)
+            .with("AGENT_HOOKS_SANDBOX", "none")
+    }
+
     fn write(self, name: &str, contents: &str) -> Self {
         std::fs::write(self.workspace.path().join(name), contents).unwrap();
         self
@@ -628,4 +640,179 @@ async fn web_fetch_deny_rules_also_refuse_a_redirect() {
         .await
         .expect_err("the redirect is refused");
     assert!(error.to_string().contains("permission rules"), "{error}");
+}
+
+// --- hooks ----------------------------------------------------------------------
+
+/// A pre hook on every tool that leaves `marker` in the workspace and then
+/// exits with `code`, saying `said` on stderr.
+fn pre_hook(marker: &str, code: i32, said: &str) -> Value {
+    json!({"pre_tool_use": [{
+        "match": "*",
+        "command": format!("touch {marker}; echo '{said}' >&2; exit {code}"),
+    }]})
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_before_any_hook_is_started() {
+    let setup = Setup::new().hooks(pre_hook("hook-ran", 0, ""));
+    let (app, _) = setup.assemble().await.unwrap();
+
+    app.plan_mode.set(&mut Session::new("s"), true);
+    let reason = refusal(decide(&app, "write_file", json!({"path": "a", "content": "x"})).await);
+
+    assert!(reason.contains("plan mode is on"), "{reason}");
+    assert!(
+        !setup.path().join("hook-ran").exists(),
+        "plan mode is outermost: no hook runs for a call that cannot run anyway"
+    );
+}
+
+#[tokio::test]
+async fn a_hook_refuses_even_what_an_allow_rule_lets_through() {
+    let setup = Setup::new().permissions(ALLOW_ALL_WRITES).hooks(pre_hook(
+        "hook-ran",
+        1,
+        "the hook says no",
+    ));
+    let (app, _) = setup.assemble().await.unwrap();
+
+    let reason = refusal(decide(&app, "write_file", json!({"path": "a", "content": "x"})).await);
+
+    assert_eq!(
+        reason, "the hook says no",
+        "the hooks sit outside the rules"
+    );
+}
+
+#[tokio::test]
+async fn a_passing_hook_still_leaves_the_decision_to_the_rules() {
+    let setup = Setup::new()
+        .permissions(r#"{"rules": [{"tool": "write_file", "effect": "deny"}]}"#)
+        .hooks(pre_hook("hook-ran", 0, ""));
+    let (app, _) = setup.assemble().await.unwrap();
+
+    let reason = refusal(decide(&app, "write_file", json!({"path": "a", "content": "x"})).await);
+
+    assert!(setup.path().join("hook-ran").exists(), "the hook ran first");
+    assert!(
+        reason.contains("permission rule `deny write_file`"),
+        "exit 0 approves nothing: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn with_hooks_the_dependency_question_still_reaches_the_human_gate() {
+    let llm = MockLlmServer::start(vec![
+        Response::tool_call("call_1", "edit_file", ADD_TOKIO),
+        Response::assistant_text("Done."),
+    ])
+    .await;
+    let setup = Setup::new()
+        .model(&llm)
+        .with("AGENT_APPROVAL", "auto")
+        .with("AGENT_ALLOW_DEPENDENCY_CHANGES", "true")
+        .hooks(pre_hook("hook-ran", 0, ""))
+        .write("Cargo.toml", MANIFEST);
+    let (app, _) = setup.assemble().await.unwrap();
+
+    app.agent
+        .run(&mut Session::new("composition-test"), "add tokio")
+        .await
+        .unwrap();
+
+    let manifest = std::fs::read_to_string(setup.path().join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains("tokio = \"1\""),
+        "the hook layer must forward the question, not answer it: {manifest}"
+    );
+}
+
+#[tokio::test]
+async fn a_post_hook_runs_after_the_call_through_the_registered_tool() {
+    let setup = Setup::new().hooks(json!({"post_tool_use": [{
+        "match": "write_file",
+        "command": "cat > post.json",
+    }]}));
+    let (app, _) = setup.assemble().await.unwrap();
+
+    tool(&app, "write_file")
+        .execute(json!({"path": "a.txt", "content": "x"}))
+        .await
+        .unwrap();
+
+    let seen: Value =
+        serde_json::from_str(&std::fs::read_to_string(setup.path().join("post.json")).unwrap())
+            .unwrap();
+    assert_eq!(seen["event"], "post_tool_use");
+    assert_eq!(seen["tool"], "write_file");
+    assert_eq!(seen["is_error"], false);
+}
+
+#[tokio::test]
+async fn a_hooks_file_inside_the_workspace_stops_startup() {
+    let setup = Setup::new().write("hooks.json", "{}");
+    let inside = setup.path().join("hooks.json").display().to_string();
+    let error = setup
+        .with("AGENT_HOOKS", &inside)
+        .assemble()
+        .await
+        .err()
+        .expect("refused");
+    let message = format!("{error:#}");
+    assert!(message.contains("AGENT_HOOKS"), "{message}");
+    assert!(message.contains("inside the workspace"), "{message}");
+}
+
+#[tokio::test]
+async fn a_hook_on_a_tool_that_is_not_offered_stops_startup() {
+    // `run_command` is not offered without AGENT_SHELL: a hook meant to
+    // police it would never run, and nobody would notice.
+    let error = Setup::new()
+        .hooks(json!({"pre_tool_use": [{"match": "run_command", "command": "exit 1"}]}))
+        .assemble()
+        .await
+        .err()
+        .expect("refused");
+    let message = format!("{error:#}");
+    assert!(message.contains("run_command"), "{message}");
+    assert!(message.contains("not offered"), "{message}");
+}
+
+#[tokio::test]
+async fn an_unknown_field_in_the_hooks_file_stops_startup() {
+    let error = Setup::new()
+        .hooks(json!({"pre_tool_use": [{"match": "*", "command": "exit 0", "on_fail": "allow"}]}))
+        .assemble()
+        .await
+        .err()
+        .expect("refused");
+    let message = format!("{error:#}");
+    assert!(message.contains("unknown field"), "{message}");
+}
+
+/// As for the shell: either outcome is legitimate, but they must not mix.
+#[tokio::test]
+async fn hooks_under_the_default_sandbox_either_confine_or_stop_startup() {
+    let setup = Setup::new().hooks(json!({"stop": [{"command": "exit 0"}]}));
+    // The default, not the `none` the other tests use.
+    let result = setup
+        .with("AGENT_HOOKS_SANDBOX", "confined")
+        .assemble()
+        .await;
+
+    match result {
+        Ok((app, _)) => {
+            let hooks = app.hooks.as_ref().expect("the hooks were started");
+            assert!(
+                hooks.sandbox().confines(),
+                "started with {:?}, which does not confine",
+                hooks.sandbox()
+            );
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            assert!(message.contains("AGENT_HOOKS_SANDBOX"), "{message}");
+        }
+    }
 }

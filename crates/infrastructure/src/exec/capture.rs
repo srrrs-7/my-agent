@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use agent_domain::error::CommandError;
 use agent_domain::ports::command::CommandOutput;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use super::process::{GuardedChild, kill_group};
@@ -64,12 +64,33 @@ use super::reaper;
 /// The caller has already configured the sandbox, working directory and
 /// environment; this only owns the mechanics.
 pub(crate) async fn run_capped(
+    command: Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<CommandOutput, CommandError> {
+    run_capped_with_input(command, None, timeout, max_output_bytes).await
+}
+
+/// [`run_capped`], with `input` written to the child's stdin and then closed.
+/// `None` gives the child no stdin at all, as a command run for the model
+/// gets.
+///
+/// The input is written alongside the reading, never before it: a child that
+/// prints before it reads would otherwise fill its pipe while we wait for it
+/// to take the input, and neither side would move. A child that exits without
+/// reading it all is not an error - what it chose to ignore is its business.
+pub(crate) async fn run_capped_with_input(
     mut command: Command,
+    input: Option<Vec<u8>>,
     timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<CommandOutput, CommandError> {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -77,6 +98,7 @@ pub(crate) async fn run_capped(
     let mut guarded = GuardedChild::spawn(command)?;
 
     let pid = guarded.child.id();
+    let stdin = guarded.child.stdin.take();
     let stdout = guarded.child.stdout.take();
     let stderr = guarded.child.stderr.take();
 
@@ -84,7 +106,11 @@ pub(crate) async fn run_capped(
     // the stdout the model is usually after.
     let half = max_output_bytes / 2;
     let capture = async {
-        let (out, err) = tokio::join!(read_capped(stdout, half), read_capped(stderr, half));
+        let (_, out, err) = tokio::join!(
+            write_input(stdin, input),
+            read_capped(stdout, half),
+            read_capped(stderr, half)
+        );
         // Before `wait`, which reaps: see "Kill, then reap" above.
         kill_group(pid);
         let found = reaper::sweep(pid.as_slice());
@@ -123,6 +149,17 @@ async fn settle(found: std::collections::HashSet<i32>) {
     // A failed join only means the wait was abandoned; everything found has
     // been signalled already.
     let _ = tokio::task::spawn_blocking(move || reaper::settle(found, reaper::SETTLE_BUDGET)).await;
+}
+
+/// Writes `input` and closes the pipe, so the child sees end of file.
+async fn write_input(stdin: Option<tokio::process::ChildStdin>, input: Option<Vec<u8>>) {
+    let (Some(mut stdin), Some(input)) = (stdin, input) else {
+        return;
+    };
+    // A broken pipe means the child stopped reading; its exit status says
+    // the rest.
+    let _ = stdin.write_all(&input).await;
+    let _ = stdin.shutdown().await;
 }
 
 /// Reads a stream, keeping at most `limit` bytes but draining the rest so the
@@ -314,6 +351,37 @@ mod tests {
             Some(libc::ESRCH),
             "gone, not merely unsignalable"
         );
+    }
+
+    #[tokio::test]
+    async fn input_reaches_the_child_and_is_closed() {
+        // `cat` stops only at end of file, so finishing at all proves the
+        // pipe was closed after the write.
+        let output = run_capped_with_input(
+            shell("cat; echo done >&2"),
+            Some(b"{\"v\":1}".to_vec()),
+            Duration::from_secs(10),
+            4096,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.stdout, "{\"v\":1}");
+        assert_eq!(output.stderr.trim(), "done");
+    }
+
+    #[tokio::test]
+    async fn a_child_that_ignores_a_large_input_still_finishes() {
+        // Larger than a pipe buffer: the write cannot complete, and must not
+        // hold the capture open once the child has gone.
+        let output = run_capped_with_input(
+            shell("exit 4"),
+            Some(vec![b'x'; 1024 * 1024]),
+            Duration::from_secs(10),
+            4096,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, Some(4), "{output:?}");
     }
 
     #[tokio::test]

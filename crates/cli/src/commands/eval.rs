@@ -585,6 +585,10 @@ async fn attempt_in(
         _ => None,
     };
 
+    // A hook is told the session its call belongs to, as in `run`.
+    if let Some(hooks) = &app.hooks {
+        hooks.begin_turn(&session.id);
+    }
     let started = Instant::now();
     let result = app
         .agent

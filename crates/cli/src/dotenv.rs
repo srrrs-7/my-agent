@@ -35,6 +35,10 @@ pub const DENIED: &[&str] = &[
     // Start programs outside the model's tools.
     "AGENT_MCP_CONFIG",
     "AGENT_MCP_SANDBOX",
+    // Programs run around every tool call, and how loosely - a hook can also
+    // refuse calls, which a planted file would decide.
+    "AGENT_HOOKS",
+    "AGENT_HOOKS_SANDBOX",
     // Run commands, and how loosely.
     "AGENT_SHELL",
     "AGENT_SHELL_SANDBOX",
@@ -310,6 +314,8 @@ mod tests {
         for key in [
             "AGENT_MCP_CONFIG",
             "AGENT_MCP_SANDBOX",
+            "AGENT_HOOKS",
+            "AGENT_HOOKS_SANDBOX",
             "AGENT_SHELL",
             "AGENT_SHELL_SANDBOX",
             "AGENT_SHELL_NETWORK_ALLOW",

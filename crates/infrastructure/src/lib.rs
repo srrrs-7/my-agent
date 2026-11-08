@@ -10,6 +10,7 @@
 pub mod config;
 pub mod exec;
 pub mod fs;
+pub mod hooks;
 pub mod llm;
 pub mod mcp;
 pub(crate) mod net;

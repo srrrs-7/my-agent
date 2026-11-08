@@ -48,6 +48,7 @@ use agent_infrastructure::config::{
 use agent_infrastructure::exec::background::BackgroundSupervisor;
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
+use agent_infrastructure::hooks::{HookGate, HookedTool, Hooks, HooksConfig};
 use agent_infrastructure::llm::build_provider;
 use agent_infrastructure::mcp::{McpConfig, McpServer, start_servers};
 use agent_infrastructure::notify::{NtfyRemoteApprover, WebhookNotifier};
@@ -100,8 +101,14 @@ pub struct Application {
     /// The switch `/plan-mode` flips; the outermost approval gate reads it.
     pub plan_mode: PlanMode,
     /// The whole approval stack the loop asks, outermost first:
-    /// `PlanModeGate(RuleGate(CliApprovalGate))` (see `approval_stack`).
+    /// `PlanModeGate(HookGate(RuleGate(CliApprovalGate)))`, the hook layer
+    /// only when hooks are configured (see `approval_stack`).
     pub approval: Arc<dyn ApprovalGate>,
+    /// The operator's hooks (`AGENT_HOOKS`), when configured. The gate and
+    /// the post-hook wrapping hold them too; a turn is begun and ended
+    /// through this handle, because only the subcommand knows the session
+    /// and when a turn is over.
+    pub hooks: Option<Arc<Hooks>>,
     /// The tools' file system, for `@path` references in `chat`: what the
     /// user attaches is read under the same rules as what the model reads.
     pub files: Arc<dyn FileSystem>,
@@ -322,6 +329,9 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         None
     };
     let background = register_background(&mut tools, commands.as_ref(), &settings, &events)?;
+    // Before the tool servers start, so a hooks file that cannot be used
+    // costs no server startup.
+    let hooks = start_hooks(&settings, workspace.as_path(), &withheld, &redactor)?;
 
     // Last of the registrations, so a server tool whose name collides with
     // any tool above is refused. Before the wrapping below, so server tools
@@ -335,6 +345,15 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     )
     .await?;
 
+    // After every tool is registered, so a `match` naming a server tool is
+    // known. Inside the checkpoint and the dependency watch, so what a post
+    // hook does to the workspace (a formatter's rewrite) is part of the call
+    // they record and compare; outside the timeout, which bounds the tool
+    // and not the hooks, each of which has its own.
+    let tools = match &hooks {
+        Some(hooks) => observe_tools(tools, hooks)?,
+        None => tools,
+    };
     // After every tool is registered, so no command or server tool is
     // missing from what `/undo` says it did not take back.
     let tools = checkpoint_writes(tools, &checkpoints);
@@ -348,7 +367,14 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     // After the last decorator, so a rule previews a write through exactly
     // the tools the dispatcher runs.
     let plan_mode = PlanMode::new();
-    let approval = approval_stack(asks, permissions, &tools, &workspace, &plan_mode)?;
+    let approval = approval_stack(
+        asks,
+        permissions,
+        &tools,
+        &workspace,
+        &plan_mode,
+        hooks.as_ref(),
+    )?;
 
     // --- the loop ------------------------------------------------------------
     // Disabled means `NullConversationLog`, not a flag the loop checks: there
@@ -415,26 +441,79 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         plan_mode,
         approval,
         files,
+        hooks,
     })
 }
 
 /// The approval gates, outermost first: plan mode refuses before anything
-/// else is consulted, then the operator's hooks (not built yet; they go
-/// between the two), then the operator's rules decide whether `asks` - the
-/// gate that puts the question to a human - is consulted at all. Every
-/// layer forwards the dependency question to `asks` untouched.
+/// else is consulted, then the operator's hooks may refuse (never approve),
+/// then the operator's rules decide whether `asks` - the gate that puts the
+/// question to a human - is consulted at all. Every layer forwards the
+/// dependency question to `asks` untouched.
 fn approval_stack(
     asks: Arc<dyn ApprovalGate>,
     permissions: PermissionRules,
     tools: &Arc<ToolRegistry>,
     workspace: &Arc<WorkspaceRoot>,
     plan_mode: &PlanMode,
+    hooks: Option<&Arc<Hooks>>,
 ) -> Result<Arc<dyn ApprovalGate>> {
     let rules: Arc<dyn ApprovalGate> = Arc::new(
         RuleGate::new(asks, permissions, tools.clone(), workspace.clone())
             .context("AGENT_PERMISSIONS cannot be used. Fix the rule, or unset the variable")?,
     );
-    Ok(Arc::new(PlanModeGate::new(rules, plan_mode.clone())))
+    let hooked: Arc<dyn ApprovalGate> = match hooks {
+        Some(hooks) => Arc::new(HookGate::new(rules, hooks.clone())),
+        None => rules,
+    };
+    Ok(Arc::new(PlanModeGate::new(hooked, plan_mode.clone())))
+}
+
+/// The operator's hooks, when `AGENT_HOOKS` names a file. Read against the
+/// canonical workspace - neither the file nor what its commands name may be
+/// inside it - and started under the sandbox `AGENT_HOOKS_SANDBOX` asks for,
+/// or not at all: a hook the operator configured running with less
+/// confinement than they asked for, or not running, is worse than an agent
+/// that does not start.
+fn start_hooks(
+    settings: &Settings,
+    workspace: &std::path::Path,
+    withheld: &[String],
+    redactor: &Arc<Redactor>,
+) -> Result<Option<Arc<Hooks>>> {
+    let Some(path) = &settings.hooks.config else {
+        return Ok(None);
+    };
+    let config = HooksConfig::load(path, workspace)
+        .context("AGENT_HOOKS cannot be used. Fix the file, or unset the variable")?;
+    let hooks = Hooks::start(
+        config,
+        settings.hooks.sandbox,
+        workspace,
+        withheld.to_vec(),
+        redactor.clone(),
+    )
+    .context(
+        "cannot run hooks under the sandbox AGENT_HOOKS_SANDBOX asks for. Either use a platform \
+         that supports it (Linux 6.7+ for Landlock), or unset AGENT_HOOKS. \
+         AGENT_HOOKS_SANDBOX=none disables the sandbox for hooks and is only safe in a \
+         container you already treat as disposable.",
+    )?;
+    Ok(Some(Arc::new(hooks)))
+}
+
+/// Every tool a post hook is about, wrapped so the hooks see its result -
+/// after refusing a `match` that names no registered tool, which would be a
+/// hook that never runs.
+fn observe_tools(tools: ToolRegistry, hooks: &Arc<Hooks>) -> Result<ToolRegistry> {
+    let unknown = hooks.config().unknown_tools(&tools.names());
+    anyhow::ensure!(
+        unknown.is_empty(),
+        "AGENT_HOOKS names tools that are not offered: {}. Fix the `match`, use `*` for every \
+         tool, or enable the tool (`agent tools` lists what is offered)",
+        unknown.join(", ")
+    );
+    Ok(tools.map(|_, tool| HookedTool::wrap(tool, hooks)))
 }
 
 /// The domains `tool`'s `deny` rules name, for an adapter that enforces them

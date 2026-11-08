@@ -51,12 +51,12 @@
 |---|---|---|
 | `LlmProvider` | `OpenAiCompatibleProvider`, `AnthropicProvider`, `RoutingProvider`, `RetryingProvider`, `FailoverProvider` | チャット補完 |
 | `LlmRouter` | `StaticRouter`, `ModelPrefixRouter`, `TaskKindRouter` | 委譲先の選択 |
-| `Tool` | `ReadFileTool` ほか（application）, `TimeoutTool`・`RedactingTool`・`DependencyWatchTool`（装飾） | モデルに公開する能力。`preview` で書き込み予定を返す（§3.6.2） |
+| `Tool` | `ReadFileTool` ほか（application）, `TimeoutTool`・`RedactingTool`・`DependencyWatchTool`・`HookedTool`（装飾） | モデルに公開する能力。`preview` で書き込み予定を返す（§3.6.2） |
 | `FileSystem` | `LocalFileSystem` | サンドボックス化された I/O |
 | `FileSearcher` | `IgnoreAwareSearcher` | `.gitignore` 準拠の内容検索 |
 | `ContextProvider` | `WorkspaceContextProvider` | 環境情報とプロジェクト指示の収集 |
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`, `AppendingPromptBuilder` | システムプロンプトの組み立て方針（既定・差し替え・追記） |
-| `ApprovalGate` | `CliApprovalGate`, `PlanModeGate`・`RuleGate`（装飾、application） | human-in-the-loop。依存の変更は `authorize_dependency_change` で別に問う（§3.6.2）。積み順は外から `PlanModeGate(HookGate(RuleGate(CliApprovalGate)))`（`HookGate` は未実装）で、装飾はどれも依存の問いを内側へそのまま渡す |
+| `ApprovalGate` | `CliApprovalGate`, `PlanModeGate`・`RuleGate`（装飾、application）, `HookGate`（装飾、infrastructure） | human-in-the-loop。依存の変更は `authorize_dependency_change` で別に問う（§3.6.2）。積み順は外から `PlanModeGate(HookGate(RuleGate(CliApprovalGate)))`（`HookGate` は `AGENT_HOOKS` があるときだけ）で、装飾はどれも依存の問いを内側へそのまま渡す |
 | `WebFetcher` | `GuardedWebFetcher` | 外向き HTTP（SSRF ガード・許可リスト・サイズ上限） |
 | `CommandRunner` | `SandboxedCommandRunner` | 子プロセス実行（OS レベルの封じ込め・egress 許可リスト） |
 | `ToolServer` | `McpServer` | 長寿命のツールサーバ（MCP over stdio）。サーバは封じ込めの中で動き、ツール一覧は起動時に固定（§3.2.4） |
@@ -432,10 +432,12 @@ domain の値オブジェクト `Plan` が持ち、違反は直さず拒否し�
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/checkpoint_e2e.rs`） | `/undo` でファイルが戻る・手で編集されたファイルは上書きしない・`/rewind` 後の `--resume` で巻き戻した後の会話から始まる |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/interrupt_e2e.rs`） | SIGINT で `run` が 130、`chat` はターンだけ止まりプロンプトに戻る、プロンプト待ちの Ctrl-C は 0 |
 | infrastructure（実プロセス） | `/bin/sh` 製の MCP サーバ（`crates/infrastructure/tests/mcp_sandbox.rs`） | 既定でワークスペースに書けない・自分のディレクトリには書ける・許可外へ接続できない・drop で孫まで止まる・initialize 失敗で起動失敗 |
+| infrastructure（実プロセス） | `/bin/sh` 製のフック（`crates/infrastructure/tests/hooks.rs`） | 前フックの 0 以外・タイムアウト・起動失敗で拒否、0 でも承認しない、`match` の照合、依存の確認は内側へ、stdin の JSON、後フックは結果を変えず伏せ字済みの出力を受け取る、停止時フック、ワークスペース外に書けない（対照付き） |
+| 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/hooks_e2e.rs`） | `run` のターン終了で停止時フックが走り、終わり方を受け取る |
 | 全体（実バイナリ） | 子プロセス E2E（`crates/cli/tests/mcp_e2e.rs`） | MCP ツールの登録と `destructive` 分類、伏せ字・タイムアウト・依存の検知・承認の各装飾、終了時に孫が残らない、設定の位置による起動失敗 |
 
 モックサーバは `crates/test-support` に置いて infrastructure と cli の
 両テストスイートで共有しています（HTTP フレームワークを足さずに済ませるため、
 実装は生 TCP の約 60 行です）。
 
-外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 1128 本）。
+外部依存はゼロなので、`make test` はネットワークもモデルも要りません（計 1162 本）。

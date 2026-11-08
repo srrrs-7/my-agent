@@ -260,6 +260,51 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 ディレクトリをたどるツール（`search_files` / `glob` / `list_directory`）は**起点のパス**だけで照合します。
 中身を読ませたくないファイルは、ルールではなく `AGENT_DENY_READ`（§5）で守ってください。
 
+### フック（`AGENT_HOOKS`）
+
+ツール呼び出しの前後とターンの終わりに、運用者のコマンドを走らせます。**既定で無効**です。
+`AGENT_HOOKS` に JSON の**絶対パス**を実環境変数で渡し（`.env` からは設定できない）、
+ファイルがワークスペース内（シンボリックリンクの先を含む）なら起動失敗です。
+
+```json
+{
+  "pre_tool_use":  [{ "match": "run_command", "command": "/opt/hooks/check-command.sh", "timeout_secs": 5 }],
+  "post_tool_use": [{ "match": "write_file",  "command": "prettier --write \"$(jq -r .arguments.path)\"" }],
+  "stop":          [{ "command": "/opt/hooks/turn-done.sh" }]
+}
+```
+
+| イベント | いつ | できること |
+|---|---|---|
+| `pre_tool_use` | 承認の前（プランモードの後、権限ルールと確認プロンプトの前） | **拒否だけ**。0 以外の終了（失敗・タイムアウト・起動できない場合を含む）で呼び出しを拒否し、stderr の先頭（最大 1 KiB、伏せ字済み）が理由としてモデルに返る。0 で終了しても承認にはならず、通常の承認（ルール・確認）に進む |
+| `post_tool_use` | ツールの実行後 | **観測だけ**。モデルに返る結果は変わらない。失敗は stderr に警告 1 行 |
+| `stop` | ターンの終了時（`run` / `chat`） | 観測だけ。続行させる機能はない。失敗は警告 1 行 |
+
+- `match` はツール名か `*`。存在しないツール名は起動エラー（効かないフックを黙って抱えないため）
+- `command` は `/bin/sh -c` で、**ワークスペースを作業ディレクトリ**として実行する。
+  コマンドがワークスペース内のファイルを指す語（絶対・相対どちらも）を含むと起動エラー
+  （リポジトリやモデルが書き換えられるスクリプトを走らせないため。`$(cat ...)` などの間接参照は見抜けない）
+- `timeout_secs` は 1〜600（既定 30）。各フックはこの時間で子孫ごと止める
+- 依存ファイルの変更確認（§5）はフックでは答えない。必ず確認プロンプト側に届く
+- 項目の綴り間違い・未知の項目（`stop` に `match` を書く、など）は起動エラー
+
+stdin には 1 行の JSON が届きます（`"v": 1`）。
+
+```json
+{"v":1,"event":"pre_tool_use","session_id":"…","tool":"run_command","safety":"destructive","call_id":"call_1","arguments":{"command":"cargo test"}}
+{"v":1,"event":"post_tool_use", …上と同じ…, "is_error":false,"output":"…"}
+{"v":1,"event":"stop","session_id":"…","reason":"completed"}
+```
+
+`output` は秘密の値を伏せ字にしてから 64 KiB で切り詰めます。`reason` は
+`completed` / `max_iterations` / `stopped` / `interrupted` / `error` のいずれかです。
+
+**フックは既定でサンドボックス内で動きます**（`run_command` と同じ機構。§5）。書き込めるのは
+**ワークスペース**とフック専用の一時ディレクトリだけで、**ネットワークには出られません**。
+ワークスペースを書けるのは、`post_tool_use` で整形ツール（prettier など）を走らせる用途のためです。
+秘密らしい環境変数は渡しません。要求した封じ込めが得られない環境（macOS など）では起動に失敗します。
+`AGENT_HOOKS_SANDBOX=none` で外せますが、使い捨てのコンテナ内に限ってください。
+
 ### モデルの切り替えと文脈の確認（`/model` `/compact` `/context`）
 
 | コマンド | 何をするか |
@@ -1315,7 +1360,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 1128 本、外部ネットワークもモデルも不要です。
+テストは 1162 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -1348,6 +1393,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | 変数 | 理由 |
 |---|---|
 | `AGENT_MCP_CONFIG`, `AGENT_MCP_SANDBOX` | 任意のプログラムを起動できる |
+| `AGENT_HOOKS`, `AGENT_HOOKS_SANDBOX` | ツール呼び出しのたびに任意のコマンドを走らせる・呼び出しを拒否できる・その封じ込めを緩める |
 | `AGENT_SHELL`, `AGENT_SHELL_SANDBOX`, `AGENT_SHELL_NETWORK_ALLOW`, `AGENT_SHELL_WRITABLE` | コマンド実行を有効にする・封じ込めを緩める |
 | `AGENT_SHELL_BACKGROUND`, `AGENT_SHELL_BACKGROUND_MAX_JOBS`, `AGENT_SHELL_BACKGROUND_LIFETIME_SECS` | 呼び出しの後も動き続けるコマンドを有効にする・その数と寿命を広げる |
 | `AGENT_APPROVAL`, `AGENT_ALLOW_DEPENDENCY_CHANGES`, `AGENT_PERMISSIONS` | 人間の承認を省く |
@@ -1455,6 +1501,8 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_SHELL_BACKGROUND_BUFFER_BYTES` | `262144` | ジョブごとに保持する出力のバイト数（末尾を保持し、捨てた量を報告）。0 は不可 |
 | `AGENT_MCP_CONFIG` | —（**無効**） | MCP サーバの設定ファイル（JSON、**絶対パス**、ワークスペース外）。§5 参照。ワークスペース内なら起動失敗 |
 | `AGENT_MCP_SANDBOX` | `confined` | MCP サーバに必須とする封じ込め。`confined` \| `isolated`（`AGENT_SHELL_SANDBOX` と同じ意味）。**`none` は指定できない**（`AGENT_SHELL_SANDBOX` とは独立） |
+| `AGENT_HOOKS` | —（**無効**） | フックの設定ファイル（JSON、**絶対パス**、ワークスペース外）。§3「フック」参照。ワークスペース内・未知の項目・存在しないツール名・ワークスペース内のファイルを指すコマンドは起動失敗 |
+| `AGENT_HOOKS_SANDBOX` | `confined` | フックに必須とする封じ込め。`confined` \| `isolated` \| `none`（`AGENT_SHELL_SANDBOX` と同じ意味）。得られなければ起動失敗 |
 | `AGENT_PERMISSIONS` | —（ルールなし） | 権限ルールの JSON（**絶対パス**、ワークスペース外）。§3「権限ルール」参照。ワークスペース内・解釈できないルール・`run_command` の `allow` は起動失敗 |
 | `AGENT_PARALLEL_READ_TOOLS` | `true` | 読み取り系ツールの並列実行 |
 

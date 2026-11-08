@@ -38,7 +38,7 @@
 | `FileSearcher` | `IgnoreAwareSearcher` |
 | `ContextProvider` | `WorkspaceContextProvider` |
 | `PromptBuilder` | `DefaultPromptBuilder`, `FixedPromptBuilder`（差し替え）, `AppendingPromptBuilder`（追記・装飾） |
-| `ApprovalGate` | `CliApprovalGate`（`authorize_dependency_change` は既定で拒否）。装飾子 `PlanModeGate` / `RuleGate`（application。積み順 PlanMode → (Hook) → Rule → Cli、依存承認は必ず内側へ転送） |
+| `ApprovalGate` | `CliApprovalGate`（`authorize_dependency_change` は既定で拒否）。装飾子 `PlanModeGate` / `RuleGate`（application）・`HookGate`（infrastructure、前フック）。積み順 PlanMode → Hook → Rule → Cli、依存承認は必ず内側へ転送。拒否理由は「誰が」拒否したかを含める（ディスパッチャの文面は中立） |
 | `BackgroundCommands` | `BackgroundSupervisor`（`run_command` と同じ封じ込め・寿命と出力の上限・drop で全ジョブ停止） |
 | `WebFetcher` | `GuardedWebFetcher`（SSRF ガード付き・既定無効） |
 | `CommandRunner` | `SandboxedCommandRunner`（Linux: Landlock + egress プロキシ・既定無効） |

@@ -385,6 +385,47 @@ impl McpSettings {
     }
 }
 
+/// The operator's hooks: commands run before a tool call is approved, after
+/// it ran, and when a turn ends.
+///
+/// Off unless `config` is set. Like the MCP configuration, the file is the
+/// operator's: an absolute path from the real environment (never `.env`),
+/// refused when it lives inside the workspace - a hook can refuse calls, so a
+/// file the repository or the model could write would decide what the agent
+/// may do.
+///
+/// `sandbox` defaults to confinement, and a platform that cannot provide it
+/// fails startup. `none` is allowed, as for `run_command`: the operator wrote
+/// the commands, and turning confinement off for them is a deliberate act.
+#[derive(Debug, Clone, Default)]
+pub struct HookSettings {
+    /// Absolute path of the JSON file listing the hooks.
+    pub config: Option<PathBuf>,
+    pub sandbox: SandboxRequirement,
+}
+
+const HOOKS_KEY: &str = "AGENT_HOOKS";
+const HOOKS_SANDBOX_KEY: &str = "AGENT_HOOKS_SANDBOX";
+
+impl HookSettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        let config = match reader.string(HOOKS_KEY) {
+            None => None,
+            Some(raw) if Path::new(&raw).is_absolute() => Some(PathBuf::from(raw)),
+            Some(raw) => {
+                return Err(ConfigError::invalid(
+                    HOOKS_KEY,
+                    raw,
+                    "must be an absolute path outside the workspace (`~` is not expanded), e.g. \
+                     /home/me/.config/agent/hooks.json",
+                ));
+            }
+        };
+        let sandbox = reader.parsed(HOOKS_SANDBOX_KEY, SandboxRequirement::default())?;
+        Ok(Self { config, sandbox })
+    }
+}
+
 /// What a session leaves on disk.
 ///
 /// Off is a real option and not a formality: the log holds the conversation
@@ -654,6 +695,7 @@ pub struct Settings {
     pub web_search: WebSearchSettings,
     pub shell: ShellSettings,
     pub mcp: McpSettings,
+    pub hooks: HookSettings,
     /// `AGENT_PERMISSIONS`: the absolute path of the operator's permission
     /// rules, read at startup (see [`load_permissions`]). `None`: no rules,
     /// the approval policy alone decides.
@@ -721,6 +763,7 @@ impl Settings {
                 background: BackgroundSettings::read(&reader)?,
             },
             mcp: McpSettings::read(&reader)?,
+            hooks: HookSettings::read(&reader)?,
             permissions: permissions::read_permissions_path(&reader)?,
             notify: NotifySettings::read(&reader)?,
             access: AccessSettings::read(&reader)?,
@@ -1035,6 +1078,26 @@ mod tests {
         assert_eq!(
             settings.permissions,
             Some(PathBuf::from("/etc/agent/permissions.json"))
+        );
+    }
+
+    #[test]
+    fn hooks_are_off_by_default_and_confined_when_on() {
+        let defaults = settings(&[("AGENT_MODEL", "m")]).unwrap();
+        assert_eq!(defaults.hooks.config, None);
+        assert_eq!(defaults.hooks.sandbox, SandboxRequirement::Confined);
+
+        let error = settings(&[("AGENT_MODEL", "m"), ("AGENT_HOOKS", "hooks.json")]).unwrap_err();
+        assert!(error.to_string().contains("AGENT_HOOKS"), "{error}");
+
+        let configured = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_HOOKS", "/etc/agent/hooks.json"),
+        ])
+        .unwrap();
+        assert_eq!(
+            configured.hooks.config,
+            Some(PathBuf::from("/etc/agent/hooks.json"))
         );
     }
 

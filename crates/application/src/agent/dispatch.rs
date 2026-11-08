@@ -228,7 +228,9 @@ impl ToolDispatcher {
             Ok(ApprovalDecision::Approve) => Disposition::Run { tool, safety },
             Ok(ApprovalDecision::Deny { reason }) => {
                 let message = format!(
-                    "The user declined this tool call: {reason}. \
+                    // The reason names who declined - the user, a permission
+                    // rule, a hook, plan mode - so the wording does not.
+                    "This tool call was declined: {reason}. \
                      Do not retry it - propose a different approach or ask how to proceed."
                 );
                 Disposition::Short(self.denied(call, reason, message))
