@@ -1000,7 +1000,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 875 本、外部ネットワークもモデルも不要です。
+テストは 882 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -1038,11 +1038,30 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_WEB_FETCH`, `AGENT_WEB_FETCH_ALLOW`, `AGENT_WEB_FETCH_ALLOW_PRIVATE`, `AGENT_NOTIFY_WEBHOOK_URL` | 外部へ送る経路を開く |
 | `AGENT_GLOBAL_INSTRUCTIONS`, `AGENT_SYSTEM_PROMPT_FILE`, `AGENT_APPEND_SYSTEM_PROMPT` | モデルへの指示を差し替える |
 | `AGENT_WORKSPACE` | ファイルツールの届く範囲を変える |
+| `AGENT_SESSION_DIR` | 会話の原文（モデルが読んだファイルの中身を含む）の書き出し先と、保持期間による削除の対象を変える |
 | `PATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `DYLD_*`（3 種）, `BASH_ENV`, `ENV`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`（大文字小文字を問わない） | 起動する子プロセスと HTTPS 通信（API キーを含む）の行き先を変える |
 
 理由は、**リポジトリに同梱された `.env` による権限昇格を防ぐため**です。他人のリポジトリを clone して
 その中で `agent` を起動しただけで、そこに置かれた `.env` が MCP サーバを起動したり、承認を `auto` に
-したりできてはいけません。上の表にない変数（接続先・モデル・ループの設定など）は従来どおり `.env` に書けます。
+したりできてはいけません。上の表にない変数（ループの設定など）は従来どおり `.env` に書けます。
+
+**接続先は、API キーと同じ所からだけ読みます。** 実環境変数に API キーが 1 つでもあるとき、
+`.env` の次の変数は無視し、名前を 1 行の警告で stderr に出します。
+
+| 種別 | 変数 |
+|---|---|
+| API キー（実環境にあるかを見る） | `AGENT_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AGENT_PROVIDER_<ALIAS>_API_KEY`（空の値は数えない） |
+| 接続先（無視されるもの） | `AGENT_PROVIDER`, `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_OPENAI_MAX_TOKENS_FIELD`, `AGENT_PROVIDERS`, `AGENT_DEFAULT_PROVIDER`, `AGENT_PROVIDER_*`（すべて）, `AGENT_ROUTER`, `AGENT_ROUTE_*`, `AGENT_FAILOVER*`（大文字小文字を問わない） |
+
+理由は、**他人のリポジトリの `.env` に自分の API キーの送り先を決めさせないため**です。キーを
+`export` しておき接続先は既定のまま使っているところへ、同梱の `.env` が `AGENT_BASE_URL` や
+新しい別名（`AGENT_PROVIDERS` + `AGENT_PROVIDER_<ALIAS>_BASE_URL`。`openai` / `anthropic` の別名は
+`OPENAI_API_KEY` / `ANTHROPIC_API_KEY` を読む）を書けば、最初のリクエストでキーがそのホストへ送られます。
+モデル名は送り先を変えませんが、同じプロバイダ設定の組なので揃えて扱います。
+
+キーも `.env` に書いている場合（`make setup` の想定する使い方）は、接続先も含めてすべて従来どおり効きます。
+キーを実環境に置き、接続先を `.env` に書いていた場合は、接続先も実環境へ移してください
+（あるいはキーも `.env` に書く）。
 
 ### 接続先
 

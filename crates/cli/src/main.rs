@@ -74,7 +74,18 @@ fn load_dotenv() {
         return;
     };
     let entries = entries.map_while(Result::ok);
-    let applied = dotenv::apply(entries, |key| std::env::var_os(key).is_some());
+    // A variable that is not valid UTF-8 is unreadable to the settings too,
+    // so it holds no key that could be sent anywhere.
+    let real_credential = dotenv::holds_credential(
+        std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
+    );
+    let applied = dotenv::apply(
+        entries,
+        |key| std::env::var_os(key).is_some(),
+        real_credential,
+    );
+    let warnings = dotenv::warnings(&applied);
     for (key, value) in applied.set {
         // SAFETY: called first thing in `main`, before the runtime or any
         // other thread exists, so nothing can be reading the environment
@@ -82,7 +93,7 @@ fn load_dotenv() {
         // made the same call from the same place.
         unsafe { std::env::set_var(key, value) };
     }
-    if let Some(warning) = dotenv::warning(&applied.ignored) {
+    for warning in warnings {
         eprintln!("{warning}");
     }
 }

@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: medium
 importance: xhigh
 priority: P1
+started: 2026-11-08
+completed: 2026-11-08
 scope: [cli, infrastructure, docs]
 ---
 
@@ -51,17 +53,17 @@ scope: [cli, infrastructure, docs]
 
 ## 達成条件
 
-- [ ] 方針（下のメモの 3 案から 1 つ、または組み合わせ）を決め、理由をメモに残す
-- [ ] 実環境にだけ API キーがあり、`.env` に `AGENT_BASE_URL` があるとき、その URL へ
+- [x] 方針（下のメモの 3 案から 1 つ、または組み合わせ）を決め、理由をメモに残す
+- [x] 実環境にだけ API キーがあり、`.env` に `AGENT_BASE_URL` があるとき、その URL へ
       キーが送られないことを `dotenv.rs` の単体テストで固定する
-- [ ] 同じことを別名プロバイダ（`AGENT_PROVIDER_<ALIAS>_BASE_URL`）でも固定する。
+- [x] 同じことを別名プロバイダ（`AGENT_PROVIDER_<ALIAS>_BASE_URL`）でも固定する。
       `.env` が新しい別名（`_KIND` / `_BASE_URL` / ルート）を定義して、実環境のキーを持つ
       既存プロバイダの宛先を差し替えられないことも含む
-- [ ] `.env` に接続先とキーを両方書く従来の使い方が動き続けることを固定する
-- [ ] 無視した場合に警告が出る
-- [ ] `AGENT_SESSION_DIR` の扱いを決め、決めた内容がテストか README に残っている
-- [ ] README §8 が実装と一致している
-- [ ] `make check` が緑
+- [x] `.env` に接続先とキーを両方書く従来の使い方が動き続けることを固定する
+- [x] 無視した場合に警告が出る
+- [x] `AGENT_SESSION_DIR` の扱いを決め、決めた内容がテストか README に残っている
+- [x] README §8 が実装と一致している
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -86,3 +88,13 @@ scope: [cli, infrastructure, docs]
 - 関連: `done/2026-11-08_secret-file-protection.md`（モデルによる `.env` の書き換えは既に拒否。
   本 issue はリポジトリに最初から置かれた `.env` の話）
 - 出典: 2026-11-08 のレビュー（security）で見送ったもの
+- **決定（2026-11-08, root）: 案 1 を採用。** 実環境に資格情報（`AGENT_API_KEY` / `OPENAI_API_KEY` /
+  `ANTHROPIC_API_KEY` / `AGENT_PROVIDER_*_API_KEY`、空値は数えない）が 1 つでもあるとき、`.env` の
+  接続先キー（`AGENT_PROVIDER` / `AGENT_BASE_URL` / `AGENT_MODEL` / `AGENT_OPENAI_MAX_TOKENS_FIELD` /
+  `AGENT_PROVIDERS` / `AGENT_DEFAULT_PROVIDER` / `AGENT_PROVIDER_*` / `AGENT_ROUTER` / `AGENT_ROUTE_*` /
+  `AGENT_FAILOVER*`）をすべて無視し、警告に名前を出す。案 2 と違いプロバイダの組の知識を cli に
+  持ち込まず、別名の新設（`AGENT_PROVIDERS` + vendor キーのフォールバック）も同じ規則で塞がる。
+  `AGENT_MODEL` は単独では送り先を変えないが、同じプロバイダ設定の組なので一貫性を優先した。
+  `AGENT_SESSION_DIR` は `DENIED` に追加（保持期間による削除をワークスペース外へ及ぼせるため）。
+  実装は `crates/cli/src/dotenv.rs`（`is_credential` / `is_connection` / `holds_credential` / `apply`）、
+  実バイナリでの確認は `crates/cli/tests/dotenv_e2e.rs`（モックサーバ 2 台）。
