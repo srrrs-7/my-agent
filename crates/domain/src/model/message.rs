@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::image::Image;
 use super::tool::{ToolCall, ToolResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -28,6 +29,14 @@ pub enum ContentBlock {
     },
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    /// An image the user attached to their message. Only user messages carry
+    /// one: tool results are text (an image read by the model itself is not
+    /// supported yet).
+    ///
+    /// Not text: [`Message::text`] skips it. Where only text can go - a
+    /// terminal, a compaction transcript, a provider without vision - it
+    /// appears as its [`Display`](std::fmt::Display) form, `[image: 12 KB png]`.
+    Image(Image),
     /// Something a provider put in an assistant turn that this program does
     /// not interpret but must hand back, byte for byte, on later requests of
     /// the same conversation - Anthropic's `thinking` and `redacted_thinking`
@@ -57,6 +66,8 @@ impl ContentBlock {
             Self::Text { text } => text.len(),
             Self::ToolCall(call) => call.name.as_str().len() + call.arguments.to_string().len(),
             Self::ToolResult(result) => result.content.len(),
+            // Nominal, not the encoded length: see `model::image`.
+            Self::Image(_) => Image::NOMINAL_BYTES,
             Self::Opaque { data, .. } => data.to_string().len(),
         }
     }
@@ -93,6 +104,14 @@ impl Message {
 
     pub fn user(text: impl Into<String>) -> Self {
         Self::new(Role::User, vec![ContentBlock::text(text)])
+    }
+
+    /// A user message of `text` followed by `images`. With no images it is
+    /// exactly [`Self::user`].
+    pub fn user_with_images(text: impl Into<String>, images: Vec<Image>) -> Self {
+        let mut content = vec![ContentBlock::text(text)];
+        content.extend(images.into_iter().map(ContentBlock::Image));
+        Self::new(Role::User, content)
     }
 
     pub fn assistant_text(text: impl Into<String>) -> Self {
@@ -195,6 +214,37 @@ mod tests {
         assert_eq!(restored, message);
         assert_eq!(restored.text(), "done");
         assert!(message.approx_bytes() > data.to_string().len());
+    }
+
+    #[test]
+    fn an_image_is_not_text_and_weighs_a_fixed_nominal_amount() {
+        let mut big = crate::model::image::tests::TINY_PNG.to_vec();
+        big.resize(2 * 1024 * 1024, 0);
+        let message = Message::user_with_images("look", vec![Image::from_bytes(big).unwrap()]);
+
+        assert_eq!(message.text(), "look");
+        assert_eq!(
+            message.approx_bytes(),
+            "look".len() + Image::NOMINAL_BYTES + 16,
+            "a 2 MiB image must not count as 2.7 MB of base64 against the history budget"
+        );
+    }
+
+    /// The session log keeps the image itself, so a resumed conversation
+    /// sends the model the same picture.
+    #[test]
+    fn an_image_round_trips_through_the_session_log_format() {
+        let image = Image::from_bytes(crate::model::image::tests::TINY_PNG.to_vec()).unwrap();
+        let message = Message::user_with_images("look", vec![image.clone()]).with_seq(3);
+
+        let line = serde_json::to_string(&message).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["content"][1]["type"], "image");
+        assert_eq!(value["content"][1]["media_type"], "image/png");
+        assert_eq!(value["content"][1]["data"], image.to_base64());
+
+        let restored: Message = serde_json::from_str(&line).unwrap();
+        assert_eq!(restored, message);
     }
 
     /// A history written before sequence numbers existed must still load, and

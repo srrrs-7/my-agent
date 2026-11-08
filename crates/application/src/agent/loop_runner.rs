@@ -49,6 +49,7 @@ use super::compaction::{CompactionConfig, CompactionReport, HistoryCompactor, Ma
 use super::config::AgentLoopConfig;
 use super::context_report::{ContextReport, PlanNote, definition_bytes};
 use super::dispatch::{DispatchConfig, ToolDispatcher};
+use super::input::UserInput;
 use super::interrupt::Interrupt;
 use super::plan;
 use super::session::Session;
@@ -227,7 +228,7 @@ impl AgentLoop {
     pub async fn run(
         &self,
         session: &mut Session,
-        user_input: impl Into<String>,
+        user_input: impl Into<UserInput>,
     ) -> Result<AgentOutcome, AppError> {
         self.run_until(session, user_input, &Interrupt::new()).await
     }
@@ -243,7 +244,7 @@ impl AgentLoop {
     pub async fn run_until(
         &self,
         session: &mut Session,
-        user_input: impl Into<String>,
+        user_input: impl Into<UserInput>,
         interrupt: &Interrupt,
     ) -> Result<AgentOutcome, AppError> {
         let tools = self.advertised_tools();
@@ -252,8 +253,11 @@ impl AgentLoop {
         // smallest thing that can be called a run.
         let limit = self.config.max_iterations.max(1);
 
-        let user_input = session.with_notes(user_input.into());
-        session.conversation.push(Message::user(user_input));
+        let UserInput { text, images } = user_input.into();
+        let text = session.with_notes(text);
+        session
+            .conversation
+            .push(Message::user_with_images(text, images));
         self.record(session, 1).await;
         if let (Some(journal), Some(seq)) = (
             &self.checkpoints,

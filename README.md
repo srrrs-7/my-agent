@@ -173,10 +173,36 @@ make run ARGS="-v run 'hi'"    # 任意の引数で CLI を実行
 
 読めない参照は本文にそのまま残し、理由を stderr に 1 行ずつ出してターンはそのまま実行します。
 添付しないもの: 存在しないファイル、ワークスペースの外、**保護ファイル**（`.env` など §5。`read_file` と同じ規則で
-シンボリックリンク経由も拒否）、ディレクトリ、テキストでないファイル（UTF-8 でない・NUL を含む）、
-`AGENT_MAX_FILE_BYTES` を超えるファイル、上限を超えた分。v1 はテキストファイルのみで、画像は対象外です。
+シンボリックリンク経由も拒否）、ディレクトリ、画像でもテキストでもないファイル（UTF-8 でない・NUL を含む）、
+`AGENT_MAX_FILE_BYTES` を超えるテキストファイル、上限を超えた分。
 
 添付した中身はユーザー発言の一部なので、セッションログにもそのまま記録されます（§4）。
+
+#### 画像を添付する
+
+`@` で指したファイルの**中身**が PNG / JPEG / GIF / WebP なら、テキストではなく画像として発言に添えます
+（`› @screenshot.png のレイアウト崩れを直して`）。形式は先頭のマジックバイトで判定し、拡張子は見ません
+（拡張子のないスクリーンショットも画像、`.png` という名前のテキストはテキスト）。保護ファイル・ワークスペース外の
+拒否はテキストと同じ規則です。専用のコマンド（`/image`）はありません — `@` で足ります。
+
+| 対象 | 上限 |
+|---|---|
+| 1 枚 | 3,750,000 バイト（base64 にすると 5,000,000 バイトで、Anthropic の 1 枚 5 MB 上限に収まる大きさ）と `AGENT_MAX_FILE_BYTES`（既定 2 MiB）の小さい方。超えたら添付せず、どちらの上限で断ったかを stderr に出す |
+| 1 発言の枚数 | 4 枚 |
+| 1 発言の合計 | 8 MiB |
+
+- テキストの添付とは別枠です。画像は履歴の容量計算では 1 枚 1.5 KB 相当として数えます
+  （base64 の長さで数えると 1 枚で履歴予算を食い尽くすため）。そのため刈り込みは画像の大きさを見ません。
+  **画像は以降のリクエストすべてに再送されます** — 大きな画像を何枚も添えた長い会話はリクエストが大きくなります
+- セッションログには画像そのもの（base64）を保存します。`--resume` で再開しても同じ画像がモデルに届きます
+- Anthropic は `image` ブロック、OpenAI 互換は `image_url`（`data:` URL）で送ります。OpenAI 互換で
+  画像がないリクエストは従来どおり文字列の `content` のままです
+- 画像を受け付けないモデル（`AGENT_OPENAI_IMAGES=false`）には、エラーにも黙った破棄にもせず
+  `[image omitted: this model does not accept images]` という 1 行に置き換えて送ります。フェイルオーバー先や
+  ルーティング先でも、そのプロバイダの設定で決まります
+- 履歴の圧縮では、要約役のモデルに画像は送らず `[image: 12 KB png]` の 1 行として渡します
+- **v1 はユーザーが添付した画像のみ**です。モデルが自分でツールから画像を読む（`read_file` で画像を見る）ことは
+  まだできません
 
 ### 変更を取り消す（`/undo` と `/rewind`）
 
@@ -1385,7 +1411,7 @@ make exec  CMD="ls -la /target"
 make clean-all   # コンテナ・イメージ・キャッシュボリュームを削除
 ```
 
-テストは 1194 本、外部ネットワークもモデルも不要です。
+テストは 1220 本、外部ネットワークもモデルも不要です。
 
 - ドメイン／ユースケース … フェイクのポートのみ
 - 設定 … `EnvSource` 経由でインメモリ環境を注入（プロセス環境を汚さない）
@@ -1439,7 +1465,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | 種別 | 変数 |
 |---|---|
 | API キー（実環境にあるかを見る） | `AGENT_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AGENT_PROVIDER_<ALIAS>_API_KEY`（空の値は数えない） |
-| 接続先（無視されるもの） | `AGENT_PROVIDER`, `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_OPENAI_MAX_TOKENS_FIELD`, `AGENT_PROVIDERS`, `AGENT_DEFAULT_PROVIDER`, `AGENT_PROVIDER_*`（すべて）, `AGENT_ROUTER`, `AGENT_ROUTE_*`, `AGENT_FAILOVER*`（大文字小文字を問わない） |
+| 接続先（無視されるもの） | `AGENT_PROVIDER`, `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_OPENAI_MAX_TOKENS_FIELD`, `AGENT_OPENAI_IMAGES`, `AGENT_PROVIDERS`, `AGENT_DEFAULT_PROVIDER`, `AGENT_PROVIDER_*`（すべて）, `AGENT_ROUTER`, `AGENT_ROUTE_*`, `AGENT_FAILOVER*`（大文字小文字を問わない） |
 
 理由は、**他人のリポジトリの `.env` に自分の API キーの送り先を決めさせないため**です。キーを
 `export` しておき接続先は既定のまま使っているところへ、同梱の `.env` が `AGENT_BASE_URL` や
@@ -1460,6 +1486,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_MODEL` | （必須） | モデル名。プロバイダごとの既定値は持たない |
 | `AGENT_BASE_URL` | プロバイダで決まる（下表） | エンドポイント。明示すれば常にこちらが優先 |
 | `AGENT_OPENAI_MAX_TOKENS_FIELD` | `max_tokens` | 新しい OpenAI モデル向けに `max_completion_tokens` へ変更可 |
+| `AGENT_OPENAI_IMAGES` | `true` | OpenAI 互換のモデルに添付画像を送るか。画像を受け付けないモデル（多くのローカルモデル）では `false` にすると、画像の代わりに置き換えの 1 行を送る（§3「画像を添付する」）。Anthropic は常に送る |
 | `AGENT_WORKSPACE` | カレントディレクトリ（compose 内は `/workspace`） | サンドボックスのルート |
 
 `AGENT_BASE_URL` を省いたときの接続先:
@@ -1484,6 +1511,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_PROVIDER_<別名>_MODEL` | （必須） | 別名ごとのモデル |
 | `AGENT_PROVIDER_<別名>_API_KEY` | — | 別名ごとの API キー。フォールバックと必須の規則は `AGENT_API_KEY` と同じ |
 | `AGENT_PROVIDER_<別名>_MAX_TOKENS_FIELD` | `max_tokens` | 別名ごとの `AGENT_OPENAI_MAX_TOKENS_FIELD` |
+| `AGENT_PROVIDER_<別名>_IMAGES` | `true` | 別名ごとの `AGENT_OPENAI_IMAGES` |
 | `AGENT_ROUTER` | 単一なら `static`、複数なら `model-prefix`。`AGENT_ROUTE_*` があれば `task-kind` | `static` \| `model-prefix` \| `task-kind` |
 | `AGENT_ROUTE_AGENTIC` / `_CHAT` / `_SUMMARIZE` / `_CLASSIFY` | — | `task-kind` ルータでの種別ごとの委譲先（別名）。未設定の種別は既定の委譲先。未知の別名や、`task-kind` 以外のルータと併用すると起動失敗 |
 | `AGENT_FAILOVER` | — | 委譲先が落ちたときに順に試す別名のカンマ区切り。空なら切り替えなし。未知の別名は起動失敗 |
@@ -1506,7 +1534,7 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_SESSION_KEEP` | `50` | 残すセッション数の上限。`0` で無制限 |
 | `AGENT_SESSION_MAX_AGE_DAYS` | `30` | 残す日数の上限。`0` で無期限 |
 | `AGENT_TOOL_TIMEOUT_SECS` | `60` | ツール 1 回あたりの上限時間 |
-| `AGENT_MAX_FILE_BYTES` | `2097152` | `read_file` が読む最大サイズ |
+| `AGENT_MAX_FILE_BYTES` | `2097152` | `read_file` が読む最大サイズ。`@` で添付する画像にも効く |
 | `AGENT_DENY_READ` | —（既定の規則のみ） | ファイルツールが読み書きしないパターンのカンマ区切り（例: `*.p12,secrets/`）。既定の規則（§5）に**追加**する。外す手段はない。解釈できないパターンは起動エラー |
 | `AGENT_DENY_WRITE` | —（既定の規則のみ） | 読めるが書き込まないパターンのカンマ区切り（例: `Cargo.lock`）。既定の `.git/` に追加する |
 | `AGENT_WEB_FETCH` | `false` | `web_fetch` ツールの有効化（§4 参照） |

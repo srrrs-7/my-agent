@@ -94,7 +94,10 @@ impl LlmProvider for RoutingProvider {
 
     fn capabilities(&self) -> ProviderCapabilities {
         // Only promise what every candidate can deliver: the caller cannot know
-        // which one will serve the next request.
+        // which one will serve the next request. For images that promise is
+        // all this is - a route without vision does not stop a route with it
+        // from seeing them, because each candidate's adapter decides per
+        // request whether to send an image or a placeholder.
         self.providers
             .values()
             .map(|provider| provider.capabilities())

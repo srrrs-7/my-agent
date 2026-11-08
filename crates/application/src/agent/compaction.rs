@@ -395,6 +395,12 @@ fn render_transcript(conversation: &Conversation, split: usize) -> String {
                         text::clip(&result.content, budget)
                     ));
                 }
+                // The summariser is sent text only: what was attached, not
+                // the picture. Re-sending every image in the history to
+                // summarise it would cost more than the turns it folds.
+                ContentBlock::Image(image) => {
+                    out.push_str(&format!("{image}\n"));
+                }
                 // Provider-private reasoning: opaque by definition (often
                 // empty or encrypted), so it has nothing to give a summary.
                 ContentBlock::Opaque { .. } => {}
@@ -550,6 +556,25 @@ mod tests {
         );
         assert!(head.text().contains("not a new request"), "{}", head.text());
         assert!(head.text().contains("<conversation-summary>"));
+    }
+
+    #[test]
+    fn an_image_reaches_the_summariser_as_a_line_of_text() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(3 * 1024, 7);
+        let image = agent_domain::model::image::Image::from_bytes(png).unwrap();
+        let conversation = Conversation::from_messages(vec![
+            Message::user_with_images("what is wrong with this chart?", vec![image.clone()]),
+            Message::assistant_text("the axis is inverted"),
+        ]);
+
+        let transcript = render_transcript(&conversation, 2);
+
+        assert!(
+            transcript.contains("## user\nwhat is wrong with this chart?\n[image: 3 KB png]\n"),
+            "{transcript}"
+        );
+        assert!(!transcript.contains(&image.to_base64()), "{transcript}");
     }
 
     #[tokio::test]

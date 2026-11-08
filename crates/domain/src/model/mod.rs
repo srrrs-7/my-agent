@@ -7,6 +7,7 @@ pub mod conversation;
 pub mod dependency;
 mod file_name;
 pub mod glob;
+pub mod image;
 pub mod llm;
 pub mod message;
 pub mod permission;

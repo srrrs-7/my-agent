@@ -6,7 +6,7 @@
 //! Kept in one place so a step added for one subcommand is not missing from
 //! the other.
 
-use agent_application::agent::{AgentOutcome, Interrupt, Session};
+use agent_application::agent::{AgentOutcome, Interrupt, Session, UserInput};
 use agent_application::error::AppError;
 use agent_domain::ports::events::FinishReason;
 
@@ -22,7 +22,7 @@ use crate::ctrl_c::{CtrlC, Sigint, TurnEnd, drive};
 pub(crate) async fn run_turn(
     app: &Application,
     session: &mut Session,
-    prompt: impl Into<String>,
+    prompt: impl Into<UserInput>,
     sigint: &mut Sigint,
     keys: &mut CtrlC,
 ) -> TurnEnd<Result<AgentOutcome, AppError>> {

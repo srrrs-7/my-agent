@@ -158,6 +158,13 @@ pub(super) fn to_blocks(message: &Message) -> Vec<WireBlock> {
                 name: call.name.to_string(),
                 input: call.arguments.clone(),
             }),
+            ContentBlock::Image(image) => Some(WireBlock::Image {
+                source: WireImageSource {
+                    kind: "base64",
+                    media_type: image.media_type().as_mime(),
+                    data: image.to_base64(),
+                },
+            }),
             ContentBlock::ToolResult(result) => Some(WireBlock::ToolResult {
                 tool_use_id: result.call_id.to_string(),
                 content: result.content.clone(),
@@ -199,10 +206,21 @@ pub(super) enum WireBlock {
         content: String,
         is_error: bool,
     },
+    Image {
+        source: WireImageSource,
+    },
     /// A block received from the API and returned as it came (thinking).
     /// It carries its own `type`.
     #[serde(untagged)]
     Verbatim(Value),
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct WireImageSource {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: &'static str,
+    data: String,
 }
 
 #[derive(Debug, Deserialize)]

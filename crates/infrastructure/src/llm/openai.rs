@@ -12,6 +12,13 @@
 //! * `content` may be `null`, a string, or an array of parts.
 //! * newer OpenAI models require `max_completion_tokens` instead of
 //!   `max_tokens`; the field name is configurable.
+//! * a user message is sent as a plain string unless it carries an image, and
+//!   only then as an array of parts - servers without vision accept the
+//!   string form and some reject the array. An image becomes an `image_url`
+//!   part holding a `data:` URL. A server whose model has no vision
+//!   (`AGENT_OPENAI_IMAGES=false`) gets a text placeholder instead, because it
+//!   answers an image part with a 400 that would end the session. Tool
+//!   results never carry images: the `tool` role takes text only.
 //! * prompt caching is automatic where it exists at all, so nothing is sent
 //!   for it. Cache hits come back as `usage.prompt_tokens_details.cached_tokens`
 //!   on servers that report them, and are simply absent elsewhere.
@@ -44,6 +51,7 @@ pub struct OpenAiCompatibleProvider {
     default_model: ModelId,
     max_tokens_field: String,
     timeout: Duration,
+    images: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -63,7 +71,16 @@ impl OpenAiCompatibleProvider {
             default_model,
             max_tokens_field: max_tokens_field.into(),
             timeout,
+            images: true,
         })
+    }
+
+    /// Whether the model is sent images (the default) or a placeholder line
+    /// in place of each.
+    #[must_use]
+    pub fn with_images(mut self, images: bool) -> Self {
+        self.images = images;
+        self
     }
 
     pub fn base_url(&self) -> &str {
@@ -82,6 +99,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             supports_tools: true,
             supports_streaming: true,
             supports_system_prompt: true,
+            supports_images: self.images,
             max_context_tokens: None,
         }
     }
@@ -132,7 +150,7 @@ impl OpenAiCompatibleProvider {
             messages.push(WireMessage::simple("system", system.clone()));
         }
         for message in &request.messages {
-            append_message(&mut messages, message);
+            append_message(&mut messages, message, self.images);
         }
 
         let mut max_tokens = BTreeMap::new();
@@ -465,10 +483,15 @@ impl StreamAccumulator {
 
 // --- outbound mapping --------------------------------------------------------
 
-fn append_message(messages: &mut Vec<WireMessage>, message: &Message) {
+fn append_message(messages: &mut Vec<WireMessage>, message: &Message, images: bool) {
     match message.role {
         Role::System => messages.push(WireMessage::simple("system", message.text())),
-        Role::User => messages.push(WireMessage::simple("user", message.text())),
+        Role::User => messages.push(WireMessage {
+            role: "user",
+            content: Some(user_content(message, images)),
+            tool_calls: None,
+            tool_call_id: None,
+        }),
         Role::Assistant => {
             let tool_calls: Vec<WireToolCall> = message
                 .tool_calls()
@@ -486,7 +509,7 @@ fn append_message(messages: &mut Vec<WireMessage>, message: &Message) {
 
             messages.push(WireMessage {
                 role: "assistant",
-                content: Some(message.text()),
+                content: Some(Value::String(message.text())),
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -501,7 +524,7 @@ fn append_message(messages: &mut Vec<WireMessage>, message: &Message) {
                 if let ContentBlock::ToolResult(result) = block {
                     messages.push(WireMessage {
                         role: "tool",
-                        content: Some(result.content.clone()),
+                        content: Some(Value::String(result.content.clone())),
                         tool_calls: None,
                         tool_call_id: Some(result.call_id.to_string()),
                     });
@@ -510,6 +533,56 @@ fn append_message(messages: &mut Vec<WireMessage>, message: &Message) {
         }
     }
 }
+
+/// A user message's `content`: the string every server accepts, unless the
+/// message has an image - then the parts array, text and images in their
+/// order. Without vision, each image is a text placeholder and the string
+/// form is kept.
+fn user_content(message: &Message, images: bool) -> Value {
+    let has_image = message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image(_)));
+    if !has_image {
+        return Value::String(message.text());
+    }
+    if !images {
+        let parts: Vec<String> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                ContentBlock::Image(_) => Some(IMAGE_PLACEHOLDER.to_string()),
+                _ => None,
+            })
+            .collect();
+        return Value::String(parts.join("\n"));
+    }
+    let parts: Vec<Value> = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } if text.is_empty() => None,
+            ContentBlock::Text { text } => Some(serde_json::json!({"type": "text", "text": text})),
+            ContentBlock::Image(image) => Some(serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!(
+                        "data:{};base64,{}",
+                        image.media_type().as_mime(),
+                        image.to_base64()
+                    ),
+                },
+            })),
+            _ => None,
+        })
+        .collect();
+    Value::Array(parts)
+}
+
+/// What a model without vision is told in place of an image: that there was
+/// one, so it does not answer as if the user had attached nothing.
+const IMAGE_PLACEHOLDER: &str = "[image omitted: this model does not accept images]";
 
 fn normalize_arguments(raw: Value) -> Result<Value, LlmError> {
     match raw {
@@ -617,8 +690,10 @@ struct WireStreamFunction {
 #[derive(Debug, Serialize)]
 struct WireMessage {
     role: &'static str,
+    /// A string, except for a user message with an image: see
+    /// [`user_content`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<WireToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -629,7 +704,7 @@ impl WireMessage {
     fn simple(role: &'static str, content: String) -> Self {
         Self {
             role,
-            content: Some(content),
+            content: Some(Value::String(content)),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -797,12 +872,12 @@ mod tests {
         ]);
 
         let mut wire = Vec::new();
-        append_message(&mut wire, &message);
+        append_message(&mut wire, &message, true);
 
         assert_eq!(wire.len(), 2);
         assert_eq!(wire[0].role, "tool");
         assert_eq!(wire[0].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(wire[1].content.as_deref(), Some("second"));
+        assert_eq!(wire[1].content, Some(json!("second")));
     }
 
     #[test]
@@ -815,13 +890,76 @@ mod tests {
         let message = Message::assistant(vec![ContentBlock::ToolCall(call)]);
 
         let mut wire = Vec::new();
-        append_message(&mut wire, &message);
+        append_message(&mut wire, &message, true);
 
         let serialised = serde_json::to_value(&wire[0]).unwrap();
         assert_eq!(
             serialised["tool_calls"][0]["function"]["arguments"],
             json!(r#"{"path":"a.rs"}"#)
         );
+    }
+
+    /// One transparent pixel.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn with_image() -> Message {
+        let image = agent_domain::model::image::Image::from_bytes(TINY_PNG.to_vec()).unwrap();
+        Message::user_with_images("what is this?", vec![image])
+    }
+
+    #[test]
+    fn a_user_image_is_sent_as_a_data_url_part() {
+        let mut wire = Vec::new();
+        append_message(&mut wire, &with_image(), true);
+
+        let image = agent_domain::model::image::Image::from_bytes(TINY_PNG.to_vec()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&wire[0]).unwrap(),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {
+                        "url": format!("data:image/png;base64,{}", image.to_base64())
+                    }},
+                ],
+            })
+        );
+    }
+
+    /// Servers without vision accept the string form and some reject the
+    /// array, so a message with no image must not change shape.
+    #[test]
+    fn a_text_only_user_message_stays_a_plain_string() {
+        let mut wire = Vec::new();
+        append_message(&mut wire, &Message::user("hello"), true);
+
+        assert_eq!(
+            serde_json::to_value(&wire[0]).unwrap(),
+            json!({"role": "user", "content": "hello"})
+        );
+    }
+
+    #[test]
+    fn a_model_without_vision_is_told_an_image_was_left_out() {
+        let mut wire = Vec::new();
+        append_message(&mut wire, &with_image(), false);
+
+        assert_eq!(
+            serde_json::to_value(&wire[0]).unwrap(),
+            json!({
+                "role": "user",
+                "content": "what is this?\n[image omitted: this model does not accept images]",
+            })
+        );
+        assert!(!provider().with_images(false).capabilities().supports_images);
+        assert!(provider().capabilities().supports_images, "on by default");
     }
 
     #[test]

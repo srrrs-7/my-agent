@@ -102,6 +102,7 @@ impl Fixture {
                 api_key: None,
                 model: ModelId::new("mock"),
                 max_tokens_field: "max_tokens".into(),
+                images: true,
             }],
             default_provider: ProviderId::new("local"),
             router: RouterKind::Static,

@@ -69,6 +69,11 @@
 //! advertises. A tool-less local model can stand in for summaries without
 //! turning tools off for the agent loop.
 //!
+//! Images are not a reason to skip one. A fallback without vision is still
+//! better than an outage, and its own adapter sends a placeholder line in
+//! place of each image, so the request goes through and the model is told
+//! what it is missing.
+//!
 //! ## Models
 //!
 //! A fallback is asked for its own configured model. The request's model was

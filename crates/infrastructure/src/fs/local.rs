@@ -44,11 +44,10 @@ impl LocalFileSystem {
     fn guard(&self, path: &WorkspacePath, access: Option<FileAccess>) -> Result<PathBuf, FsError> {
         self.workspace.resolve(path, access)
     }
-}
 
-#[async_trait]
-impl FileSystem for LocalFileSystem {
-    async fn read_to_string(&self, path: &WorkspacePath) -> Result<String, FsError> {
+    /// Every read, text or not: guarded for [`FileAccess::Read`], a regular
+    /// file, and no longer than `limit`.
+    async fn read_capped(&self, path: &WorkspacePath, limit: u64) -> Result<Vec<u8>, FsError> {
         let target = self.guard(path, Some(FileAccess::Read))?;
 
         let metadata = tokio::fs::metadata(&target)
@@ -59,20 +58,33 @@ impl FileSystem for LocalFileSystem {
                 path: path.display(),
             });
         }
-        if metadata.len() > self.max_file_bytes {
+        if metadata.len() > limit {
             return Err(FsError::TooLarge {
                 path: path.display(),
                 actual: metadata.len(),
-                limit: self.max_file_bytes,
+                limit,
             });
         }
 
-        let bytes = tokio::fs::read(&target)
+        tokio::fs::read(&target)
             .await
-            .map_err(|error| io_error(path, error))?;
+            .map_err(|error| io_error(path, error))
+    }
+}
+
+#[async_trait]
+impl FileSystem for LocalFileSystem {
+    async fn read_to_string(&self, path: &WorkspacePath) -> Result<String, FsError> {
+        let bytes = self.read_capped(path, self.max_file_bytes).await?;
         String::from_utf8(bytes).map_err(|_| FsError::NotUtf8 {
             path: path.display(),
         })
+    }
+
+    async fn read_bytes(&self, path: &WorkspacePath, limit: u64) -> Result<Vec<u8>, FsError> {
+        // The operator's cap (`AGENT_MAX_FILE_BYTES`) bounds every read, not
+        // only the text ones.
+        self.read_capped(path, limit.min(self.max_file_bytes)).await
     }
 
     async fn write(&self, path: &WorkspacePath, contents: &str) -> Result<(), FsError> {
@@ -374,6 +386,56 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("ask the user"), "{message}");
         assert!(!message.contains("sk-secret"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn read_bytes_returns_binary_content_under_the_callers_limit() {
+        let fixture = fixture();
+        let path = fixture.root.resolve("pic.bin").unwrap();
+        std::fs::write(
+            fixture.root.as_path().join("pic.bin"),
+            [0x89, 0x00, 0xFF, 0x10],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fixture.fs.read_bytes(&path, 4).await.unwrap(),
+            [0x89, 0x00, 0xFF, 0x10]
+        );
+        assert!(matches!(
+            fixture.fs.read_bytes(&path, 3).await,
+            Err(FsError::TooLarge { limit: 3, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_bytes_never_reads_past_the_operators_file_limit() {
+        let fixture = fixture();
+        let small = LocalFileSystem::new(fixture.root.clone(), 3).unwrap();
+        let path = fixture.root.resolve("pic.bin").unwrap();
+        std::fs::write(fixture.root.as_path().join("pic.bin"), [1, 2, 3, 4]).unwrap();
+
+        assert!(
+            matches!(
+                small.read_bytes(&path, 1024).await,
+                Err(FsError::TooLarge { limit: 3, .. })
+            ),
+            "the lower of the two caps applies, and is the one reported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_bytes_obeys_the_access_policy_through_a_link() {
+        let fixture = fixture();
+        put(&fixture, ".env", "SECRET=1");
+        link(&fixture, ".env", "innocent.png");
+
+        for name in [".env", "innocent.png"] {
+            let path = fixture.root.resolve(name).unwrap();
+            let error = fixture.fs.read_bytes(&path, 1024).await.unwrap_err();
+            assert!(denied(&error, FileAccess::Read), "{name}: {error:?}");
+        }
     }
 
     #[cfg(unix)]

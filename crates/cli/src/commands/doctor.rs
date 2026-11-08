@@ -44,9 +44,10 @@ fn print_configuration(app: &Application) {
     }
     println!("  {:<20} {}", "tools", app.tools.names().join(", "));
     println!(
-        "  {:<20} tools={}",
+        "  {:<20} tools={} images={}",
         "capabilities",
-        app.provider.capabilities().supports_tools
+        app.provider.capabilities().supports_tools,
+        app.provider.capabilities().supports_images
     );
     print_sandbox(app);
     print_tool_servers(app);

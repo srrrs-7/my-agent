@@ -88,6 +88,11 @@ pub struct ProviderSettings {
     /// Newer OpenAI models renamed `max_tokens` to `max_completion_tokens`;
     /// self-hosted servers still expect the old name.
     pub max_tokens_field: String,
+    /// Whether an OpenAI-compatible model is sent images, or a placeholder
+    /// in their place. Many local models have no vision; their servers
+    /// answer an image part with a 400. Ignored for Anthropic, which always
+    /// accepts them.
+    pub images: bool,
 }
 
 impl ProviderSettings {
@@ -1570,6 +1575,7 @@ mod tests {
             api_key: Some("sk-ant-0123456789abcdef".into()),
             model: ModelId::new("claude-sonnet-5"),
             max_tokens_field: "max_tokens".into(),
+            images: true,
         };
         let masked = provider.masked_api_key();
         assert!(masked.starts_with("sk-a"));
@@ -1586,6 +1592,7 @@ mod tests {
             api_key: Some("short".into()),
             model: ModelId::new("m"),
             max_tokens_field: "max_tokens".into(),
+            images: true,
         };
         assert_eq!(provider.masked_api_key(), "*****");
         provider.api_key = None;

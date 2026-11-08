@@ -63,6 +63,10 @@ impl FileSystem for MemoryFileSystem {
             })
     }
 
+    async fn read_bytes(&self, path: &WorkspacePath, _limit: u64) -> Result<Vec<u8>, FsError> {
+        self.read_to_string(path).await.map(String::into_bytes)
+    }
+
     async fn write(&self, path: &WorkspacePath, contents: &str) -> Result<(), FsError> {
         self.files
             .lock()

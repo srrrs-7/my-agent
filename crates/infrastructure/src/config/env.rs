@@ -136,6 +136,7 @@ struct Keys {
     api_key: String,
     model: String,
     max_tokens_field: String,
+    images: String,
 }
 
 impl Keys {
@@ -147,6 +148,7 @@ impl Keys {
             api_key: "AGENT_API_KEY".into(),
             model: "AGENT_MODEL".into(),
             max_tokens_field: "AGENT_OPENAI_MAX_TOKENS_FIELD".into(),
+            images: "AGENT_OPENAI_IMAGES".into(),
         }
     }
 
@@ -168,6 +170,7 @@ impl Keys {
             api_key: format!("AGENT_PROVIDER_{upper}_API_KEY"),
             model: format!("AGENT_PROVIDER_{upper}_MODEL"),
             max_tokens_field: format!("AGENT_PROVIDER_{upper}_MAX_TOKENS_FIELD"),
+            images: format!("AGENT_PROVIDER_{upper}_IMAGES"),
         }
     }
 }
@@ -241,6 +244,7 @@ pub(super) fn provider_from_env(
         max_tokens_field: reader
             .string(&keys.max_tokens_field)
             .unwrap_or_else(|| "max_tokens".to_string()),
+        images: reader.parsed(&keys.images, true)?,
     })
 }
 
@@ -288,6 +292,30 @@ mod tests {
             "the compose Ollama service by default"
         );
         assert_eq!(provider.max_tokens_field, "max_tokens");
+        assert!(provider.images, "images are sent unless turned off");
+    }
+
+    #[test]
+    fn images_can_be_turned_off_per_provider() {
+        let env = read(&[
+            ("AGENT_PROVIDER", "ollama"),
+            ("AGENT_MODEL", "qwen3:8b"),
+            ("AGENT_OPENAI_IMAGES", "false"),
+            ("AGENT_PROVIDER_LOCAL_KIND", "ollama"),
+            ("AGENT_PROVIDER_LOCAL_MODEL", "qwen3:8b"),
+            ("AGENT_PROVIDER_LOCAL_IMAGES", "false"),
+        ]);
+        let reader = Reader::new(&env);
+        assert!(!provider_from_env(&reader, None).unwrap().images);
+        assert!(!provider_from_env(&reader, Some("local")).unwrap().images);
+
+        let bad = read(&[
+            ("AGENT_PROVIDER", "ollama"),
+            ("AGENT_MODEL", "qwen3:8b"),
+            ("AGENT_OPENAI_IMAGES", "maybe"),
+        ]);
+        let error = provider_from_env(&Reader::new(&bad), None).unwrap_err();
+        assert!(error.to_string().contains("AGENT_OPENAI_IMAGES"), "{error}");
     }
 
     #[test]

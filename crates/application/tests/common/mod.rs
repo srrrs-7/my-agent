@@ -77,6 +77,8 @@ impl LlmProvider for ScriptedProvider {
 #[derive(Default)]
 pub struct MemoryFileSystem {
     pub files: Mutex<HashMap<String, String>>,
+    /// Files that are not text; only `read_bytes` returns them whole.
+    pub blobs: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MemoryFileSystem {
@@ -88,7 +90,16 @@ impl MemoryFileSystem {
                     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                     .collect(),
             ),
+            blobs: Mutex::default(),
         })
+    }
+
+    /// Adds a binary file.
+    pub fn put_bytes(&self, path: &str, bytes: &[u8]) {
+        self.blobs
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), bytes.to_vec());
     }
 
     pub fn get(&self, path: &str) -> Option<String> {
@@ -99,6 +110,12 @@ impl MemoryFileSystem {
 #[async_trait]
 impl FileSystem for MemoryFileSystem {
     async fn read_to_string(&self, path: &WorkspacePath) -> Result<String, FsError> {
+        let blob = self.blobs.lock().unwrap().get(&path.display()).cloned();
+        if let Some(blob) = blob {
+            return String::from_utf8(blob).map_err(|_| FsError::NotUtf8 {
+                path: path.display(),
+            });
+        }
         self.files
             .lock()
             .unwrap()
@@ -107,6 +124,22 @@ impl FileSystem for MemoryFileSystem {
             .ok_or_else(|| FsError::NotFound {
                 path: path.display(),
             })
+    }
+
+    async fn read_bytes(&self, path: &WorkspacePath, limit: u64) -> Result<Vec<u8>, FsError> {
+        let blob = self.blobs.lock().unwrap().get(&path.display()).cloned();
+        let bytes = match blob {
+            Some(blob) => blob,
+            None => self.read_to_string(path).await?.into_bytes(),
+        };
+        if bytes.len() as u64 > limit {
+            return Err(FsError::TooLarge {
+                path: path.display(),
+                actual: bytes.len() as u64,
+                limit,
+            });
+        }
+        Ok(bytes)
     }
 
     async fn write(&self, path: &WorkspacePath, contents: &str) -> Result<(), FsError> {

@@ -6,6 +6,7 @@ pub mod compaction;
 pub mod config;
 pub mod context_report;
 pub mod dispatch;
+pub mod input;
 pub mod interrupt;
 pub mod loop_runner;
 mod plan;
@@ -17,6 +18,7 @@ pub use compaction::{CompactionConfig, CompactionReport, HistoryCompactor, Manua
 pub use config::AgentLoopConfig;
 pub use context_report::{ContextReport, PlanNote};
 pub use dispatch::{DispatchConfig, Dispatched, ToolDispatcher};
+pub use input::UserInput;
 pub use interrupt::Interrupt;
 pub use loop_runner::{AgentDependencies, AgentLoop, AgentOutcome};
 pub use prompt::{

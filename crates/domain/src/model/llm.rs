@@ -218,6 +218,14 @@ pub struct ProviderCapabilities {
     pub supports_tools: bool,
     pub supports_streaming: bool,
     pub supports_system_prompt: bool,
+    /// Whether image blocks in a user message reach the model as images.
+    ///
+    /// A provider without them is still sent the conversation: each adapter
+    /// replaces an image with a line of text saying it was left out, so the
+    /// request neither fails nor silently loses the user's attachment. This
+    /// flag therefore gates nothing; it says what the model will see.
+    #[serde(default)]
+    pub supports_images: bool,
     pub max_context_tokens: Option<u32>,
 }
 
@@ -227,6 +235,7 @@ impl Default for ProviderCapabilities {
             supports_tools: true,
             supports_streaming: false,
             supports_system_prompt: true,
+            supports_images: false,
             max_context_tokens: None,
         }
     }
@@ -235,11 +244,17 @@ impl Default for ProviderCapabilities {
 impl ProviderCapabilities {
     /// Conservative merge, used by the routing provider: it can only promise
     /// what *every* candidate behind it can deliver.
+    ///
+    /// That includes `supports_images`, and it costs nothing: the flag decides
+    /// nothing (see its docs). Each candidate's own adapter decides, per
+    /// request, whether its model sees an image or the placeholder, so one
+    /// route without vision never takes images away from a route with it.
     pub fn intersect(self, other: Self) -> Self {
         Self {
             supports_tools: self.supports_tools && other.supports_tools,
             supports_streaming: self.supports_streaming && other.supports_streaming,
             supports_system_prompt: self.supports_system_prompt && other.supports_system_prompt,
+            supports_images: self.supports_images && other.supports_images,
             max_context_tokens: match (self.max_context_tokens, other.max_context_tokens) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -302,16 +317,19 @@ mod tests {
             supports_tools: true,
             supports_streaming: true,
             supports_system_prompt: true,
+            supports_images: true,
             max_context_tokens: Some(200_000),
         };
         let b = ProviderCapabilities {
             supports_tools: false,
             supports_streaming: true,
             supports_system_prompt: true,
+            supports_images: false,
             max_context_tokens: Some(32_000),
         };
         let merged = a.intersect(b);
         assert!(!merged.supports_tools);
+        assert!(!merged.supports_images);
         assert_eq!(merged.max_context_tokens, Some(32_000));
     }
 }

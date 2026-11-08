@@ -111,14 +111,15 @@ const CREDENTIALS: &[&str] = &["AGENT_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API
 /// `AGENT_PROVIDER_*` is matched by prefix below: an alias defined in `.env`
 /// would otherwise be a new destination for a vendor fallback key.
 ///
-/// `AGENT_MODEL` and `AGENT_OPENAI_MAX_TOKENS_FIELD` move nothing on their
-/// own, but they belong to the same provider block as `AGENT_PROVIDER` - a
-/// block read half from each source is one nobody wrote.
+/// `AGENT_MODEL`, `AGENT_OPENAI_MAX_TOKENS_FIELD` and `AGENT_OPENAI_IMAGES`
+/// move nothing on their own, but they belong to the same provider block as
+/// `AGENT_PROVIDER` - a block read half from each source is one nobody wrote.
 const CONNECTION: &[&str] = &[
     "AGENT_PROVIDER",
     "AGENT_BASE_URL",
     "AGENT_MODEL",
     "AGENT_OPENAI_MAX_TOKENS_FIELD",
+    "AGENT_OPENAI_IMAGES",
     "AGENT_PROVIDERS",
     "AGENT_DEFAULT_PROVIDER",
     "AGENT_ROUTER",

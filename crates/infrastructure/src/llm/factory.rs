@@ -121,14 +121,17 @@ fn build_client(
     settings: &LlmSettings,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
     match provider.kind {
-        ProviderKind::OpenAiCompatible => Ok(Arc::new(OpenAiCompatibleProvider::new(
-            provider.id.clone(),
-            provider.base_url.clone(),
-            provider.api_key.clone(),
-            provider.model.clone(),
-            provider.max_tokens_field.clone(),
-            settings.request_timeout,
-        )?)),
+        ProviderKind::OpenAiCompatible => Ok(Arc::new(
+            OpenAiCompatibleProvider::new(
+                provider.id.clone(),
+                provider.base_url.clone(),
+                provider.api_key.clone(),
+                provider.model.clone(),
+                provider.max_tokens_field.clone(),
+                settings.request_timeout,
+            )?
+            .with_images(provider.images),
+        )),
         ProviderKind::Anthropic => {
             let api_key = provider.api_key.clone().ok_or_else(|| {
                 LlmError::Configuration(format!(

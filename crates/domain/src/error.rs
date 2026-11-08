@@ -120,6 +120,19 @@ impl LlmError {
     }
 }
 
+/// Why bytes could not become an [`crate::model::image::Image`]. Read by the
+/// person who attached the file, so each says what is accepted.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ImageError {
+    #[error(
+        "not a PNG, JPEG, GIF or WebP image (the format is read from the content, not the name)"
+    )]
+    UnknownFormat,
+
+    #[error("{actual} bytes, over the {limit} byte limit for one image")]
+    TooLarge { actual: usize, limit: usize },
+}
+
 /// Failures produced by filesystem ports.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum FsError {

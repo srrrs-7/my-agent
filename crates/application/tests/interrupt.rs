@@ -181,7 +181,9 @@ fn mentions_interrupted_marker(messages: &[Message]) -> bool {
         message.content.iter().any(|block| match block {
             ContentBlock::Text { text } => text.contains("[interrupted]"),
             ContentBlock::ToolResult(result) => result.content.contains("[interrupted]"),
-            ContentBlock::ToolCall(_) | ContentBlock::Opaque { .. } => false,
+            ContentBlock::ToolCall(_) | ContentBlock::Image(_) | ContentBlock::Opaque { .. } => {
+                false
+            }
         })
     })
 }

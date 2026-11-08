@@ -25,6 +25,17 @@ pub struct DirEntry {
 pub trait FileSystem: Send + Sync {
     async fn read_to_string(&self, path: &WorkspacePath) -> Result<String, FsError>;
 
+    /// The file's bytes, under the same rules as [`Self::read_to_string`] -
+    /// the symlink check and the read access policy - but with no UTF-8
+    /// requirement. Refused with [`FsError::TooLarge`] past `limit` or past
+    /// the adapter's own limit for any read, whichever is lower: the caller
+    /// has a cap of its own (an attached image's), and the operator's cap on
+    /// reading files still holds. The error's `limit` is the one that refused.
+    ///
+    /// No default: one built on `read_to_string` would refuse every binary
+    /// file, and one that skipped the policy would be a way around it.
+    async fn read_bytes(&self, path: &WorkspacePath, limit: u64) -> Result<Vec<u8>, FsError>;
+
     /// Creates missing parent directories and overwrites existing content.
     async fn write(&self, path: &WorkspacePath, contents: &str) -> Result<(), FsError>;
 

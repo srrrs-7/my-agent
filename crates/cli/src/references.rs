@@ -18,20 +18,21 @@
 //!
 //! Repeated references are returned once, in the order first written.
 
-use agent_application::agent::{ReferenceLimits, attach_references};
+use agent_application::agent::{ReferenceLimits, UserInput, attach_references};
 use agent_domain::text::printable;
 
 use crate::composition::Application;
 
-/// `line` with the files it references attached, as the turn's input.
+/// `line` with the files it references attached, as the turn's input -
+/// text files as text, images as images.
 ///
 /// One stderr line per reference, attached or not: a refused one stays in the
 /// text as typed and the turn runs anyway, so the line is the only place the
 /// user learns the model did not get the file.
-pub(crate) async fn expand(app: &Application, line: &str) -> String {
+pub(crate) async fn expand(app: &Application, line: &str) -> UserInput {
     let references = extract(line);
     if references.is_empty() {
-        return line.to_string();
+        return line.into();
     }
     let limits = ReferenceLimits::for_loop(
         app.settings.agent_loop.max_tool_output_bytes,
@@ -41,11 +42,26 @@ pub(crate) async fn expand(app: &Application, line: &str) -> String {
         attach_references(app.files.as_ref(), &app.workspace, &references, limits).await;
 
     for file in &attachments.attached {
-        let note = if file.truncated { ", truncated" } else { "" };
+        let what = match file.image {
+            Some(format) => format!(
+                "image, {} KB {}",
+                file.bytes.div_ceil(1024),
+                format.short_name()
+            ),
+            None if file.truncated => format!("{} bytes, truncated", file.bytes),
+            None => format!("{} bytes", file.bytes),
+        };
+        eprintln!("  attached @{} ({what})", printable(&file.path.display()));
+    }
+    let images = attachments
+        .attached
+        .iter()
+        .filter(|file| file.image.is_some())
+        .count();
+    if images > 0 && !app.provider.capabilities().supports_images {
         eprintln!(
-            "  attached @{} ({} bytes{note})",
-            printable(&file.path.display()),
-            file.bytes
+            "  note: not every configured model accepts images; one that does not is sent a \
+             placeholder in place of each"
         );
     }
     for refused in &attachments.refused {
@@ -55,7 +71,7 @@ pub(crate) async fn expand(app: &Application, line: &str) -> String {
             printable(&refused.reason)
         );
     }
-    attachments.apply(line)
+    attachments.into_input(line)
 }
 
 /// Punctuation that ends a sentence or a parenthetical rather than a path.
