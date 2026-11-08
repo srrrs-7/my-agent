@@ -42,6 +42,8 @@
 | `WebFetcher` | `GuardedWebFetcher`（SSRF ガード付き・既定無効） |
 | `CommandRunner` | `SandboxedCommandRunner`（Linux: Landlock + egress プロキシ・既定無効） |
 | `EventSink` | `TerminalRenderer`, `NullEventSink` |
+| `ConversationLog` | `FileConversationLog`, `NullConversationLog`（会話の記録。追記のみ） |
+| `SessionStore` | `FileSessionStore`（同じ記録の読み出し・一覧・削除） |
 
 `LlmProvider` が合成パターンになっている点が重要です。ルータもリトライもそれ自体が `LlmProvider` なので、
 呼び出し側は積み方の変化を認識しません。

@@ -42,6 +42,7 @@ make build / make lint / make fmt
 make doctor                   # 設定表示 + LLM 疎通確認
 make ask Q="..."              # エージェントを 1 回実行
 make chat                     # 対話セッション
+make run ARGS="sessions"      # 保存されたセッション一覧（--resume で続きから）
 make cargo CMD="<cargo args>" # 任意の cargo コマンド（依存追加など）
 make exec  CMD="<shell>"      # 任意のシェルコマンド
 ```
@@ -78,10 +79,43 @@ crates/test-support   (agent-test-support)   統合テスト用モック LLM サ
 | `crates/domain/src/ports/` | システムが外界と接する全境界 |
 | `crates/application/src/agent/loop_runner.rs` | エージェントループ本体 |
 | `crates/application/src/agent/dispatch.rs` | ツール実行の不変条件（順序・並列・承認） |
+| `crates/domain/src/model/conversation.rs` | 履歴を短くするときの規則。対を壊さない境界と、何を残すかの重み付け |
 | `crates/cli/src/composition.rs` | 具象と抽象が結線される唯一の場所 |
+
+**`crates/cli` は bin only で、`composition.rs` にはテストがありません。**
+`tests/end_to_end.rs` は `agent_cli` を import せず配線を自前で組み直しているため
+（本物は 5 ツール + `TimeoutTool`、E2E は 2 ツール素のまま）、composition の間違い —
+ツールの登録漏れ、ポートの取り違え、設定分岐 — は**どのテストからも見えません**。
+ここを触ったら手で確かめてください。足場を作る issue は
+`management/issues/todo/2026-08-14_composition-root-test-harness.md`（P1）。
 
 構造の詳細・各ポートの実装対応・設計判断の根拠は `.claude/rules/architecture.md` と
 `management/docs/architecture.md` にあります。
+
+## 会話の保持 — 文脈の中と、ディスクの上
+
+会話が失われる経路は 2 つあり、扱いが違います。
+
+**文脈から（圧縮・刈り込み）** — 何を残すかは**メッセージの順序と大きさ**で決めます。
+そのまま残す範囲は通数と容量の両方で頭打ちになり、畳む側は後ろに下がるほど段階的に薄くなります。
+ユーザー発言だけは距離に関係なく無傷で、これが前回の要約（user ロールで先頭に入る）を守っています。
+
+> **ここに壁時計を持ち込まないでください。**効くのは「それ以降どれだけ会話が進んだか」であって、
+> 何時間経ったかではありません。3 時間放置しただけのセッションは何も先に進んでいないのに、
+> 時計はそれを「古い」と報告します。この判断のおかげで domain にクロックのポートが不要になり、
+> 保持方針のテストが sleep なしで決定的に書けています。
+
+**プロセスから（終了）** — 会話は `.agent/sessions/<id>.jsonl` に、**履歴が短くされる前に**
+追記されます（`AGENT_SESSION_LOG`、既定で有効）。圧縮も刈り込みも元に戻せないので、
+ここが原文の唯一の残り先です。再開（`agent chat --resume`）はこのログの再生で、
+保存用のファイルを別に持ちません。保持は起動時に刈り込まれます（既定 50 件 / 30 日）。
+
+> **このファイルは会話をそのまま持ちます** — モデルが読んだファイルの中身を含みます。
+> 既定でワークスペース内にあるため、**エージェント自身の `read_file` からも読めます**。
+> ワークスペース外に出すなら `AGENT_SESSION_DIR` に絶対パスを指定します。
+
+進捗表示（`EventSink`）と記録（`ConversationLog`）は別のポートです。イベントは端末への実況で、
+ツール結果を 1 行要約に縮めているため記録には使えません。
 
 ## マルチエージェント開発
 
