@@ -14,6 +14,7 @@
 
 pub mod env;
 pub mod kinds;
+pub mod routes;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ use crate::notify::{NotifyFormat, WebhookUrl};
 
 pub use env::{EnvSource, MapEnv, SystemEnv};
 pub use kinds::{ApprovalPolicy, ProviderKind, RouterKind};
+pub use routes::RoutingSettings;
 
 use env::{Reader, provider_from_env};
 
@@ -98,6 +100,8 @@ pub struct LlmSettings {
     pub router: RouterKind,
     pub request_timeout: Duration,
     pub max_retries: u32,
+    /// Per-task destinations and the failover chain.
+    pub routing: RoutingSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -460,12 +464,15 @@ impl LlmSettings {
             RouterKind::Static
         };
 
+        let routing = RoutingSettings::read(reader, &providers)?;
+
         Ok(Self {
+            router: routing.router(reader, default_router)?,
             providers,
             default_provider,
-            router: reader.parsed("AGENT_ROUTER", default_router)?,
             request_timeout: Duration::from_secs(reader.parsed("AGENT_REQUEST_TIMEOUT_SECS", 180)?),
             max_retries: reader.parsed("AGENT_MAX_RETRIES", 3)?,
+            routing,
         })
     }
 }
@@ -611,6 +618,7 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
         ),
     );
     description.insert("router".into(), settings.llm.router.as_str().into());
+    description.extend(settings.llm.routing.describe());
     description.insert(
         "default provider".into(),
         settings.llm.default_provider.to_string(),

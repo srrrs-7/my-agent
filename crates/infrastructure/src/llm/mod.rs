@@ -2,10 +2,11 @@
 //!
 //! ```text
 //!   Arc<dyn LlmProvider>
-//!     = RetryingProvider(          <- backoff on transient failures
-//!         RoutingProvider(         <- picks a provider per request
-//!           { "local": OpenAiCompatibleProvider,
-//!             "cloud": AnthropicProvider }))
+//!     = RoutingProvider(                     <- picks a destination per request
+//!         { "cloud": FailoverProvider(       <- crosses destinations (opt-in)
+//!                      RetryingProvider(AnthropicProvider),   <- backoff
+//!                      [RetryingProvider(OpenAiCompatibleProvider)]),
+//!           "local": RetryingProvider(OpenAiCompatibleProvider) })
 //! ```
 //!
 //! Each layer is an [`agent_domain::ports::llm::LlmProvider`] in its own right,
@@ -15,6 +16,7 @@
 
 pub mod anthropic;
 pub mod factory;
+pub mod failover;
 pub(crate) mod http;
 pub mod openai;
 pub mod retry;
@@ -23,6 +25,7 @@ pub(crate) mod sse;
 
 pub use anthropic::AnthropicProvider;
 pub use factory::build_provider;
+pub use failover::{Clock, FailoverProvider, SystemClock};
 pub use openai::OpenAiCompatibleProvider;
 pub use retry::RetryingProvider;
-pub use routing::{ModelPrefixRouter, RoutingProvider, StaticRouter};
+pub use routing::{ModelPrefixRouter, RoutingProvider, StaticRouter, TaskKindRouter};

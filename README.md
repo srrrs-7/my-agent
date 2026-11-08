@@ -429,10 +429,11 @@ crates/
 
 ```
 Arc<dyn LlmProvider>
-  = RetryingProvider(         ← 指数バックオフ（Retry-After 尊重）
-      RoutingProvider(        ← リクエストごとに委譲先を選択
-        { "local": OpenAiCompatibleProvider,
-          "cloud": AnthropicProvider }))
+  = RoutingProvider(                          ← リクエストごとに委譲先を選択
+      { "cloud": FailoverProvider(            ← 委譲先をまたぐ切り替え（AGENT_FAILOVER 設定時のみ）
+                   RetryingProvider(Anthropic),        ← 委譲先ごとの指数バックオフ
+                   [RetryingProvider(OpenAiCompatible)]),
+        "local": RetryingProvider(OpenAiCompatible) })
 ```
 
 複数プロバイダは環境変数だけで定義できます。
@@ -453,6 +454,48 @@ AGENT_PROVIDER_CLOUD_API_KEY=sk-ant-...
 
 この設定なら `make ask Q="..." ARGS="-m cloud/claude-sonnet-5"` のように
 モデル参照でプロバイダを選べます。
+
+#### ローカル優先のハイブリッド構成
+
+履歴圧縮の要約（と将来の分類リクエスト）をローカルの Ollama に、エージェントループを
+クラウドに送り、クラウドが落ちたらローカルで続ける構成も環境変数だけで組めます。
+
+```bash
+AGENT_PROVIDERS=local,cloud
+AGENT_DEFAULT_PROVIDER=cloud
+AGENT_ROUTE_SUMMARIZE=local      # これだけで AGENT_ROUTER=task-kind になる
+AGENT_ROUTE_CLASSIFY=local
+AGENT_FAILOVER=local             # cloud が落ちたら local へ
+```
+
+- **`task-kind` ルータ** — リクエストの `task_kind`（`agentic` / `chat` / `summarize` /
+  `classify`）ごとに `AGENT_ROUTE_<種別>` の委譲先へ送ります。未設定の種別は
+  `AGENT_DEFAULT_PROVIDER` へ。ただし `-m cloud/claude-sonnet-5` のような**明示的な
+  プロバイダ指定が常に勝ちます**。指定はその実行全体に効くため、要約も含めて `cloud` へ
+  行きます。接頭辞のない `-m` は既定プロバイダのモデル名として扱い、別の委譲先へ
+  回ったリクエストではその委譲先の設定モデルに置き換えます
+- **フェイルオーバー** — 委譲先がまず自分のリトライを使い切り、そのうえで接続失敗・
+  タイムアウト・5xx・429 だったときだけ `AGENT_FAILOVER` の順に次を試します。
+  401 / 400 などは設定の誤りなので切り替えずにそのまま失敗します（切り替えると誤りが
+  隠れるため）。切り替え先には切り替え先自身の設定モデルを要求します
+- **ストリームは途中で切り替えません** — 出力が始まった後の失敗はそのまま失敗として
+  返ります。切り替えると、途中まで表示した回答に別の回答が継ぎ足されるためです
+- **クールダウン** — 一度切り替わった委譲先は `AGENT_FAILOVER_COOLDOWN_SECS`（既定 60 秒）
+  の間スキップし、直接切り替え先へ送ります。経過後は再び第一候補から試すので、
+  復旧すれば自動で戻ります。クールダウン中でも切り替え先が全滅したら第一候補を最後に試します
+- **能力** — 委譲先が公表する能力は第一候補のものです。ツールを使えない切り替え先は、
+  ツールを要求するリクエストでは飛ばされます（ツールの無いローカルモデルを要約用の
+  切り替え先にしても、エージェントループからツールが消えません）
+- **見え方** — 切り替えは `-v` なしでも stderr に 1 行の警告が出ます（別名と大まかな理由のみ。
+  URL やキーは出しません）。`-v` を付けるとリクエストごとの委譲先と理由が
+  `agent::route` の行として出ます。要約リクエストもここで確認できます
+
+> **注意: Ollama は文脈長を超えた入力を黙って切り詰めます。** Ollama の既定の文脈長
+> （`num_ctx`）はモデルの最大値より小さいことが多く、超えた分はエラーにならず先頭から
+> 捨てられます。要約をローカルに回す場合、要約に渡す転記が切り詰められると、
+> 最も古い部分（＝ユーザーの最初の依頼）が要約から消えます。モデル側の文脈長を
+> 十分に取るか、`AGENT_COMPACT_KEEP_RECENT_BYTES` / `AGENT_MAX_HISTORY_BYTES` を
+> 小さめにしてください。文脈長の自動調整はこのエージェントでは行っていません。
 
 将来コスト／レイテンシ／能力ベースのルーティングを足す場合も、
 `LlmRouter` を実装するだけで済みます。判断材料として `RequestMetadata`
@@ -530,7 +573,10 @@ make clean-all   # コンテナ・イメージ・キャッシュボリューム�
 | `AGENT_PROVIDER_<別名>_MODEL` | （必須） | 別名ごとのモデル |
 | `AGENT_PROVIDER_<別名>_API_KEY` | — | 別名ごとの API キー。フォールバックと必須の規則は `AGENT_API_KEY` と同じ |
 | `AGENT_PROVIDER_<別名>_MAX_TOKENS_FIELD` | `max_tokens` | 別名ごとの `AGENT_OPENAI_MAX_TOKENS_FIELD` |
-| `AGENT_ROUTER` | 単一なら `static`、複数なら `model-prefix` | `static` \| `model-prefix` |
+| `AGENT_ROUTER` | 単一なら `static`、複数なら `model-prefix`。`AGENT_ROUTE_*` があれば `task-kind` | `static` \| `model-prefix` \| `task-kind` |
+| `AGENT_ROUTE_AGENTIC` / `_CHAT` / `_SUMMARIZE` / `_CLASSIFY` | — | `task-kind` ルータでの種別ごとの委譲先（別名）。未設定の種別は既定の委譲先。未知の別名や、`task-kind` 以外のルータと併用すると起動失敗 |
+| `AGENT_FAILOVER` | — | 委譲先が落ちたときに順に試す別名のカンマ区切り。空なら切り替えなし。未知の別名は起動失敗 |
+| `AGENT_FAILOVER_COOLDOWN_SECS` | `60` | 切り替えた委譲先をスキップする秒数。`0` なら毎回第一候補から試す |
 
 ### ループの安全弁（§4 参照）
 

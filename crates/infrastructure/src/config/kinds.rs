@@ -176,6 +176,10 @@ pub enum RouterKind {
     Static,
     /// `--model cloud/claude-sonnet-5` selects the `cloud` provider.
     ModelPrefix,
+    /// Per-[`TaskKind`](agent_domain::model::llm::TaskKind) destinations
+    /// (`AGENT_ROUTE_SUMMARIZE=local`), with an explicit model prefix still
+    /// winning over them.
+    TaskKind,
 }
 
 impl RouterKind {
@@ -183,6 +187,7 @@ impl RouterKind {
         match self {
             Self::Static => "static",
             Self::ModelPrefix => "model-prefix",
+            Self::TaskKind => "task-kind",
         }
     }
 }
@@ -194,8 +199,9 @@ impl FromStr for RouterKind {
         match raw.trim().to_ascii_lowercase().as_str() {
             "static" | "default" | "single" => Ok(Self::Static),
             "model-prefix" | "model_prefix" | "prefix" => Ok(Self::ModelPrefix),
+            "task-kind" | "task_kind" | "task" => Ok(Self::TaskKind),
             other => Err(format!(
-                "unknown router `{other}` (expected static|model-prefix)"
+                "unknown router `{other}` (expected static|model-prefix|task-kind)"
             )),
         }
     }
@@ -280,6 +286,10 @@ mod tests {
             "model-prefix".parse::<RouterKind>().unwrap(),
             RouterKind::ModelPrefix
         );
+        assert_eq!(
+            "task-kind".parse::<RouterKind>().unwrap(),
+            RouterKind::TaskKind
+        );
         assert!("cheapest".parse::<RouterKind>().is_err());
     }
 
@@ -295,7 +305,11 @@ mod tests {
         ] {
             assert_eq!(policy.as_str().parse::<ApprovalPolicy>().unwrap(), policy);
         }
-        for router in [RouterKind::Static, RouterKind::ModelPrefix] {
+        for router in [
+            RouterKind::Static,
+            RouterKind::ModelPrefix,
+            RouterKind::TaskKind,
+        ] {
             assert_eq!(router.as_str().parse::<RouterKind>().unwrap(), router);
         }
     }
