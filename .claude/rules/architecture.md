@@ -44,6 +44,7 @@
 | `EventSink` | `TerminalRenderer`, `NullEventSink` |
 | `ConversationLog` | `FileConversationLog`, `NullConversationLog`（会話の記録。追記のみ） |
 | `SessionStore` | `FileSessionStore`（同じ記録の読み出し・一覧・削除） |
+| `Notifier` | `WebhookNotifier`（ntfy / Slack / json・既定無効）, `NullNotifier`。発火は cli のみ（承認ゲートと run / chat） |
 
 `LlmProvider` が合成パターンになっている点が重要です。ルータもリトライもそれ自体が `LlmProvider` なので、
 呼び出し側は積み方の変化を認識しません。

@@ -14,25 +14,52 @@ mod args;
 mod commands;
 mod composition;
 mod input;
+mod notify;
 mod render;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 
 use crate::args::{Cli, Command};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// How long exit waits for blocking work still running on the runtime.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+// The runtime is built by hand instead of with `#[tokio::main]` so that its
+// shutdown can be bounded. Dropping a runtime waits for every blocking-pool
+// thread, and a DNS lookup (`getaddrinfo`) for a notification webhook runs on
+// one and cannot be cancelled. A resolver that hangs would then keep the
+// process alive long after `Notifications::drain` gave up on it. Shutting
+// down with a timeout abandons such a thread instead, and still returns an
+// `ExitCode` normally - unlike `process::exit`, destructors and stdout
+// flushing run.
+fn main() -> ExitCode {
     // `.env` is a convenience for local runs; real environment variables win.
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
     agent_infrastructure::telemetry::init("warn");
 
-    match dispatch(cli).await {
+    // The same configuration `#[tokio::main]` produced.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = runtime.block_on(dispatch(cli));
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+
+    match result {
         Ok(code) => code,
         Err(error) => {
             // `{:#}` prints the whole context chain on one line, which is what

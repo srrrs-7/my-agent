@@ -22,9 +22,11 @@ use std::time::Duration;
 use crate::session::store::RetentionPolicy;
 
 use agent_domain::model::llm::{ModelId, ProviderId};
+use agent_domain::ports::notify::NotificationKind;
 use thiserror::Error;
 
 use crate::exec::SandboxRequirement;
+use crate::notify::{NotifyFormat, WebhookUrl};
 
 pub use env::{EnvSource, MapEnv, SystemEnv};
 pub use kinds::{ApprovalPolicy, ProviderKind, RouterKind};
@@ -202,6 +204,99 @@ pub struct SessionSettings {
     pub retention: RetentionPolicy,
 }
 
+/// Push notifications over a webhook.
+///
+/// Off unless a URL is set, and the URL being set is the operator's consent
+/// to what follows: a completed turn's notification carries the opening of
+/// the model's answer to a server outside this machine. `excerpt_chars = 0`
+/// keeps answers out entirely.
+///
+/// `Debug` is safe to print: [`WebhookUrl`] hides everything past the host.
+#[derive(Debug, Clone)]
+pub struct NotifySettings {
+    /// `None` wires a notifier that sends nothing.
+    pub webhook: Option<WebhookUrl>,
+    pub format: NotifyFormat,
+    /// What the operator subscribed to. Never empty.
+    pub events: Vec<NotificationKind>,
+    /// Completed turns shorter than this are not worth a buzz - in `chat`
+    /// the person who typed the prompt is usually still there. Approvals and
+    /// failures ignore it.
+    pub min_turn: Duration,
+    /// Characters of the answer to include. `0` sends none.
+    pub excerpt_chars: usize,
+}
+
+const NOTIFY_URL_KEY: &str = "AGENT_NOTIFY_WEBHOOK_URL";
+const NOTIFY_EVENTS_KEY: &str = "AGENT_NOTIFY_EVENTS";
+
+impl NotifySettings {
+    fn read(reader: &Reader<'_>) -> Result<Self, ConfigError> {
+        // The value is the secret, so no error below repeats it.
+        let webhook = match reader.string(NOTIFY_URL_KEY) {
+            None => None,
+            Some(raw) => Some(WebhookUrl::parse(&raw).map_err(|reason| {
+                ConfigError::invalid(
+                    NOTIFY_URL_KEY,
+                    "(hidden)",
+                    format!(
+                        "{reason}; expected e.g. https://ntfy.sh/<topic> or a Slack \
+                         incoming-webhook URL"
+                    ),
+                )
+            })?),
+        };
+
+        // An explicit format always wins over the guess from the host.
+        let format = match reader.optional::<NotifyFormat>("AGENT_NOTIFY_FORMAT")? {
+            Some(format) => format,
+            None => webhook
+                .as_ref()
+                .map_or(NotifyFormat::Json, NotifyFormat::infer),
+        };
+        if let Some(url) = &webhook {
+            crate::notify::endpoint(url, format)
+                .map_err(|reason| ConfigError::invalid(NOTIFY_URL_KEY, url.redacted(), reason))?;
+        }
+
+        Ok(Self {
+            webhook,
+            format,
+            events: notify_events(reader)?,
+            min_turn: Duration::from_secs(reader.parsed("AGENT_NOTIFY_MIN_SECS", 30)?),
+            excerpt_chars: reader.parsed("AGENT_NOTIFY_EXCERPT_CHARS", 100)?,
+        })
+    }
+}
+
+/// Absent or blank means every kind: someone who set a URL and nothing else
+/// wants to hear about everything.
+fn notify_events(reader: &Reader<'_>) -> Result<Vec<NotificationKind>, ConfigError> {
+    let entries = reader.list(NOTIFY_EVENTS_KEY);
+    if entries.is_empty() {
+        return Ok(NotificationKind::ALL.to_vec());
+    }
+
+    let mut kinds = entries
+        .iter()
+        .map(|entry| {
+            NotificationKind::ALL
+                .into_iter()
+                .find(|kind| kind.as_str().eq_ignore_ascii_case(entry))
+                .ok_or_else(|| {
+                    ConfigError::invalid(
+                        NOTIFY_EVENTS_KEY,
+                        entry,
+                        "expected a comma-separated list of: approval, completed, failed",
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    kinds.sort();
+    kinds.dedup();
+    Ok(kinds)
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub workspace: PathBuf,
@@ -212,6 +307,7 @@ pub struct Settings {
     pub prompt: PromptSettings,
     pub web_fetch: WebFetchSettings,
     pub shell: ShellSettings,
+    pub notify: NotifySettings,
     /// Largest file the read tool will load.
     pub max_file_bytes: u64,
 }
@@ -272,6 +368,7 @@ impl Settings {
                     .map(PathBuf::from)
                     .collect(),
             },
+            notify: NotifySettings::read(&reader)?,
             max_file_bytes: reader.parsed("AGENT_MAX_FILE_BYTES", 2 * 1024 * 1024)?,
         })
     }
@@ -390,6 +487,32 @@ fn describe_retention(policy: &RetentionPolicy) -> String {
     format!("{count}, kept {age}")
 }
 
+/// Where notifications go and what they carry, with the URL reduced to its
+/// host. The excerpt is called out because it is the part that leaves the
+/// machine with the model's words in it.
+fn describe_notify(notify: &NotifySettings) -> String {
+    let Some(url) = &notify.webhook else {
+        return "disabled".to_string();
+    };
+    let events = notify
+        .events
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let excerpt = if notify.excerpt_chars == 0 {
+        "no answer excerpt".to_string()
+    } else {
+        format!("first {} chars of each answer", notify.excerpt_chars)
+    };
+    format!(
+        "{} to {} ({events}; turns >= {}s; {excerpt})",
+        notify.format.as_str(),
+        url.redacted(),
+        notify.min_turn.as_secs()
+    )
+}
+
 /// `0` reads as "no limit" for every retention setting.
 ///
 /// A limit of zero would otherwise mean "delete everything immediately", which
@@ -445,6 +568,7 @@ pub fn describe(settings: &Settings) -> BTreeMap<String, String> {
             format!("enabled (sandbox: {}; {egress})", settings.shell.sandbox)
         },
     );
+    description.insert("notify".into(), describe_notify(&settings.notify));
     description.insert(
         "session log".into(),
         if settings.session.log {
@@ -823,5 +947,119 @@ mod tests {
         assert_eq!(provider.masked_api_key(), "*****");
         provider.api_key = None;
         assert_eq!(provider.masked_api_key(), "(none)");
+    }
+
+    #[test]
+    fn notifications_are_off_and_subscribe_to_everything_by_default() {
+        let settings = settings(&[("AGENT_MODEL", "m")]).unwrap();
+
+        assert!(settings.notify.webhook.is_none());
+        assert_eq!(settings.notify.format, NotifyFormat::Json);
+        assert_eq!(settings.notify.events, NotificationKind::ALL.to_vec());
+        assert_eq!(settings.notify.min_turn, Duration::from_secs(30));
+        assert_eq!(settings.notify.excerpt_chars, 100);
+        assert_eq!(describe(&settings)["notify"], "disabled");
+    }
+
+    #[test]
+    fn the_public_ntfy_host_implies_the_ntfy_format_unless_told_otherwise() {
+        let inferred = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_NOTIFY_WEBHOOK_URL", "https://ntfy.sh/my-topic"),
+        ])
+        .unwrap();
+        assert_eq!(inferred.notify.format, NotifyFormat::Ntfy);
+
+        let explicit = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_NOTIFY_WEBHOOK_URL", "https://ntfy.sh/my-topic"),
+            ("AGENT_NOTIFY_FORMAT", "json"),
+        ])
+        .unwrap();
+        assert_eq!(explicit.notify.format, NotifyFormat::Json);
+    }
+
+    #[test]
+    fn notification_filters_and_limits_come_from_the_environment() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            (
+                "AGENT_NOTIFY_WEBHOOK_URL",
+                "https://hooks.slack.com/services/T/B/x",
+            ),
+            ("AGENT_NOTIFY_FORMAT", "slack"),
+            ("AGENT_NOTIFY_EVENTS", "failed, Approval,failed"),
+            ("AGENT_NOTIFY_MIN_SECS", "0"),
+            ("AGENT_NOTIFY_EXCERPT_CHARS", "0"),
+        ])
+        .unwrap();
+
+        assert_eq!(settings.notify.format, NotifyFormat::Slack);
+        assert_eq!(
+            settings.notify.events,
+            vec![NotificationKind::Approval, NotificationKind::Failed]
+        );
+        assert_eq!(settings.notify.min_turn, Duration::ZERO);
+        assert_eq!(settings.notify.excerpt_chars, 0);
+    }
+
+    #[test]
+    fn a_bad_notification_setting_aborts_startup_and_names_the_variable() {
+        for (key, value) in [
+            ("AGENT_NOTIFY_FORMAT", "ntfyy"),
+            ("AGENT_NOTIFY_EVENTS", "approval,done"),
+            ("AGENT_NOTIFY_MIN_SECS", "soon"),
+        ] {
+            let error = settings(&[
+                ("AGENT_MODEL", "m"),
+                ("AGENT_NOTIFY_WEBHOOK_URL", "https://example.com/hook"),
+                (key, value),
+            ])
+            .expect_err("startup must fail");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_bad_webhook_url_is_rejected_without_being_repeated() {
+        let error = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_NOTIFY_WEBHOOK_URL", "hooks.example.com/s3cr3t"),
+        ])
+        .expect_err("not an absolute URL");
+        let message = error.to_string();
+        assert!(message.contains("AGENT_NOTIFY_WEBHOOK_URL"), "{message}");
+        assert!(!message.contains("s3cr3t"), "{message}");
+
+        let error = settings(&[
+            ("AGENT_MODEL", "m"),
+            ("AGENT_NOTIFY_WEBHOOK_URL", "https://ntfy.sh/"),
+            ("AGENT_NOTIFY_FORMAT", "ntfy"),
+        ])
+        .expect_err("ntfy without a topic");
+        assert!(error.to_string().contains("topic"), "{error}");
+    }
+
+    #[test]
+    fn the_webhook_url_is_masked_in_debug_output_and_in_doctor() {
+        let settings = settings(&[
+            ("AGENT_MODEL", "m"),
+            (
+                "AGENT_NOTIFY_WEBHOOK_URL",
+                "https://hooks.slack.com/services/T000/B000/XXXXSECRET",
+            ),
+        ])
+        .unwrap();
+
+        let debug = format!("{settings:?}");
+        let doctor = describe(&settings)["notify"].clone();
+        for shown in [&debug, &doctor] {
+            assert!(!shown.contains("XXXXSECRET"), "{shown}");
+            assert!(!shown.contains("services"), "{shown}");
+        }
+        assert!(
+            doctor.contains("https://hooks.slack.com/…"),
+            "doctor still says where notifications go: {doctor}"
+        );
     }
 }

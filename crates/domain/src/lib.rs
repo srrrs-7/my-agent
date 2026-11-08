@@ -21,7 +21,7 @@ pub mod ports;
 pub mod text;
 
 pub use error::{
-    ApprovalError, CommandError, DomainError, FetchError, FsError, LlmError, ToolError,
+    ApprovalError, CommandError, DomainError, FetchError, FsError, LlmError, NotifyError, ToolError,
 };
 pub use model::{
     context::ContextSnapshot,
@@ -42,6 +42,7 @@ pub use ports::{
     events::{AgentEvent, EventSink, FinishReason, NullEventSink},
     file_system::{DirEntry, EntryKind, FileSystem},
     llm::{ChatStream, LlmProvider, LlmRouter, RouteDecision, StreamEvent},
+    notify::{Notification, NotificationEvent, NotificationKind, Notifier, NullNotifier},
     prompt::PromptBuilder,
     search::{FileSearcher, SearchHit, SearchQuery},
     session_store::{SessionStore, SessionSummary},

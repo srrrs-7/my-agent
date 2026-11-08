@@ -210,3 +210,20 @@ pub enum ApprovalError {
     #[error("approval channel is unavailable: {0}")]
     Unavailable(String),
 }
+
+/// Failures produced by [`crate::ports::notify::Notifier`] implementations.
+///
+/// None of the variants carries the destination. A webhook URL is a
+/// credential: for Slack and for a public ntfy topic, knowing it is all it
+/// takes to post or to read. These errors end up in logs.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum NotifyError {
+    #[error("the notification endpoint could not be reached: {message}")]
+    Transport { message: String },
+
+    #[error("the notification endpoint did not answer within {seconds}s")]
+    Timeout { seconds: u64 },
+
+    #[error("the notification endpoint answered with HTTP {status}")]
+    HttpStatus { status: u16 },
+}

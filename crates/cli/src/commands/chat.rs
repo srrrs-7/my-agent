@@ -7,6 +7,7 @@ use crate::args::Resume;
 use crate::commands::tools;
 use crate::composition::Application;
 use crate::input::prompt_line;
+use crate::notify::DRAIN_TIMEOUT;
 use crate::session_id;
 
 const HELP: &str = "  /reset  start a new conversation\n  \
@@ -23,6 +24,14 @@ enum Input {
 }
 
 pub async fn execute(app: &Application, resume: Resume) -> Result<()> {
+    let result = repl(app, resume).await;
+    // Every way out of the loop passes here - `/exit`, Ctrl-D, and a broken
+    // stdin - so the last turn's notification is not lost with the process.
+    app.notifications.drain(DRAIN_TIMEOUT).await;
+    result
+}
+
+async fn repl(app: &Application, resume: Resume) -> Result<()> {
     banner(app);
 
     let mut session = start(app, resume).await;
@@ -45,9 +54,13 @@ pub async fn execute(app: &Application, resume: Resume) -> Result<()> {
             Input::Prompt => {}
         }
 
+        app.notifications.begin_turn(&session.id);
+        let result = app.agent.run(&mut session, line).await;
+        app.notifications.turn_finished(&result);
+
         // A failed turn must not end the session: the user may want to fix the
         // configuration, or simply try a different prompt.
-        if let Err(error) = app.agent.run(&mut session, line).await {
+        if let Err(error) = result {
             eprintln!("error: {error:#}");
         }
     }

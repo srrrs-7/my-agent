@@ -4,6 +4,7 @@
 //! result so it can pick another approach. That keeps a "no" cheap for the
 //! human and informative for the agent.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_domain::error::ApprovalError;
@@ -12,6 +13,7 @@ use agent_infrastructure::config::ApprovalPolicy;
 use async_trait::async_trait;
 
 use crate::input::prompt_line;
+use crate::notify::Notifications;
 
 pub struct CliApprovalGate {
     policy: ApprovalPolicy,
@@ -19,14 +21,22 @@ pub struct CliApprovalGate {
     /// Set once the user answers "a" - approve everything for the rest of the
     /// session.
     approve_all: AtomicBool,
+    /// Told when a prompt is about to block on a human, and when the human
+    /// answers. Shared with the subcommands, which time turns against it.
+    notifications: Arc<Notifications>,
 }
 
 impl CliApprovalGate {
-    pub fn new(policy: ApprovalPolicy, interactive: bool) -> Self {
+    pub fn new(
+        policy: ApprovalPolicy,
+        interactive: bool,
+        notifications: Arc<Notifications>,
+    ) -> Self {
         Self {
             policy,
             interactive,
             approve_all: AtomicBool::new(false),
+            notifications,
         }
     }
 
@@ -68,9 +78,15 @@ impl ApprovalGate for CliApprovalGate {
             request.summary
         );
 
+        // Only here, once nothing is left that could answer for the human:
+        // an auto-approved or auto-denied call blocks nobody. Fire and forget
+        // - a delivery failure must not turn into a denied tool call.
+        self.notifications.approval_pending(request);
+
         let answer = prompt_line(&question)
             .await
             .map_err(|error| ApprovalError::Unavailable(error.to_string()))?;
+        self.notifications.engaged();
 
         match answer
             .map(|line| line.trim().to_ascii_lowercase())
@@ -102,6 +118,13 @@ mod tests {
     use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName, ToolSafety};
     use serde_json::json;
 
+    use crate::notify::tests::{RecordingNotifier, everything};
+    use crate::notify::{DRAIN_TIMEOUT, Notifications};
+
+    fn gate(policy: ApprovalPolicy, interactive: bool) -> CliApprovalGate {
+        CliApprovalGate::new(policy, interactive, Arc::new(Notifications::disabled()))
+    }
+
     fn request(safety: ToolSafety) -> ApprovalRequest {
         ApprovalRequest {
             call: ToolCall::new(
@@ -116,26 +139,26 @@ mod tests {
 
     #[test]
     fn auto_policy_never_asks() {
-        let gate = CliApprovalGate::new(ApprovalPolicy::Auto, true);
+        let gate = gate(ApprovalPolicy::Auto, true);
         assert!(!gate.needs_confirmation(&request(ToolSafety::Destructive)));
     }
 
     #[test]
     fn read_only_policy_asks_only_for_writes() {
-        let gate = CliApprovalGate::new(ApprovalPolicy::ReadOnlyAuto, true);
+        let gate = gate(ApprovalPolicy::ReadOnlyAuto, true);
         assert!(!gate.needs_confirmation(&request(ToolSafety::ReadOnly)));
         assert!(gate.needs_confirmation(&request(ToolSafety::Mutating)));
     }
 
     #[test]
     fn ask_policy_asks_for_everything() {
-        let gate = CliApprovalGate::new(ApprovalPolicy::Ask, true);
+        let gate = gate(ApprovalPolicy::Ask, true);
         assert!(gate.needs_confirmation(&request(ToolSafety::ReadOnly)));
     }
 
     #[tokio::test]
     async fn non_interactive_sessions_deny_instead_of_hanging() {
-        let gate = CliApprovalGate::new(ApprovalPolicy::ReadOnlyAuto, false);
+        let gate = gate(ApprovalPolicy::ReadOnlyAuto, false);
         let decision = gate
             .authorize(&request(ToolSafety::Mutating))
             .await
@@ -144,5 +167,27 @@ mod tests {
             ApprovalDecision::Deny { reason } => assert!(reason.contains("--yes")),
             other => panic!("expected a denial, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn no_one_is_paged_when_no_prompt_is_shown() {
+        // Auto-approval and the non-interactive denial both decide without a
+        // human, so nobody is waiting and nothing should buzz.
+        let notifier = Arc::new(RecordingNotifier::default());
+        let notifications = Arc::new(Notifications::new(notifier.clone(), everything()));
+
+        for (policy, interactive) in [
+            (ApprovalPolicy::Auto, true),
+            (ApprovalPolicy::ReadOnlyAuto, false),
+        ] {
+            let gate = CliApprovalGate::new(policy, interactive, notifications.clone());
+            gate.authorize(&request(ToolSafety::Destructive))
+                .await
+                .unwrap();
+        }
+        notifications.drain(DRAIN_TIMEOUT).await;
+
+        let sent = notifier.sent.lock().unwrap();
+        assert!(sent.is_empty(), "{sent:?}");
     }
 }

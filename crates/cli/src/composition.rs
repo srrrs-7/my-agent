@@ -24,6 +24,7 @@ use agent_domain::ports::approval::ApprovalGate;
 use agent_domain::ports::conversation_log::{ConversationLog, NullConversationLog};
 use agent_domain::ports::events::EventSink;
 use agent_domain::ports::llm::LlmProvider;
+use agent_domain::ports::notify::{Notifier, NullNotifier};
 use agent_domain::ports::prompt::PromptBuilder;
 use agent_domain::ports::session_store::SessionStore;
 use agent_domain::ports::tool::Tool;
@@ -31,6 +32,7 @@ use agent_infrastructure::config::{ApprovalPolicy, PromptSettings, Settings, She
 use agent_infrastructure::exec::{ExecConfig, SandboxedCommandRunner};
 use agent_infrastructure::fs::{IgnoreAwareSearcher, LocalFileSystem, WorkspaceContextProvider};
 use agent_infrastructure::llm::build_provider;
+use agent_infrastructure::notify::WebhookNotifier;
 use agent_infrastructure::session::{FileConversationLog, FileSessionStore};
 use agent_infrastructure::tools::TimeoutTool;
 use agent_infrastructure::web::{GuardedWebFetcher, WebFetchConfig};
@@ -40,6 +42,7 @@ use tracing::warn;
 
 use crate::approval::CliApprovalGate;
 use crate::args::{Cli, Resume};
+use crate::notify::{Notifications, NotifyPolicy};
 use crate::render::TerminalRenderer;
 
 pub struct Application {
@@ -56,6 +59,9 @@ pub struct Application {
     /// port, and the commands it confines refer to that port by number.
     /// `doctor` also reads its reported sandbox rather than the configuration.
     pub commands: Option<Arc<SandboxedCommandRunner>>,
+    /// The same instance the approval gate holds: the gate restarts the turn
+    /// clock when a prompt is answered, and the subcommands read it.
+    pub notifications: Arc<Notifications>,
 }
 
 /// Async because the egress proxy binds a socket at startup - see
@@ -82,8 +88,29 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
     let context = Arc::new(WorkspaceContextProvider::new(workspace.clone()));
     let provider = build_provider(&settings.llm).context("cannot build the LLM provider")?;
 
-    let approval: Arc<dyn ApprovalGate> =
-        Arc::new(CliApprovalGate::new(settings.approval, interactive));
+    // No URL means `NullNotifier`, not a flag: nothing above this line has a
+    // "notifications are off" branch, and nothing is ever sent.
+    let notifier: Arc<dyn Notifier> = match &settings.notify.webhook {
+        Some(url) => Arc::new(
+            WebhookNotifier::new(
+                url,
+                settings.notify.format,
+                agent_infrastructure::notify::DEFAULT_TIMEOUT,
+            )
+            .context("cannot set up webhook notifications")?,
+        ),
+        None => Arc::new(NullNotifier),
+    };
+    let notifications = Arc::new(Notifications::new(
+        notifier,
+        NotifyPolicy::from_settings(&settings.notify),
+    ));
+
+    let approval: Arc<dyn ApprovalGate> = Arc::new(CliApprovalGate::new(
+        settings.approval,
+        interactive,
+        notifications.clone(),
+    ));
     let events: Arc<dyn EventSink> = Arc::new(TerminalRenderer::new(cli.verbose, cli.no_color));
 
     let mut tools = build_tools(
@@ -188,6 +215,7 @@ pub async fn build(cli: &Cli, interactive: bool) -> Result<Application> {
         agent,
         sessions,
         commands,
+        notifications,
     })
 }
 
