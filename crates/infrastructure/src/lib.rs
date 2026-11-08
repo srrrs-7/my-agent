@@ -14,6 +14,7 @@ pub mod llm;
 pub mod mcp;
 pub(crate) mod net;
 pub mod notify;
+pub mod secrets;
 pub mod session;
 pub mod telemetry;
 pub mod tools;

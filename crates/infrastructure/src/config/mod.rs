@@ -604,7 +604,7 @@ impl Settings {
     /// tool output and notifications: [`Self::configured_secrets`], and the
     /// value of every variable in `environment` whose name the command sandbox
     /// would keep from a child process - when the value itself looks like a
-    /// secret (see `exec::env::secret_values`).
+    /// secret (see [`crate::secrets::secret_values`]).
     ///
     /// The environment is passed in (`SystemEnv.vars()` in production) for
     /// the same reason the settings are read through an [`EnvSource`]. It
@@ -613,7 +613,7 @@ impl Settings {
     /// `GITHUB_TOKEN`, a database password - is in there too.
     pub fn secrets(&self, environment: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
         let mut secrets = self.configured_secrets();
-        secrets.extend(crate::exec::env::secret_values(environment));
+        secrets.extend(crate::secrets::secret_values(environment));
         secrets
     }
 
