@@ -16,6 +16,7 @@ use crate::composition::Application;
 use crate::ctrl_c::{CtrlC, Sigint, TurnEnd};
 use crate::input::prompt_line;
 use crate::notify::DRAIN_TIMEOUT;
+use crate::references;
 use crate::render::{describe_plan, describe_usage};
 use crate::session_id;
 
@@ -123,8 +124,9 @@ async fn repl(app: &Application, resume: Resume) -> Result<ExitCode> {
             Input::Prompt => {}
         }
 
+        let prompt = references::expand(app, line).await;
         // An interrupted turn is `Ok` and the session carries on from it.
-        let result = match run_turn(app, &mut session, line, &mut sigint, &mut keys).await {
+        let result = match run_turn(app, &mut session, prompt, &mut sigint, &mut keys).await {
             TurnEnd::Finished(result) => result,
             TurnEnd::Abandoned(code) => return Ok(code),
         };

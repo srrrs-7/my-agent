@@ -33,6 +33,7 @@ use agent_domain::ports::background::{BackgroundCommands, JobLimits};
 use agent_domain::ports::command::CommandRunner as _;
 use agent_domain::ports::conversation_log::{ConversationLog, NullConversationLog};
 use agent_domain::ports::events::EventSink;
+use agent_domain::ports::file_system::FileSystem;
 use agent_domain::ports::llm::LlmProvider;
 use agent_domain::ports::notify::{Notifier, NullNotifier};
 use agent_domain::ports::prompt::PromptBuilder;
@@ -101,6 +102,9 @@ pub struct Application {
     /// The whole approval stack the loop asks, outermost first:
     /// `PlanModeGate(RuleGate(CliApprovalGate))` (see `approval_stack`).
     pub approval: Arc<dyn ApprovalGate>,
+    /// The tools' file system, for `@path` references in `chat`: what the
+    /// user attaches is read under the same rules as what the model reads.
+    pub files: Arc<dyn FileSystem>,
 }
 
 /// What differs between the callers of [`assemble`].
@@ -260,6 +264,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
     };
 
     let checkpoints = Arc::new(CheckpointJournal::new(file_system.clone()));
+    let files: Arc<dyn FileSystem> = file_system.clone();
     let mut tools = build_tools(
         file_system,
         searcher,
@@ -409,6 +414,7 @@ pub async fn assemble(settings: Settings, wiring: Wiring) -> Result<Application>
         checkpoints,
         plan_mode,
         approval,
+        files,
     })
 }
 
