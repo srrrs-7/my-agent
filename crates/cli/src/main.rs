@@ -65,6 +65,13 @@ fn main() -> ExitCode {
 }
 
 async fn dispatch(cli: Cli) -> Result<ExitCode> {
+    // eval builds one agent per attempt, each over a scratch copy of a
+    // fixture. The agent for the real workspace is never built, so nothing -
+    // not even session retention - touches it.
+    if let Some(Command::Eval(args)) = &cli.command {
+        return commands::eval::execute(&cli, args).await;
+    }
+
     // Without a TTY there is nobody to answer an approval prompt, so the gate
     // has to deny rather than block forever.
     let interactive = std::io::stdin().is_terminal();
@@ -91,5 +98,8 @@ async fn dispatch(cli: Cli) -> Result<ExitCode> {
             commands::doctor::execute(&app).await?;
             ExitCode::SUCCESS
         }
+        // Answered above, before an agent was built for the real workspace;
+        // repeating it here is harmless, which a panic would not be.
+        Command::Eval(args) => commands::eval::execute(&cli, &args).await?,
     })
 }

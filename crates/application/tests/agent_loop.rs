@@ -1141,6 +1141,46 @@ async fn an_overflowing_history_is_folded_into_a_summary_instead_of_being_droppe
 }
 
 #[tokio::test]
+async fn the_summary_request_is_counted_in_the_session_usage() {
+    // The summary is a request on the same bill as the turn. Dropping its
+    // usage made long sessions - the only ones that compact - look cheaper
+    // than they were, which is precisely what an eval comparing token counts
+    // must not be told.
+    let summary = ChatResponse {
+        usage: TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 200,
+            ..TokenUsage::default()
+        },
+        ..assistant("RECORD OF THE SESSION")
+    };
+    let provider = ScriptedProvider::new(vec![summary, assistant("ok")]);
+    let agent = loop_with_config(
+        provider.clone(),
+        registry(MemoryFileSystem::default().into()),
+        Arc::new(AlwaysApprove),
+        Arc::new(NullEventSink),
+        compacting_config(8 * 1024),
+    );
+
+    let mut session = crowded_session("c-usage");
+    let outcome = agent.run(&mut session, "carry on").await.unwrap();
+
+    assert_eq!(
+        provider.requests()[0].metadata.task_kind,
+        TaskKind::Summarize,
+        "precondition: the history really was compacted"
+    );
+    // 1000/200 for the summary, 10/5 for the turn.
+    assert_eq!(session.usage.input_tokens, 1_010, "{:?}", session.usage);
+    assert_eq!(session.usage.output_tokens, 205, "{:?}", session.usage);
+    assert_eq!(
+        outcome.usage, session.usage,
+        "the outcome reports the same total"
+    );
+}
+
+#[tokio::test]
 async fn a_compacted_history_is_still_well_formed() {
     // `compact_keep_recent: 3` leaves a complete tool turn in the tail, so the
     // pairing check below has something to be wrong about. With a smaller tail

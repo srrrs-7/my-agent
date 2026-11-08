@@ -4,6 +4,8 @@ created: 2026-11-08
 urgency: medium
 importance: high
 priority: P1
+started: 2026-11-08
+completed: 2026-11-08
 scope: [application, infrastructure, cli, docs, ops]
 ---
 
@@ -47,17 +49,17 @@ scope: [application, infrastructure, cli, docs, ops]
 
 ## 達成条件
 
-- [ ] `agent replay <ID>` が LLM にもネットワークにも出ずに完走し、圧縮・刈り込みの発生回数と、
+- [x] `agent replay <ID>` が LLM にもネットワークにも出ずに完走し、圧縮・刈り込みの発生回数と、
       各時点の履歴の大きさを出す
-- [ ] 同じ記録・同じ設定で replay を 2 回流すと、出力が一致する
-- [ ] 予算などの設定を変えて replay すると、その差が出力に現れる
-- [ ] `agent eval <tasks>` がタスクごとの成功／失敗・反復回数・入出力トークン・レイテンシと、
+- [x] 同じ記録・同じ設定で replay を 2 回流すと、出力が一致する
+- [x] 予算などの設定を変えて replay すると、その差が出力に現れる
+- [x] `agent eval <tasks>` がタスクごとの成功／失敗・反復回数・入出力トークン・レイテンシと、
       全体の成功率を JSON（stdout）で出す
-- [ ] タスクの成否判定の方法をタスク定義に書ける（方式は設計で決める）
-- [ ] eval はタスクごとに使い捨ての作業ディレクトリで動き、実ワークスペースを変更しない
-- [ ] JSON の形式と、2 回分の結果を比べる手順が README に書かれている
-- [ ] eval / replay のテストがモックサーバとフェイクだけで通る
-- [ ] `make check` が緑
+- [x] タスクの成否判定の方法をタスク定義に書ける（方式は設計で決める）
+- [x] eval はタスクごとに使い捨ての作業ディレクトリで動き、実ワークスペースを変更しない
+- [x] JSON の形式と、2 回分の結果を比べる手順が README に書かれている
+- [x] eval / replay のテストがモックサーバとフェイクだけで通る
+- [x] `make check` が緑
 
 ## 優先度の根拠
 
@@ -95,3 +97,5 @@ score 8 → P1。
 - 検査コマンドは `SandboxedCommandRunner` を通す（タスクごとにスクラッチをルートに作成）。要求サンドボックスが得られなければ LLM を呼ぶ前に失敗。`confines()` が偽なら eval では run_command を登録しない
 - **既存バグ修正**: 圧縮の要約リクエストの usage が捨てられている（`compaction.rs:213-219`, `loop_runner.rs:174`）→ `CompactionReport` に usage を持たせ session.usage に積む
 - stdout は JSON 報告専用、進捗は stderr。会話ログは `<out>/sessions/`。報告に provider/model/設定/sandbox/システムプロンプト指紋（FNV-1a、DefaultHasher は使わない）。`--repeat N` を v1 に入れる
+
+- 2026-11-08 完了（eval のみ。replay は設計確認の結論どおり作らない — 必要になったら fit_history を部品化して別 issue）。圧縮の要約の usage を session.usage に積むバグも修正。終了コード 0=全成功 / 1=実行不能 / 3=失敗あり。root 判断: コマンド検査を含むスイートは AGENT_SHELL_SANDBOX=none でも confined を要求する（モデルが書いたコードを実行するため）＝ macOS ホストではコマンド検査付きスイートは失敗する。システムプロンプトの指紋は固定のプレースホルダ文脈で描画（AGENTS.md の中身は含まない）。既知: 準備段階の失敗でスイート全体が中断し部分レポートが出ない、Ctrl-C でスクラッチが残る

@@ -42,7 +42,7 @@
 | `WebFetcher` | `GuardedWebFetcher`（SSRF ガード付き・既定無効） |
 | `CommandRunner` | `SandboxedCommandRunner`（Linux: Landlock + egress プロキシ・既定無効） |
 | `ToolServer` | `McpServer`（MCP over stdio。サーバは Landlock の中・既定無効。命名・安全区分・無害化は application の `tools/server.rs`） |
-| `EventSink` | `TerminalRenderer`, `NullEventSink` |
+| `EventSink` | `TerminalRenderer`, `NullEventSink`, `MetricsSink`（eval の計測） |
 | `ConversationLog` | `FileConversationLog`, `NullConversationLog`（会話の記録。追記のみ） |
 | `SessionStore` | `FileSessionStore`（同じ記録の読み出し・一覧・削除） |
 | `Notifier` | `WebhookNotifier`（ntfy / Slack / json・既定無効）, `NullNotifier`。発火は cli のみ（承認ゲートと run / chat） |

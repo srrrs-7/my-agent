@@ -540,7 +540,7 @@ fn redact_all(tools: &ToolRegistry, redactor: &Arc<Redactor>) -> Arc<ToolRegistr
 /// read (or an effectively empty file) aborts startup: silently falling back
 /// to the built-in prompt would hide exactly the misconfiguration the
 /// operator most needs to see.
-fn build_prompt_builder(prompt: &PromptSettings) -> Result<Arc<dyn PromptBuilder>> {
+pub(crate) fn build_prompt_builder(prompt: &PromptSettings) -> Result<Arc<dyn PromptBuilder>> {
     let base: Arc<dyn PromptBuilder> = match &prompt.replace_file {
         Some(path) => {
             let contents = std::fs::read_to_string(path).with_context(|| {
@@ -565,7 +565,7 @@ fn build_prompt_builder(prompt: &PromptSettings) -> Result<Arc<dyn PromptBuilder
 }
 
 /// Environment first, command-line flags on top.
-fn resolve_settings(cli: &Cli) -> Result<Settings> {
+pub(crate) fn resolve_settings(cli: &Cli) -> Result<Settings> {
     let mut settings = Settings::from_env()
         .context("invalid configuration - copy .env.example to .env (make env) and fill it in")?;
     apply_cli_overrides(&mut settings, cli);

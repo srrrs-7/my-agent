@@ -2,10 +2,12 @@
 
 pub mod context;
 pub mod local;
+pub mod scratch;
 pub mod search;
 
 pub use context::WorkspaceContextProvider;
 pub use local::LocalFileSystem;
+pub use scratch::{ScratchDir, ScratchError};
 pub use search::IgnoreAwareSearcher;
 
 use agent_domain::error::FsError;

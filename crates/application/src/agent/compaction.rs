@@ -45,7 +45,9 @@
 use std::sync::Arc;
 
 use agent_domain::model::conversation::Conversation;
-use agent_domain::model::llm::{ChatRequest, GenerationParams, ModelId, RequestMetadata, TaskKind};
+use agent_domain::model::llm::{
+    ChatRequest, GenerationParams, ModelId, RequestMetadata, TaskKind, TokenUsage,
+};
 use agent_domain::model::message::{ContentBlock, Message, Role};
 use agent_domain::ports::llm::LlmProvider;
 use agent_domain::text;
@@ -181,6 +183,11 @@ pub struct CompactionReport {
     pub folded_messages: usize,
     pub before_bytes: usize,
     pub after_bytes: usize,
+    /// What the summary request cost. Carried out rather than dropped here:
+    /// it is a real request on the same bill, and a turn's usage that leaves
+    /// it out understates exactly the sessions that ran long enough to need
+    /// compacting.
+    pub usage: TokenUsage,
 }
 
 pub struct HistoryCompactor {
@@ -214,8 +221,8 @@ impl HistoryCompactor {
         let before_bytes = conversation.approx_bytes();
         let transcript = render_transcript(conversation, split);
 
-        let summary = match self.llm.chat(self.request(session_id, transcript)).await {
-            Ok(response) => response.message.text(),
+        let (summary, usage) = match self.llm.chat(self.request(session_id, transcript)).await {
+            Ok(response) => (response.message.text(), response.usage),
             Err(error) => {
                 warn!(%error, "history compaction failed; falling back to trimming");
                 return None;
@@ -234,6 +241,7 @@ impl HistoryCompactor {
             folded_messages: folded,
             before_bytes,
             after_bytes,
+            usage,
         })
     }
 

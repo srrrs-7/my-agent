@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod error;
+pub mod eval;
 pub mod supply_chain;
 pub mod tools;
 

@@ -398,6 +398,7 @@ impl AgentLoop {
                 .await?
         {
             shortened = true;
+            session.usage.accumulate(report.usage);
             self.events.emit(AgentEvent::HistoryCompacted {
                 folded_messages: report.folded_messages,
                 before_bytes: report.before_bytes,
