@@ -12,6 +12,7 @@ use agent_domain::model::dependency::DependencyFileChange;
 use agent_domain::model::llm::TokenUsage;
 use agent_domain::model::plan::{Plan, PlanStatus};
 use agent_domain::ports::events::{AgentEvent, EventSink, FinishReason};
+use agent_domain::text::printable;
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -49,11 +50,19 @@ impl TerminalRenderer {
         }
     }
 
+    /// `text`, made [`printable`] and coloured.
+    ///
+    /// Every piece of a status line goes through here - or through
+    /// [`printable`] directly when it is not coloured - so the sanitising
+    /// happens where text leaves for the terminal, and nothing upstream has to
+    /// remember to do it. The escape codes of the colour itself are added
+    /// after, which is why this cannot be applied to a finished line.
     fn paint(&self, style: &str, text: &str) -> String {
+        let text = printable(text);
         if self.color {
             format!("{style}{text}{RESET}")
         } else {
-            text.to_string()
+            text
         }
     }
 
@@ -107,30 +116,53 @@ impl TerminalRenderer {
 
 impl EventSink for TerminalRenderer {
     fn emit(&self, event: AgentEvent) {
-        match event {
+        match &event {
+            AgentEvent::AssistantDelta { text } => return self.answer_delta(text),
+            AgentEvent::AssistantMessage { text } => return self.answer(text),
+            // A turn that failed mid-stream never got its `AssistantMessage`
+            // or its `RunFinished`; without this its half line would run into
+            // the next turn's output, and the next turn's answer - if it is
+            // not streamed - would be taken for the end of it and swallowed.
+            AgentEvent::RunStarted { .. }
+            | AgentEvent::IterationStarted { .. }
+            | AgentEvent::RunFinished { .. } => self.end_stream(),
+            _ => {}
+        }
+        if let Some(line) = self.status_line(&event) {
+            self.status(line);
+        }
+    }
+}
+
+impl TerminalRenderer {
+    /// What `event` prints on stderr, if anything. Separate from the writing
+    /// so that what reaches the terminal can be tested.
+    fn status_line(&self, event: &AgentEvent) -> Option<String> {
+        let line = match event {
             AgentEvent::RunStarted {
                 provider, model, ..
             } => {
-                if self.verbose {
-                    let model = model
-                        .map(|m| m.to_string())
-                        .unwrap_or_else(|| "default".into());
-                    self.status(self.paint(DIM, &format!("· provider={provider} model={model}")));
+                if !self.verbose {
+                    return None;
                 }
+                let model = model
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "default".into());
+                self.paint(DIM, &format!("· provider={provider} model={model}"))
             }
 
             AgentEvent::IterationStarted { iteration, limit } => {
-                if self.verbose {
-                    self.status(self.paint(DIM, &format!("· iteration {iteration}/{limit}")));
+                if !self.verbose {
+                    return None;
                 }
+                self.paint(DIM, &format!("· iteration {iteration}/{limit}"))
             }
 
-            AgentEvent::HistoryTrimmed { dropped_messages } => {
-                self.status(self.paint(
-                    YELLOW,
-                    &format!("! trimmed {dropped_messages} old messages to fit the context budget"),
-                ));
-            }
+            AgentEvent::HistoryTrimmed { dropped_messages } => self.paint(
+                YELLOW,
+                &format!("! trimmed {dropped_messages} old messages to fit the context budget"),
+            ),
 
             AgentEvent::HistoryCompacted {
                 folded_messages,
@@ -138,7 +170,7 @@ impl EventSink for TerminalRenderer {
                 after_bytes,
             } => {
                 // Deliberately not a warning: unlike a trim, nothing was lost.
-                self.status(self.paint(
+                self.paint(
                     DIM,
                     &format!(
                         "~ compacted {folded_messages} old messages into a summary \
@@ -146,7 +178,7 @@ impl EventSink for TerminalRenderer {
                         before_bytes / 1024,
                         after_bytes / 1024
                     ),
-                ));
+                )
             }
 
             AgentEvent::ModelResponded {
@@ -156,29 +188,30 @@ impl EventSink for TerminalRenderer {
                 stop_reason,
                 ..
             } => {
-                if self.verbose {
-                    self.status(self.paint(
-                        DIM,
-                        &format!(
-                            "· {model} · {} · {} · {stop_reason:?}",
-                            describe_usage(&usage),
-                            format_duration(latency),
-                        ),
-                    ));
+                if !self.verbose {
+                    return None;
                 }
+                self.paint(
+                    DIM,
+                    &format!(
+                        "· {model} · {} · {} · {stop_reason:?}",
+                        describe_usage(usage),
+                        format_duration(*latency),
+                    ),
+                )
             }
 
-            AgentEvent::AssistantDelta { text } => self.answer_delta(&text),
-
-            AgentEvent::AssistantMessage { text } => self.answer(&text),
+            AgentEvent::AssistantDelta { .. } | AgentEvent::AssistantMessage { .. } => {
+                return None;
+            }
 
             AgentEvent::ToolCallStarted { call, safety } => {
                 let marker = if safety.is_read_only() { CYAN } else { YELLOW };
-                self.status(format!(
+                format!(
                     "{} {}",
                     self.paint(marker, "→"),
                     self.paint(BOLD, call.name.as_str())
-                ));
+                )
             }
 
             AgentEvent::ToolCallFinished {
@@ -188,82 +221,79 @@ impl EventSink for TerminalRenderer {
                 duration,
                 ..
             } => {
-                let (style, glyph) = if is_error {
+                let (style, glyph) = if *is_error {
                     (RED, "✗")
                 } else {
                     (GREEN, "✓")
                 };
-                self.status(format!(
+                format!(
                     "{} {} {}",
                     self.paint(style, glyph),
-                    self.paint(DIM, &format!("{name} ({})", format_duration(duration))),
-                    summary
-                ));
+                    self.paint(DIM, &format!("{name} ({})", format_duration(*duration))),
+                    printable(summary)
+                )
             }
 
             AgentEvent::ToolCallDenied { name, reason } => {
-                self.status(self.paint(YELLOW, &format!("⊘ {name} denied: {reason}")));
+                self.paint(YELLOW, &format!("⊘ {name} denied: {reason}"))
             }
 
-            AgentEvent::PlanUpdated { plan } => self.status(self.checklist(&plan)),
+            AgentEvent::PlanUpdated { plan } => self.checklist(plan),
 
             AgentEvent::DependenciesChanged { name, files } => {
-                self.status(self.paint(
-                    YELLOW,
-                    &describe_dependency_files(&name.to_string(), &files),
-                ));
+                self.paint(YELLOW, &describe_dependency_files(&name.to_string(), files))
             }
 
             AgentEvent::RunFinished {
                 reason,
                 iterations,
                 usage,
-            } => {
-                self.end_stream();
-                self.run_finished(reason, iterations, usage);
-            }
-        }
+            } => return self.run_finished(reason, *iterations, usage),
+        };
+        Some(line)
     }
-}
 
-impl TerminalRenderer {
-    fn run_finished(&self, reason: FinishReason, iterations: u32, usage: TokenUsage) {
-        match reason {
+    fn run_finished(
+        &self,
+        reason: &FinishReason,
+        iterations: u32,
+        usage: &TokenUsage,
+    ) -> Option<String> {
+        let line = match reason {
             FinishReason::Completed => {
-                if self.verbose {
-                    self.status(self.paint(
-                        DIM,
-                        &format!(
-                            "· done in {iterations} iteration(s), {} tokens{}",
-                            usage.total(),
-                            cache_suffix(&usage)
-                        ),
-                    ));
+                if !self.verbose {
+                    return None;
                 }
-            }
-            FinishReason::MaxIterations { limit } => {
-                self.status(self.paint(
-                    YELLOW,
+                self.paint(
+                    DIM,
                     &format!(
-                        "! stopped after the {limit}-iteration budget; the answer above may \
-                             be incomplete (raise --max-iterations to allow more)"
+                        "· done in {iterations} iteration(s), {} tokens{}",
+                        usage.total(),
+                        cache_suffix(usage)
                     ),
-                ));
+                )
             }
+            FinishReason::MaxIterations { limit } => self.paint(
+                YELLOW,
+                &format!(
+                    "! stopped after the {limit}-iteration budget; the answer above may \
+                     be incomplete (raise --max-iterations to allow more)"
+                ),
+            ),
             FinishReason::Stopped { stop_reason } => {
-                self.status(self.paint(YELLOW, &format!("! the model stopped: {stop_reason}")));
+                self.paint(YELLOW, &format!("! the model stopped: {stop_reason}"))
             }
-            FinishReason::Interrupted => {
-                self.status(self.paint(YELLOW, "! interrupted"));
-            }
-        }
+            FinishReason::Interrupted => self.paint(YELLOW, "! interrupted"),
+        };
+        Some(line)
     }
 }
 
 /// Files listed in a dependency warning before the rest are counted.
 const MAX_FILES_SHOWN: usize = 10;
 
-/// The warning for dependency files a call changed without approval.
+/// The warning for dependency files a call changed without approval. Not yet
+/// [`printable`]: the caller paints it, which cleans it.
 fn describe_dependency_files(tool: &str, files: &[DependencyFileChange]) -> String {
     let mut shown: Vec<String> = files
         .iter()
@@ -271,7 +301,7 @@ fn describe_dependency_files(tool: &str, files: &[DependencyFileChange]) -> Stri
         .map(|file| {
             format!(
                 "{} ({} {})",
-                printable(&file.path),
+                file.path,
                 file.kind.label(),
                 file.change.label()
             )
@@ -286,24 +316,13 @@ fn describe_dependency_files(tool: &str, files: &[DependencyFileChange]) -> Stri
     )
 }
 
-/// `text` with everything that could act on the terminal instead of being
-/// shown replaced by `?`: control characters (escape sequences, carriage
-/// returns that redraw a line, newlines that push the question off screen)
-/// and the bidirectional overrides that make text read differently from what
-/// it is. Used for what came from the model or from a file, wherever a human
-/// decides on the strength of it.
-pub fn printable(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            let bidi = matches!(c, '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
-            if c.is_control() || bidi { '?' } else { c }
-        })
-        .collect()
-}
-
 /// The plan as a checklist, one item per line, the step in progress
 /// highlighted. Always the whole plan: the event only fires when it changed,
 /// and a diff would leave the reader to assemble it.
+///
+/// `paint` must make what it is given [`printable`]. [`Plan::new`] already
+/// refuses an item that is not, but the line breaks between items are the only
+/// ones this output may contain, so the items are cleaned here regardless.
 fn draw_plan(plan: &Plan, paint: &dyn Fn(&'static str, &str) -> String) -> String {
     if plan.is_empty() {
         return paint(DIM, "☐ plan cleared");
@@ -320,7 +339,7 @@ fn draw_plan(plan: &Plan, paint: &dyn Fn(&'static str, &str) -> String) -> Strin
         lines.push(match item.status {
             PlanStatus::Completed => paint(DIM, &format!("  [x] {}", item.content)),
             PlanStatus::InProgress => paint(CYAN, &format!("  [>] {}", item.content)),
-            PlanStatus::Pending => format!("  [ ] {}", item.content),
+            PlanStatus::Pending => format!("  [ ] {}", printable(&item.content)),
         });
     }
     lines.join("\n")
@@ -330,7 +349,7 @@ fn draw_plan(plan: &Plan, paint: &dyn Fn(&'static str, &str) -> String) -> Strin
 /// draws it in.
 pub fn describe_plan(plan: Option<&Plan>) -> String {
     match plan {
-        Some(plan) => draw_plan(plan, &|_, text| text.to_string()),
+        Some(plan) => draw_plan(plan, &|_, text| printable(text)),
         None => "no plan".to_string(),
     }
 }
@@ -372,12 +391,6 @@ fn format_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
     use agent_domain::model::plan::PlanItem;
-
-    #[test]
-    fn nothing_that_drives_the_terminal_survives_printable() {
-        let shown = printable("evil\x1b[2J\r\nsafe\u{202E}gnp.exe");
-        assert_eq!(shown, "evil?[2J??safe?gnp.exe");
-    }
 
     #[test]
     fn a_dependency_warning_names_the_tool_and_every_file_up_to_a_limit() {
@@ -472,5 +485,124 @@ mod tests {
     fn colour_is_suppressed_on_request() {
         let renderer = TerminalRenderer::new(false, true);
         assert_eq!(renderer.paint(RED, "x"), "x");
+    }
+
+    #[test]
+    fn a_new_turn_ends_an_answer_a_failed_turn_left_streaming() {
+        let renderer = TerminalRenderer::new(false, true);
+        renderer.emit(AgentEvent::AssistantDelta {
+            text: String::new(),
+        });
+        // The stream failed: no `AssistantMessage`, no `RunFinished`.
+        renderer.emit(AgentEvent::RunStarted {
+            session_id: "s".into(),
+            provider: agent_domain::model::llm::ProviderId::new("p"),
+            model: None,
+        });
+        assert!(
+            !renderer.state.lock().unwrap().streaming,
+            "the next answer would be printed as an empty line"
+        );
+
+        renderer.emit(AgentEvent::AssistantDelta {
+            text: String::new(),
+        });
+        renderer.emit(AgentEvent::IterationStarted {
+            iteration: 2,
+            limit: 3,
+        });
+        assert!(!renderer.state.lock().unwrap().streaming);
+    }
+
+    /// Every stderr line an event can produce, fed the worst a model can
+    /// write, carries no character that acts on the terminal - only the line
+    /// breaks of a multi-line checklist.
+    #[test]
+    fn no_status_line_lets_a_control_character_through() {
+        use agent_domain::model::dependency::{FileChange, ManifestKind};
+        use agent_domain::model::llm::{ModelId, ProviderId, StopReason};
+        use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName, ToolSafety};
+
+        const EVIL: &str = "x\r\x1b[2Kok\u{202E}\u{9B}\t\u{200B}";
+        let renderer = TerminalRenderer::new(true, true);
+        let name = ToolName::new("run_command").unwrap();
+        let plan = Plan::new(vec![
+            PlanItem::new("done", PlanStatus::Completed),
+            PlanItem::new("doing", PlanStatus::InProgress),
+            PlanItem::new("next", PlanStatus::Pending),
+        ])
+        .unwrap();
+        let events = vec![
+            AgentEvent::RunStarted {
+                session_id: EVIL.into(),
+                provider: ProviderId::new("local"),
+                model: Some(ModelId::new(EVIL)),
+            },
+            AgentEvent::ModelResponded {
+                provider: ProviderId::new("local"),
+                model: ModelId::new(EVIL),
+                stop_reason: StopReason::Other(EVIL.into()),
+                usage: TokenUsage::default(),
+                latency: Duration::from_millis(1),
+            },
+            AgentEvent::ToolCallStarted {
+                call: ToolCall::new(ToolCallId::new(EVIL), name.clone(), serde_json::json!(EVIL)),
+                safety: ToolSafety::Destructive,
+            },
+            AgentEvent::ToolCallFinished {
+                name: name.clone(),
+                call_id: ToolCallId::new(EVIL),
+                is_error: true,
+                summary: EVIL.into(),
+                duration: Duration::from_millis(1),
+            },
+            AgentEvent::ToolCallDenied {
+                name: name.clone(),
+                reason: EVIL.into(),
+            },
+            AgentEvent::PlanUpdated { plan },
+            AgentEvent::DependenciesChanged {
+                name: name.clone(),
+                files: vec![DependencyFileChange {
+                    path: EVIL.into(),
+                    kind: ManifestKind::CargoToml,
+                    change: FileChange::Modified,
+                }],
+            },
+            AgentEvent::RunFinished {
+                reason: FinishReason::Stopped {
+                    stop_reason: EVIL.into(),
+                },
+                iterations: 1,
+                usage: TokenUsage::default(),
+            },
+        ];
+
+        for event in events {
+            let label = format!("{event:?}");
+            let line = renderer
+                .status_line(&event)
+                .unwrap_or_else(|| panic!("verbose prints every one of these: {label}"));
+            assert!(
+                !line
+                    .chars()
+                    .any(|c| c != '\n' && agent_domain::text::is_unprintable(c)),
+                "{line:?} from {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_command_shows_an_item_without_its_control_characters() {
+        // `Plan::new` refuses these, so a plan can only carry one if that
+        // check is ever loosened; the output must not depend on it.
+        let plan = Plan::new(vec![PlanItem::new("ok", PlanStatus::Pending)]).unwrap();
+        let shown = draw_plan(&plan, &|_, text| printable(text));
+        assert_eq!(shown, "☐ plan (0/1 completed)\n  [ ] ok");
+        assert_eq!(
+            printable("  [ ] a\x1b[2Kb"),
+            "  [ ] a?[2Kb",
+            "what `/plan` passes each line through"
+        );
     }
 }

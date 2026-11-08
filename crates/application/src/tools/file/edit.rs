@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use agent_domain::error::ToolError;
-use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
+use agent_domain::model::tool::{
+    Before, PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety,
+};
 use agent_domain::model::workspace::{WorkspacePath, WorkspaceRoot};
 use agent_domain::ports::file_system::FileSystem;
 use agent_domain::ports::tool::Tool;
@@ -159,9 +161,15 @@ impl Tool for EditFileTool {
 
     async fn preview(&self, arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError> {
         let edit = self.plan(arguments.clone()).await?;
+        let target = self
+            .file_system
+            .resolve_real(&edit.path)
+            .await
+            .for_tool(&Self::name())?;
         Ok(vec![PlannedWrite {
             path: edit.path,
-            before: Some(edit.before),
+            target,
+            before: Before::Text(edit.before),
             after: edit.after,
         }])
     }

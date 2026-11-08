@@ -172,9 +172,10 @@ pub fn build_system_prompt(context: &ContextSnapshot, tools: &[ToolDefinition]) 
         if !trimmed.is_empty() {
             prompt.push_str(
                 "\n# Project instructions\n\
-                 The following comes from instruction files, the most general first. It takes\n\
-                 precedence over the general guidance above, and a later file over an earlier one,\n\
-                 whenever they disagree.\n\n",
+                 The following comes from instruction files. It takes precedence over the general\n\
+                 guidance above whenever they disagree. A section headed \"Global instructions\"\n\
+                 is the operator's own and outranks the repository's file: where the two\n\
+                 disagree, follow the global instructions.\n\n",
             );
             let clipped = text::truncate(trimmed, MAX_PROJECT_INSTRUCTIONS_BYTES);
             prompt.push_str(clipped);
@@ -189,8 +190,9 @@ pub fn build_system_prompt(context: &ContextSnapshot, tools: &[ToolDefinition]) 
         prompt.push_str(
             "\n# Instructions in subdirectories\n\
              These subdirectories have their own instruction file. Before working inside one,\n\
-             read its file with `read_file`; for that directory it adds to, and takes precedence\n\
-             over, the project instructions above.\n\n",
+             read its file with `read_file`. It adds detail for that directory only: where it\n\
+             contradicts the project instructions above or the operator's global instructions,\n\
+             follow those instead.\n\n",
         );
         for path in &context.nested_instructions {
             let _ = writeln!(prompt, "- {path}");
@@ -230,6 +232,40 @@ mod tests {
         assert!(prompt.contains("# Instructions in subdirectories"));
         assert!(prompt.contains("read its file with `read_file`"));
         assert!(listed > prompt.find("make check").unwrap());
+    }
+
+    /// A file anyone can commit to a subdirectory must not outrank the root's
+    /// rules or the operator's: it would be the easiest place to plant
+    /// instructions in a repository the agent is pointed at.
+    #[test]
+    fn a_nested_instruction_file_is_a_supplement_not_an_override() {
+        let mut context = snapshot();
+        context.nested_instructions = vec!["vendor/x/AGENTS.md".into()];
+        let prompt = build_system_prompt(&context, &[]);
+        let nested = &prompt[prompt.find("# Instructions in subdirectories").unwrap()..];
+
+        assert!(!nested.contains("takes precedence"), "{nested}");
+        assert!(nested.contains("for that directory only"), "{nested}");
+        assert!(
+            nested.contains("the operator's global instructions")
+                && nested.contains("follow those instead"),
+            "{nested}"
+        );
+    }
+
+    #[test]
+    fn the_operators_global_instructions_outrank_the_repositorys() {
+        let prompt = build_system_prompt(&snapshot(), &[]);
+        let section = &prompt[prompt.find("# Project instructions").unwrap()..];
+        assert!(
+            section.contains("outranks the repository's file")
+                && section.contains("follow the global instructions"),
+            "{section}"
+        );
+        assert!(
+            !section.contains("a later file over an earlier one"),
+            "the repository's file comes later, so \"later wins\" let it outrank the operator"
+        );
     }
 
     #[test]

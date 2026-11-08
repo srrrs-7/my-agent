@@ -54,6 +54,19 @@ use super::session::Session;
 use crate::error::AppError;
 use crate::tools::registry::ToolRegistry;
 
+/// How far down a trim goes once it has to trim at all: three quarters of
+/// the budget.
+///
+/// Trimming only to the budget itself would, once a conversation reaches it,
+/// drop a message or two from the front on every iteration - and every
+/// change at the front rewrites the whole message prefix the provider has
+/// cached, turning a cache read (0.1x) into a cache write (1.25x) on each
+/// request. Dropping a quarter at once buys several iterations with an
+/// unchanged prefix.
+fn trim_low_water(budget: usize) -> usize {
+    budget - budget / 4
+}
+
 /// Result of one `run`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentOutcome {
@@ -374,20 +387,35 @@ impl AgentLoop {
     /// When either stage shortened the history and the model has unfinished
     /// work it can no longer see, its plan is appended once as a note (see
     /// [`super::plan`]). Room for that note is reserved in the budget up
-    /// front, whenever there is unfinished work: without the reservation the
-    /// note would push a history trimmed to exactly the budget back over it,
-    /// and the next iteration would trim again just to make room for it.
+    /// front, whenever there is unfinished work and no copy of the note is in
+    /// the history already: without the reservation the note would push a
+    /// history trimmed to exactly the budget back over it, and the next
+    /// iteration would trim again just to make room for it. A copy already in
+    /// the history is counted where it is, not a second time.
+    ///
+    /// A trim goes down to [`trim_low_water`], not to the budget, unless a
+    /// compaction just ran.
     ///
     /// `None` when `interrupt` fired during the compaction. The summary is
     /// abandoned before it changed anything, and trimming is skipped too: the
     /// turn is ending, and the next one fits the history again first.
     async fn fit_history(&self, session: &mut Session, interrupt: &Interrupt) -> Option<()> {
+        let max_bytes = self.config.max_history_bytes;
         let reminder = plan::reminder(session.plan());
-        let budget = self
-            .config
-            .max_history_bytes
-            .saturating_sub(reminder.as_ref().map_or(0, Message::approx_bytes));
-        let mut shortened = false;
+        let note_bytes = reminder.as_ref().map_or(0, Message::approx_bytes);
+        // Room is kept for the note that may have to be appended - unless a
+        // copy is already in the history, where its bytes are counted once
+        // already. Should the shortening remove that copy, room for the new
+        // one is made below, before it is appended.
+        let noted = reminder
+            .as_ref()
+            .is_some_and(|note| plan::already_noted(session, note));
+        let budget = if noted {
+            max_bytes
+        } else {
+            max_bytes.saturating_sub(note_bytes)
+        };
+        let mut compacted = false;
 
         if session.conversation.approx_bytes() > budget
             && let Some(report) = interrupt
@@ -397,7 +425,7 @@ impl AgentLoop {
                 )
                 .await?
         {
-            shortened = true;
+            compacted = true;
             session.usage.accumulate(report.usage);
             self.events.emit(AgentEvent::HistoryCompacted {
                 folded_messages: report.folded_messages,
@@ -406,22 +434,39 @@ impl AgentLoop {
             });
         }
 
-        let dropped = session
+        // A summary just made room on its own terms; trimming below the
+        // budget on top of it would delete what was just kept verbatim.
+        let low_water = if compacted {
+            budget
+        } else {
+            trim_low_water(budget)
+        };
+        let keep_recent = self.config.keep_recent_messages;
+        let mut dropped = session
             .conversation
-            .trim_to_budget(budget, self.config.keep_recent_messages);
-        if dropped > 0 {
-            shortened = true;
-            self.events.emit(AgentEvent::HistoryTrimmed {
-                dropped_messages: dropped,
-            });
-        }
+            .trim_to_budget(budget, low_water, keep_recent);
 
-        if shortened
+        if (compacted || dropped > 0)
             && let Some(reminder) = reminder
             && !plan::still_visible(session, &reminder)
         {
+            if noted {
+                // The copy the budget counted is gone, and nothing was
+                // reserved for its replacement.
+                let budget = max_bytes.saturating_sub(note_bytes);
+                dropped += session.conversation.trim_to_budget(
+                    budget,
+                    trim_low_water(budget),
+                    keep_recent,
+                );
+            }
             session.conversation.push(reminder);
             self.record(session, 1).await;
+        }
+        if dropped > 0 {
+            self.events.emit(AgentEvent::HistoryTrimmed {
+                dropped_messages: dropped,
+            });
         }
         Some(())
     }

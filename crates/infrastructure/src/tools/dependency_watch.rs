@@ -43,6 +43,7 @@ use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolOutcome, ToolS
 use agent_domain::model::workspace::WorkspaceRoot;
 use agent_domain::ports::events::{AgentEvent, EventSink};
 use agent_domain::ports::tool::Tool;
+use agent_domain::text::printable;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -178,14 +179,6 @@ fn note(changes: &[DependencyFileChange], complete: bool, limit: usize) -> Optio
         ));
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-/// A path from a directory walk, made safe to put in front of a model and on
-/// a terminal: a file name can contain a newline or an escape sequence.
-fn printable(path: &str) -> String {
-    path.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
 }
 
 /// The dependency files of a workspace at one moment, by content hash.

@@ -99,21 +99,37 @@ impl Conversation {
 
     /// Drops the oldest turns until the history fits `max_bytes`.
     ///
+    /// * Nothing is dropped while the history fits `max_bytes`. Once it does
+    ///   not, messages go until it fits `low_water` - which the caller sets
+    ///   at or below `max_bytes` (a larger value counts as `max_bytes`), so
+    ///   that one trim makes room for several turns instead of one. Where
+    ///   that mark sits is the caller's policy; the guarantee here is only
+    ///   `max_bytes`.
     /// * `keep_recent` messages are never dropped, so the model always sees the
     ///   tail of the conversation even when a single turn blows the budget.
     /// * Any leading `tool` message left behind is dropped too: its matching
     ///   assistant `tool_call` is already gone and providers reject the pair.
     ///
     /// Returns how many messages were removed.
-    pub fn trim_to_budget(&mut self, max_bytes: usize, keep_recent: usize) -> usize {
+    pub fn trim_to_budget(
+        &mut self,
+        max_bytes: usize,
+        low_water: usize,
+        keep_recent: usize,
+    ) -> usize {
         // Decide how much of the prefix to drop before touching the vector:
         // repeatedly removing the front element while recomputing the total
         // would be quadratic in the length of the history.
         let mut total: usize = self.messages.iter().map(Message::approx_bytes).sum();
         let droppable = self.messages.len().saturating_sub(keep_recent);
         let mut drop_count = 0;
+        let target = if total > max_bytes {
+            low_water.min(max_bytes)
+        } else {
+            max_bytes
+        };
 
-        while total > max_bytes && drop_count < droppable {
+        while total > target && drop_count < droppable {
             total -= self.messages[drop_count].approx_bytes();
             drop_count += 1;
         }
@@ -313,7 +329,7 @@ mod tests {
             Message::assistant_text("b".repeat(500)),
             Message::user("c".repeat(500)),
         ]);
-        conversation.trim_to_budget(10, 2);
+        conversation.trim_to_budget(10, 10, 2);
         assert_eq!(conversation.len(), 2);
     }
 
@@ -326,17 +342,54 @@ mod tests {
             Message::tool_results(vec![ToolResult::ok(&call, "y".repeat(1_000))]),
             Message::assistant_text("done"),
         ]);
-        conversation.trim_to_budget(64, 1);
+        conversation.trim_to_budget(64, 64, 1);
         assert!(
             conversation.messages().first().map(|m| m.role) != Some(Role::Tool),
             "history must not start with a tool result"
         );
     }
 
+    /// The hysteresis that keeps a cached prefix stable: one trim goes down
+    /// to the low-water mark, and a history between that mark and the budget
+    /// is left alone.
+    #[test]
+    fn a_trim_goes_down_to_the_low_water_mark_and_then_holds() {
+        let messages: Vec<Message> = (0..10)
+            .map(|n| Message::user(format!("{n}").repeat(100)))
+            .collect();
+        let each = messages[0].approx_bytes();
+        let mut conversation = Conversation::from_messages(messages);
+        let (max_bytes, low_water) = (each * 9, each * 6);
+
+        let dropped = conversation.trim_to_budget(max_bytes, low_water, 1);
+        assert_eq!(dropped, 4, "10 messages down to the 6 that fit the mark");
+        assert!(conversation.approx_bytes() <= low_water);
+
+        let head = conversation.messages()[0].text();
+        for turn in 0..3 {
+            conversation.push(Message::user("n".repeat(80)));
+            assert_eq!(
+                conversation.trim_to_budget(max_bytes, low_water, 1),
+                0,
+                "turn {turn}: still under the budget, so the front stays"
+            );
+            assert_eq!(conversation.messages()[0].text(), head);
+        }
+    }
+
+    #[test]
+    fn a_low_water_mark_above_the_budget_still_keeps_the_budget() {
+        let mut conversation =
+            Conversation::from_messages((0..4).map(|_| Message::user("x".repeat(100))).collect());
+        let budget = conversation.approx_bytes() - 1;
+        conversation.trim_to_budget(budget, usize::MAX, 1);
+        assert!(conversation.approx_bytes() <= budget);
+    }
+
     #[test]
     fn no_trimming_when_within_budget() {
         let mut conversation = Conversation::from_messages(vec![Message::user("hi")]);
-        assert_eq!(conversation.trim_to_budget(10_000, 1), 0);
+        assert_eq!(conversation.trim_to_budget(10_000, 10_000, 1), 0);
         assert_eq!(conversation.len(), 1);
     }
 

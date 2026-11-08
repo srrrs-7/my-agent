@@ -734,7 +734,7 @@ mod tests {
 
         assert_eq!(planned.len(), 1, "{planned:?}");
         assert_eq!(planned[0].path.display(), "Cargo.toml");
-        assert_eq!(planned[0].before.as_deref(), Some("[dependencies]\n"));
+        assert_eq!(planned[0].before.text(), Some("[dependencies]\n"));
         assert!(planned[0].after.contains("serde"));
     }
 

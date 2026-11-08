@@ -201,19 +201,53 @@ impl ToolOutcome {
 ///
 /// The dispatcher asks for these right before running a call, so that a
 /// write to a dependency manifest can be shown - and refused - before it
-/// happens. `before` is the file as it is now; `None` when it does not exist
-/// or could not be read, which is treated as "different" rather than "same".
+/// happens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedWrite {
+    /// The path the call names.
     pub path: WorkspacePath,
-    pub before: Option<String>,
+    /// The file the write really reaches: `path` with symbolic links
+    /// resolved (see [`FileSystem::resolve_real`]). The same as `path` unless
+    /// a link is involved. Kept apart because a rule about *which file* is
+    /// written has to look at this one - `deps.txt -> Cargo.toml` is a write
+    /// to `Cargo.toml` - while the human recognises the call by `path`.
+    ///
+    /// [`FileSystem::resolve_real`]: crate::ports::file_system::FileSystem::resolve_real
+    pub target: WorkspacePath,
+    pub before: Before,
     pub after: String,
 }
 
 impl PlannedWrite {
-    /// Whether carrying it out would leave the file as it already is.
+    /// Whether carrying it out would leave the file as it already is. Only
+    /// when the current text is known: a file that could not be read is never
+    /// assumed to be unchanged.
     pub fn is_no_op(&self) -> bool {
-        self.before.as_deref() == Some(self.after.as_str())
+        self.before.text() == Some(self.after.as_str())
+    }
+}
+
+/// The file a planned write replaces, as it is now.
+///
+/// Three cases, not two: "does not exist" and "exists but could not be read"
+/// (too large, not UTF-8, unreadable by policy) both lack a text, but only
+/// the first is a new file, and telling the human otherwise is telling them
+/// the call creates what it actually overwrites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Before {
+    /// There is no file there yet.
+    Absent,
+    /// There is a file, and this is why its content is not known.
+    Unreadable(String),
+    Text(String),
+}
+
+impl Before {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Absent | Self::Unreadable(_) => None,
+        }
     }
 }
 
@@ -233,5 +267,26 @@ mod tests {
         assert!(ToolName::new("read file").is_err());
         assert!(ToolName::new("read/file").is_err());
         assert!(ToolName::new("a".repeat(65)).is_err());
+    }
+
+    fn write(before: Before, after: &str) -> PlannedWrite {
+        let path = WorkspacePath::parse("Cargo.toml").unwrap();
+        PlannedWrite {
+            target: path.clone(),
+            path,
+            before,
+            after: after.into(),
+        }
+    }
+
+    #[test]
+    fn only_a_known_identical_text_is_a_no_op() {
+        assert!(write(Before::Text("a".into()), "a").is_no_op());
+        assert!(!write(Before::Text("a".into()), "b").is_no_op());
+        assert!(!write(Before::Absent, "").is_no_op());
+        assert!(
+            !write(Before::Unreadable("too large".into()), "").is_no_op(),
+            "an unreadable file must never count as unchanged"
+        );
     }
 }

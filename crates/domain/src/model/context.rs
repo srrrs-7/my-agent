@@ -17,7 +17,9 @@ pub struct ContextSnapshot {
     pub is_git_repository: bool,
     /// Instruction text, merged from the general to the specific (the
     /// operator's global file, then the workspace root's `AGENTS.md`,
-    /// `CLAUDE.md`, ...), so that later text wins a disagreement.
+    /// `CLAUDE.md`, ...), each section labelled with where it came from. The
+    /// order is not the precedence: the prompt says that the operator's
+    /// global file wins a disagreement with the repository's.
     pub project_instructions: Option<String>,
     /// Workspace-relative paths of instruction files in subdirectories. Only
     /// listed: the model reads one when its work takes it into that

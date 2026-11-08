@@ -47,6 +47,12 @@ pub enum PlanError {
     MultiLineItem { number: usize },
 
     #[error(
+        "item {number} contains a control, bidirectional or invisible character. Write the step \
+         as plain text"
+    )]
+    UnprintableItem { number: usize },
+
+    #[error(
         "item {number} is {bytes} bytes, more than the limit of {limit}. Shorten it to one \
          brief line"
     )]

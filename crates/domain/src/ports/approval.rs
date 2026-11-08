@@ -15,7 +15,11 @@ use crate::model::tool::{ToolCall, ToolSafety};
 pub struct ApprovalRequest {
     pub call: ToolCall,
     pub safety: ToolSafety,
-    /// One-line human description of what is about to happen.
+    /// Human description of what is about to happen, built from the model's
+    /// arguments and **not sanitised**: it may contain control and
+    /// bidirectional characters. A gate that shows it to a human passes it
+    /// through [`crate::text::printable`] first - there, at the point of
+    /// display, so that it happens once and cannot be forgotten upstream.
     pub summary: String,
 }
 

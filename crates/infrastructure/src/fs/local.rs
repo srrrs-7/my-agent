@@ -240,6 +240,13 @@ impl FileSystem for LocalFileSystem {
         let target = self.guard(path, None)?;
         Ok(tokio::fs::try_exists(&target).await.unwrap_or(false))
     }
+
+    async fn resolve_real(&self, path: &WorkspacePath) -> Result<WorkspacePath, FsError> {
+        // The same resolution a write performs, so the answer names the file
+        // the write would reach - not a second, possibly different, opinion.
+        let target = self.guard(path, None)?;
+        Ok(self.canonical_root.relativize(&target)?)
+    }
 }
 
 /// `lstat` rather than `exists`: `exists` follows symlinks, so a symlink
@@ -581,5 +588,41 @@ mod tests {
             "the write must not create the link target outside the workspace"
         );
         assert!(error.to_string().contains("symbolic link"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_real_names_the_file_a_link_reaches() {
+        let fixture = fixture();
+        let dir = fixture.root.as_path();
+        std::fs::create_dir_all(dir.join("crates/x")).unwrap();
+        std::fs::write(dir.join("crates/x/Cargo.toml"), "[package]\n").unwrap();
+        std::os::unix::fs::symlink("crates/x/Cargo.toml", dir.join("deps.txt")).unwrap();
+        std::os::unix::fs::symlink("crates/x", dir.join("linked")).unwrap();
+
+        let real = |raw: &str| {
+            let path = fixture.root.resolve(raw).unwrap();
+            let fs = &fixture.fs;
+            async move { fs.resolve_real(&path).await.unwrap().display() }
+        };
+        assert_eq!(real("deps.txt").await, "crates/x/Cargo.toml");
+        // A link in the directory part counts too, also for a file to be created.
+        assert_eq!(real("linked/Cargo.lock").await, "crates/x/Cargo.lock");
+        assert_eq!(real("plain/new.rs").await, "plain/new.rs");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_real_refuses_what_a_write_would_refuse() {
+        let fixture = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), fixture.root.as_path().join("escape")).unwrap();
+
+        let path = fixture.root.resolve("escape/Cargo.toml").unwrap();
+        let error = fixture.fs.resolve_real(&path).await.unwrap_err();
+        assert!(
+            matches!(error, FsError::OutsideWorkspace { .. }),
+            "got {error:?}"
+        );
     }
 }

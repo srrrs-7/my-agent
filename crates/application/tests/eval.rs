@@ -78,6 +78,11 @@ impl FileSystem for MemoryFileSystem {
     async fn exists(&self, path: &WorkspacePath) -> Result<bool, FsError> {
         Ok(self.files.lock().unwrap().contains_key(&path.display()))
     }
+
+    /// No links in memory: every path is its own file.
+    async fn resolve_real(&self, path: &WorkspacePath) -> Result<WorkspacePath, FsError> {
+        Ok(path.clone())
+    }
 }
 
 /// Answers every command with a fixed exit code and records what it ran.

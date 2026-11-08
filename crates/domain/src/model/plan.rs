@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::PlanError;
+use crate::text;
 
 /// More than this is no longer a plan the user can take in at a glance, and it
 /// is pinned into the history whole after every shortening.
@@ -66,6 +67,9 @@ impl PlanItem {
 /// * at most [`MAX_PLAN_ITEMS`] items;
 /// * every item is a single, non-blank line of at most
 ///   [`MAX_PLAN_ITEM_BYTES`] bytes;
+/// * no item contains a control, bidirectional or invisible character (see
+///   [`text::is_unprintable`]) - a plan is drawn on the user's terminal, and
+///   an item that rewrites the line it is on is not a step of a plan;
 /// * at most one item is `in_progress` - "what am I doing now" has one answer.
 ///
 /// An empty plan is valid: it is how the model says it no longer has one.
@@ -90,6 +94,9 @@ impl Plan {
             }
             if item.content.contains(['\n', '\r']) {
                 return Err(PlanError::MultiLineItem { number });
+            }
+            if item.content.chars().any(text::is_unprintable) {
+                return Err(PlanError::UnprintableItem { number });
             }
             if item.content.len() > MAX_PLAN_ITEM_BYTES {
                 return Err(PlanError::ItemTooLong {
@@ -265,6 +272,28 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(status).unwrap(),
                 serde_json::Value::String(status.as_str().into())
+            );
+        }
+    }
+
+    #[test]
+    fn items_that_would_act_on_the_terminal_are_rejected_not_cleaned() {
+        for content in [
+            "step\x1b[2K one",
+            "tab\there",
+            "right\u{202E}to left",
+            "zero\u{200B}width",
+            "c1\u{9B}2J",
+        ] {
+            let error = Plan::new(vec![
+                item("fine", PlanStatus::Pending),
+                item(content, PlanStatus::Pending),
+            ])
+            .unwrap_err();
+            assert_eq!(
+                error,
+                PlanError::UnprintableItem { number: 2 },
+                "{content:?}"
             );
         }
     }

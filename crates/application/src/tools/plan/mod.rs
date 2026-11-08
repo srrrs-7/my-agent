@@ -21,7 +21,7 @@ mod todo_write;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use agent_domain::model::message::{ContentBlock, Message};
+use agent_domain::model::message::{ContentBlock, Message, Role};
 use agent_domain::model::plan::{Plan, PlanStatus};
 use serde_json::Value;
 
@@ -38,31 +38,43 @@ use todo_write::parse_plan;
 /// A call only counts once its result says it succeeded: a refused plan, a
 /// denied call or one that timed out never became the plan, and the model was
 /// told so.
+///
+/// A result is matched to its call within the assistant message right before
+/// it, never across the whole history. Call ids are only unique within one
+/// turn: a server that sends none gets `call_0`, `call_1`, ... from the
+/// adapter every turn, so a history-wide lookup by id would pair a refused
+/// plan's result with an earlier turn's arguments - or a successful result
+/// with arguments that were refused.
 pub fn latest_plan(messages: &[Message]) -> Option<Plan> {
     let name = TodoWriteTool::name();
 
-    let mut arguments: HashMap<&str, &Value> = HashMap::new();
-    for call in messages.iter().flat_map(Message::tool_calls) {
-        if call.name == name {
-            arguments.insert(call.id.as_str(), &call.arguments);
+    let mut written: Vec<&Value> = Vec::new();
+    let mut turn: HashMap<&str, &Value> = HashMap::new();
+    for message in messages {
+        if message.role == Role::Assistant {
+            turn = message
+                .tool_calls()
+                .filter(|call| call.name == name)
+                .map(|call| (call.id.as_str(), &call.arguments))
+                .collect();
+            continue;
         }
-    }
-    if arguments.is_empty() {
-        return None;
+        for block in &message.content {
+            if let ContentBlock::ToolResult(result) = block
+                && !result.is_error
+                && result.tool_name == name
+                && let Some(arguments) = turn.get(result.call_id.as_str())
+            {
+                written.push(arguments);
+            }
+        }
     }
 
     // Newest first, so only the plan that wins is ever parsed.
-    messages
-        .iter()
+    written
+        .into_iter()
         .rev()
-        .flat_map(|message| message.content.iter().rev())
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult(result) if !result.is_error && result.tool_name == name => {
-                arguments.get(result.call_id.as_str())
-            }
-            _ => None,
-        })
-        .find_map(|arguments| parse_plan(&name, (*arguments).clone()).ok())
+        .find_map(|arguments| parse_plan(&name, arguments.clone()).ok())
 }
 
 /// The plan as plain text, one item per line: what the tool answers with and
@@ -215,5 +227,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(render_checklist(&plan), "[x] done\n[>] doing\n[ ] next\n");
+    }
+
+    /// What the OpenAI-compatible adapter produces for a server that sends no
+    /// call ids: the same `call_0` in every turn.
+    #[test]
+    fn a_refused_plan_reusing_an_earlier_id_does_not_replace_the_plan() {
+        let mut messages = turn(
+            vec![call(
+                "call_0",
+                "todo_write",
+                plan_args(&[("kept", "pending")]),
+            )],
+            &[true],
+        );
+        messages.extend(turn(
+            vec![call(
+                "call_0",
+                "todo_write",
+                plan_args(&[("refused", "pending")]),
+            )],
+            &[false],
+        ));
+
+        assert_eq!(contents(&latest_plan(&messages).unwrap()), ["kept"]);
+    }
+
+    #[test]
+    fn a_successful_result_is_paired_with_its_own_turns_arguments() {
+        // Turn 1 writes "first"; turn 2 is denied but reuses the id; turn 3
+        // reuses it again and succeeds. Each result must read the arguments
+        // of the call right before it.
+        let mut messages = turn(
+            vec![call(
+                "call_0",
+                "todo_write",
+                plan_args(&[("first", "pending")]),
+            )],
+            &[true],
+        );
+        messages.extend(turn(
+            vec![call(
+                "call_0",
+                "todo_write",
+                plan_args(&[("denied", "pending")]),
+            )],
+            &[false],
+        ));
+        messages.extend(turn(
+            vec![call(
+                "call_0",
+                "todo_write",
+                plan_args(&[("third", "pending")]),
+            )],
+            &[true],
+        ));
+        assert_eq!(contents(&latest_plan(&messages).unwrap()), ["third"]);
+
+        // And a later turn's arguments are never read for an earlier result.
+        let mut messages = turn(
+            vec![call(
+                "call_0",
+                "todo_write",
+                plan_args(&[("first", "pending")]),
+            )],
+            &[true],
+        );
+        messages.push(Message::assistant(vec![ContentBlock::ToolCall(call(
+            "call_0",
+            "todo_write",
+            plan_args(&[("never answered", "pending")]),
+        ))]));
+        assert_eq!(contents(&latest_plan(&messages).unwrap()), ["first"]);
     }
 }

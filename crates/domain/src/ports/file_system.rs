@@ -32,4 +32,20 @@ pub trait FileSystem: Send + Sync {
     async fn list_dir(&self, path: &WorkspacePath) -> Result<Vec<DirEntry>, FsError>;
 
     async fn exists(&self, path: &WorkspacePath) -> Result<bool, FsError>;
+
+    /// The workspace path `path` really reaches once symbolic links are
+    /// resolved - `Cargo.toml` for a `deps.txt` that links to it - or `path`
+    /// itself when no link is involved. For a path that does not exist yet,
+    /// the resolution of its deepest existing ancestor, followed by the rest.
+    ///
+    /// Fails, like a read or write would, when the path resolves outside the
+    /// workspace or through a dangling link.
+    ///
+    /// No default, for the reason [`Tool::preview`] has none: a decorator
+    /// that forgot to forward it would answer "no link" for everything, and
+    /// every rule about which file is written could be walked around with an
+    /// alias.
+    ///
+    /// [`Tool::preview`]: crate::ports::tool::Tool::preview
+    async fn resolve_real(&self, path: &WorkspacePath) -> Result<WorkspacePath, FsError>;
 }

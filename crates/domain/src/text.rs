@@ -5,6 +5,10 @@
 //! summaries - and getting it wrong panics at runtime rather than failing to
 //! compile. It lives here, in the crate everything already depends on, so there
 //! is exactly one implementation to get right.
+//!
+//! The same goes for [`printable`]: text a model or a file supplied reaches a
+//! terminal in several places, and a human decides on the strength of what it
+//! shows. One definition of "safe to show" means one list to keep complete.
 
 /// Largest index `<= max_bytes` that lies on a character boundary.
 fn boundary(text: &str, max_bytes: usize) -> usize {
@@ -49,6 +53,47 @@ pub fn first_line(text: &str, max_bytes: usize) -> String {
     truncate(line, max_bytes).to_string()
 }
 
+/// Whether `c` acts on a terminal, or changes how the text around it reads,
+/// instead of being shown as itself.
+///
+/// * every control character - C0 (escape sequences, the carriage return that
+///   redraws a line, the newline that pushes a question off screen, and the
+///   tab, because the callers draw one line), DEL and C1 (`U+009B` is a
+///   one-byte CSI on terminals that honour it);
+/// * the bidirectional controls, which make `gnp.exe` display as `exe.png`;
+/// * the invisible formatting characters, which make two different strings
+///   look identical - `rm -rf /tmp/x` and `rm -rf /\u{200B}tmp/x` are not the
+///   same command;
+/// * the Unicode line and paragraph separators, which some terminals break on.
+pub fn is_unprintable(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// `text` with every character [`is_unprintable`] reports replaced by `?`,
+/// so that it is drawn on one line and reads as what it is.
+///
+/// Applied where text leaves for a terminal, once, and to anything a model or
+/// a file wrote - tool arguments, tool output summaries, plan items, file
+/// names. Not to the model's prose on stdout: that is the answer, it may
+/// legitimately span lines, and nobody approves anything on the strength of
+/// it.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_unprintable(c) { '?' } else { c })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +136,24 @@ mod tests {
     #[test]
     fn a_zero_budget_yields_nothing() {
         assert_eq!(truncate("abc", 0), "");
+    }
+
+    #[test]
+    fn nothing_that_drives_the_terminal_survives_printable() {
+        assert_eq!(
+            printable("evil\x1b[2J\r\nsafe\u{202E}gnp.exe"),
+            "evil?[2J??safe?gnp.exe"
+        );
+        // C1 CSI, tab, DEL, zero-width space, BOM, isolate, line separator.
+        assert_eq!(
+            printable("a\u{9B}b\tc\u{7F}d\u{200B}e\u{FEFF}f\u{2066}g\u{2028}h"),
+            "a?b?c?d?e?f?g?h"
+        );
+    }
+
+    #[test]
+    fn ordinary_text_is_left_alone() {
+        let text = "cargo test -- --nocapture 日本語 é ✓ \"quoted\"";
+        assert_eq!(printable(text), text);
     }
 }

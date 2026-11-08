@@ -39,8 +39,8 @@ pub use model::{
     message::{ContentBlock, Message, Role},
     plan::{Plan, PlanItem, PlanStatus},
     tool::{
-        PlannedWrite, ToolCall, ToolCallId, ToolDefinition, ToolName, ToolOutcome, ToolResult,
-        ToolSafety,
+        Before, PlannedWrite, ToolCall, ToolCallId, ToolDefinition, ToolName, ToolOutcome,
+        ToolResult, ToolSafety,
     },
     workspace::{WorkspacePath, WorkspaceRoot},
 };

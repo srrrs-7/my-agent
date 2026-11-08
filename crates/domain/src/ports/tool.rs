@@ -25,8 +25,11 @@ pub trait Tool: Send + Sync {
     /// the dependency approval without a trace. Without a default, the
     /// omission is a compile error.
     ///
-    /// An error means "could not tell"; the dispatcher then runs the call,
-    /// which fails the same way for the same reason.
+    /// An error means "could not tell". [`ToolError::InvalidInput`] is the one
+    /// the dispatcher lets through to `execute`, which refuses the same
+    /// arguments before writing anything; for any other error the call is not
+    /// run, since nothing is known about what it would write. So return
+    /// `InvalidInput` only for arguments `execute` is certain to reject.
     async fn preview(&self, arguments: &Value) -> Result<Vec<PlannedWrite>, ToolError>;
 
     /// `arguments` is the raw JSON produced by the model; implementations are

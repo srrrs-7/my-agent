@@ -835,3 +835,98 @@ async fn the_env_file_cannot_be_rewritten_by_write_file_or_edit_file() {
         "the endpoint and the key are unchanged"
     );
 }
+
+/// Approves every ordinary call, refuses every dependency change, and keeps
+/// the dependency requests it was shown.
+#[derive(Default)]
+struct RefuseDependencies {
+    asked: std::sync::Mutex<Vec<agent_domain::ports::approval::DependencyApprovalRequest>>,
+}
+
+#[async_trait]
+impl ApprovalGate for RefuseDependencies {
+    async fn authorize(&self, _: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+
+    async fn authorize_dependency_change(
+        &self,
+        request: &agent_domain::ports::approval::DependencyApprovalRequest,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        self.asked.lock().unwrap().push(request.clone());
+        Ok(ApprovalDecision::Deny {
+            reason: "no".into(),
+        })
+    }
+}
+
+/// `deps.txt -> Cargo.toml` is not a dependency file by name, but writing to
+/// it rewrites `Cargo.toml`. The gate has to follow the link the way the
+/// write will - on a real filesystem, since only a real one has links.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dependency_file_written_through_a_symlink_still_needs_approval() {
+    use agent_application::agent::{DispatchConfig, Interrupt, ToolDispatcher};
+    use agent_domain::model::tool::{ToolCall, ToolCallId, ToolName};
+
+    const ORIGINAL: &str = "[dependencies]\n";
+    let workspace = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(workspace.path()).unwrap();
+    std::fs::write(canonical.join("Cargo.toml"), ORIGINAL).unwrap();
+    std::os::unix::fs::symlink("Cargo.toml", canonical.join("deps.txt")).unwrap();
+    let root = Arc::new(WorkspaceRoot::new(canonical.clone()).unwrap());
+    let file_system = Arc::new(LocalFileSystem::new(root.clone(), 1024 * 1024).unwrap());
+    let tools = Arc::new(
+        ToolRegistry::new()
+            .with(Arc::new(WriteFileTool::new(
+                file_system.clone(),
+                root.clone(),
+            )))
+            .with(Arc::new(EditFileTool::new(file_system, root))),
+    );
+    let gate = Arc::new(RefuseDependencies::default());
+    let dispatcher = ToolDispatcher::new(
+        tools,
+        gate.clone(),
+        Arc::new(NullEventSink),
+        DispatchConfig {
+            max_tool_output_bytes: 64 * 1024,
+            parallel_read_only_tools: true,
+        },
+    );
+
+    let calls = [
+        ToolCall::new(
+            ToolCallId::new("w"),
+            ToolName::new("write_file").unwrap(),
+            serde_json::json!({"path": "deps.txt", "content": "[dependencies]\nevil = \"1\"\n"}),
+        ),
+        ToolCall::new(
+            ToolCallId::new("e"),
+            ToolName::new("edit_file").unwrap(),
+            serde_json::json!({
+                "path": "deps.txt",
+                "old_string": "[dependencies]\n",
+                "new_string": "[dependencies]\nevil = \"1\"\n",
+            }),
+        ),
+    ];
+    let results = dispatcher.dispatch(&calls, &Interrupt::new()).await;
+
+    let asked = gate.asked.lock().unwrap();
+    assert_eq!(asked.len(), 2, "both writes were asked about: {results:?}");
+    for request in asked.iter() {
+        let change = &request.changes[0];
+        assert_eq!(change.path.display(), "deps.txt");
+        assert_eq!(
+            change.target.as_ref().map(|target| target.display()),
+            Some("Cargo.toml".to_string())
+        );
+    }
+    assert!(results.iter().all(|result| result.is_error), "{results:?}");
+    assert_eq!(
+        std::fs::read_to_string(canonical.join("Cargo.toml")).unwrap(),
+        ORIGINAL,
+        "the refused change was not written through the link"
+    );
+}

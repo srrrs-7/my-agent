@@ -132,6 +132,11 @@ impl FileSystem for MemoryFileSystem {
     async fn exists(&self, path: &WorkspacePath) -> Result<bool, FsError> {
         Ok(self.files.lock().unwrap().contains_key(&path.display()))
     }
+
+    /// No links in memory: every path is its own file.
+    async fn resolve_real(&self, path: &WorkspacePath) -> Result<WorkspacePath, FsError> {
+        Ok(path.clone())
+    }
 }
 
 struct FakeContext;
@@ -2584,12 +2589,16 @@ async fn the_change_shown_is_against_the_file_as_earlier_calls_left_it() {
 
     let asked = gate.asked();
     assert_eq!(asked.len(), 2, "{asked:?}");
-    assert!(
-        asked[0].changes[0].created,
+    assert_eq!(
+        asked[0].changes[0].before,
+        agent_domain::model::tool::Before::Absent,
         "the first write creates the file"
     );
     assert_eq!(shown(&asked[0]), ["+ serde \"1\""]);
-    assert!(!asked[1].changes[0].created);
+    assert!(matches!(
+        asked[1].changes[0].before,
+        agent_domain::model::tool::Before::Text(_)
+    ));
     assert_eq!(shown(&asked[1]), ["+ tokio \"1\""]);
 }
 
@@ -2717,9 +2726,10 @@ async fn an_interrupt_at_the_dependency_prompt_runs_nothing() {
 }
 
 #[tokio::test]
-async fn a_call_whose_effect_cannot_be_worked_out_runs_and_reports_its_own_error() {
-    // The edit cannot apply, so there is nothing to approve: running it gives
-    // the model the real reason, and it changes nothing.
+async fn a_call_whose_effect_cannot_be_worked_out_is_not_run_but_reports_the_real_error() {
+    // The edit cannot apply, so there is nothing to approve. It is not run -
+    // its preview failed for a reason other than invalid arguments - but the
+    // model still reads why, and nothing changes.
     let file_system = MemoryFileSystem::with(&[("Cargo.toml", MANIFEST)]);
     let gate = DependencyGate::answering(ApprovalDecision::Approve);
     let batch = calls(&[(
@@ -2739,9 +2749,278 @@ async fn a_call_whose_effect_cannot_be_worked_out_runs_and_reports_its_own_error
     assert!(gate.asked().is_empty());
     assert!(results[0].is_error);
     assert!(
-        results[0].content.contains("was not found"),
-        "{}",
+        results[0]
+            .content
+            .starts_with("tool `edit_file` failed: `old_string` was not found"),
+        "the model reads what it read before: {}",
         results[0].content
     );
     assert_eq!(file_system.get("Cargo.toml").as_deref(), Some(MANIFEST));
+}
+
+/// The error a tool's `preview` fails with.
+type PreviewFailure = fn(&ToolName) -> ToolError;
+
+/// A writing tool whose `preview` fails with a chosen error, and that counts
+/// how often it actually ran.
+struct UnpreviewableTool {
+    error: PreviewFailure,
+    executed: std::sync::atomic::AtomicUsize,
+}
+
+impl UnpreviewableTool {
+    fn name() -> ToolName {
+        ToolName::new("write_somewhere").unwrap()
+    }
+}
+
+#[async_trait]
+impl Tool for UnpreviewableTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::name(),
+            description: "writes a file".into(),
+            input_schema: json!({"type": "object"}),
+            safety: ToolSafety::Mutating,
+        }
+    }
+
+    async fn preview(
+        &self,
+        _arguments: &serde_json::Value,
+    ) -> Result<Vec<agent_domain::model::tool::PlannedWrite>, ToolError> {
+        Err((self.error)(&Self::name()))
+    }
+
+    async fn execute(&self, _arguments: serde_json::Value) -> Result<ToolOutcome, ToolError> {
+        self.executed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolOutcome::new("wrote it"))
+    }
+}
+
+fn unpreviewable(error: PreviewFailure) -> Arc<UnpreviewableTool> {
+    Arc::new(UnpreviewableTool {
+        error,
+        executed: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+/// A preview that timed out, or hit an I/O error that may not recur, says
+/// nothing about what the call writes. Running it anyway would be running it
+/// past the dependency gate unchecked.
+#[tokio::test]
+async fn a_call_whose_writes_cannot_be_worked_out_is_not_run() {
+    let failures: [(&str, PreviewFailure); 2] = [
+        ("timeout", |tool| ToolError::Timeout {
+            tool: tool.clone(),
+            seconds: 30,
+        }),
+        ("execution", |tool| {
+            ToolError::execution(tool, "io error on `Cargo.toml`: interrupted")
+        }),
+    ];
+    for (label, error) in failures {
+        let tool = unpreviewable(error);
+        let gate = DependencyGate::answering(ApprovalDecision::Approve);
+        let events = Arc::new(RecordingSink::default());
+        let batch = calls(&[("w1", "write_somewhere", json!({}))]);
+
+        let results = dispatcher(
+            Arc::new(ToolRegistry::new().with(tool.clone())),
+            gate.clone(),
+            events.clone(),
+        )
+        .dispatch(&batch, &Interrupt::new())
+        .await;
+
+        assert_eq!(
+            tool.executed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{label}: the call ran"
+        );
+        assert!(results[0].is_error, "{label}: {results:?}");
+        let original = error(&UnpreviewableTool::name()).to_string();
+        assert!(
+            results[0].content.starts_with(&original)
+                && results[0].content.ends_with(
+                    "(Nothing was written; the change could not be checked against the \
+                     dependency gate.)"
+                ),
+            "{label}: the tool's own error first, then the note: {}",
+            results[0].content
+        );
+        assert!(gate.asked().is_empty(), "{label}: nothing to ask about");
+        let events = events.events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallDenied { .. })),
+            "{label}: a failed preview is not a denial: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallFinished { is_error: true, .. })),
+            "{label}: shown as an ordinary failed call: {events:?}"
+        );
+    }
+}
+
+/// Arguments `execute` rejects before writing anything: running it is safe,
+/// and gives the model the real error rather than a second-hand one.
+#[tokio::test]
+async fn a_call_with_invalid_arguments_still_reaches_the_tool() {
+    let tool = unpreviewable(|tool| ToolError::invalid_input(tool, "`path` is required"));
+    let batch = calls(&[("w1", "write_somewhere", json!({}))]);
+
+    dispatcher(
+        Arc::new(ToolRegistry::new().with(tool.clone())),
+        DependencyGate::answering(ApprovalDecision::Approve),
+        Arc::new(NullEventSink),
+    )
+    .dispatch(&batch, &Interrupt::new())
+    .await;
+
+    assert_eq!(tool.executed.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// --- trimming: hysteresis and the plan note's share -------------------------
+
+/// Once the history reaches the budget, trimming to exactly the budget would
+/// drop a message or two from the front on every iteration, and each such
+/// drop rewrites the prompt-cached prefix. One trim goes well below instead,
+/// and the next iterations leave the front alone.
+#[tokio::test]
+async fn a_trim_makes_room_for_several_turns_without_touching_the_front_again() {
+    const BUDGET: usize = 16 * 1024;
+    let file_system = MemoryFileSystem::with(&[("src/main.rs", "fn main() {}\n")]);
+    let provider = ScriptedProvider::new(vec![
+        tool_use("r1", "read_file", json!({"path": "src/main.rs"})),
+        tool_use("r2", "read_file", json!({"path": "src/main.rs"})),
+        tool_use("r3", "read_file", json!({"path": "src/main.rs"})),
+        assistant("done"),
+    ]);
+    let events = Arc::new(RecordingSink::default());
+    let agent = loop_with_config(
+        provider.clone(),
+        registry_with_plan(file_system),
+        Arc::new(AlwaysApprove),
+        events.clone(),
+        AgentLoopConfig {
+            compact: false,
+            keep_recent_messages: 2,
+            max_iterations: 5,
+            ..compacting_config(BUDGET)
+        },
+    );
+
+    let mut session = crowded_session("hysteresis");
+    assert!(
+        session.conversation.approx_bytes() > BUDGET,
+        "precondition: over budget"
+    );
+    agent.run(&mut session, "carry on").await.unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    let sent = |index: usize| -> usize {
+        requests[index]
+            .messages
+            .iter()
+            .map(Message::approx_bytes)
+            .sum()
+    };
+    assert!(
+        sent(0) <= BUDGET * 3 / 4,
+        "trimmed to the low-water mark, not just under the budget: {} bytes",
+        sent(0)
+    );
+    for index in 1..requests.len() {
+        assert_eq!(
+            requests[index].messages[0], requests[0].messages[0],
+            "request {index}: the front of the history changed"
+        );
+        assert!(
+            sent(index) <= BUDGET,
+            "request {index}: {} bytes",
+            sent(index)
+        );
+    }
+    let trims = events
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::HistoryTrimmed { .. }))
+        .count();
+    assert_eq!(trims, 1, "one trim, then room to spare");
+}
+
+/// The plan note is reserved for in the budget - but a copy already in the
+/// history is counted there, and reserving for it as well would trim a
+/// history that fits.
+#[tokio::test]
+async fn a_note_already_in_the_history_is_not_reserved_for_twice() {
+    // Obtain the exact note the loop writes for this plan.
+    let note = {
+        let provider = ScriptedProvider::new(vec![assistant("ok")]);
+        let agent = loop_with_config(
+            provider.clone(),
+            registry_with_plan(MemoryFileSystem::default().into()),
+            Arc::new(AlwaysApprove),
+            Arc::new(NullEventSink),
+            AgentLoopConfig {
+                compact: false,
+                keep_recent_messages: 2,
+                ..compacting_config(8 * 1024)
+            },
+        );
+        let mut session = Session::resumed("note-source", planned_record(UNFINISHED));
+        agent.run(&mut session, "carry on").await.unwrap();
+        let note = provider.requests()[0].messages.last().unwrap().clone();
+        assert!(
+            note.text().starts_with(NOTE),
+            "precondition: {}",
+            note.text()
+        );
+        note
+    };
+
+    // A history that wrote the plan, carries the note, and fits the budget -
+    // but not the budget minus another note.
+    let planned = planned_record(UNFINISHED).into_messages();
+    let mut messages = planned[..3].to_vec();
+    messages.push(Message::user(note.text()));
+    let history = Conversation::from_messages(messages);
+    let input = Message::user("carry on");
+    let total = history.approx_bytes() + input.approx_bytes();
+    let budget = total + note.approx_bytes() / 2;
+
+    let provider = ScriptedProvider::new(vec![assistant("ok")]);
+    let events = Arc::new(RecordingSink::default());
+    let agent = loop_with_config(
+        provider.clone(),
+        registry_with_plan(MemoryFileSystem::default().into()),
+        Arc::new(AlwaysApprove),
+        events.clone(),
+        AgentLoopConfig {
+            compact: false,
+            keep_recent_messages: 1,
+            ..compacting_config(budget)
+        },
+    );
+    let mut session = Session::resumed("noted", history);
+    agent.run(&mut session, "carry on").await.unwrap();
+
+    assert!(
+        !events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::HistoryTrimmed { .. })),
+        "the history fit; nothing should have been dropped"
+    );
+    assert_eq!(provider.requests()[0].messages.len(), 5);
 }

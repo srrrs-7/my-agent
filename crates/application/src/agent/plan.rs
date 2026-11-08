@@ -68,12 +68,16 @@ pub(crate) fn reminder(plan: Option<&Plan>) -> Option<Message> {
 /// `reminder`: the call that wrote it is still in the history, or an earlier
 /// copy of the same note is.
 pub(crate) fn still_visible(session: &Session, reminder: &Message) -> bool {
-    let messages = session.conversation.messages();
-    if latest_plan(messages).as_ref() == session.plan() {
-        return true;
-    }
+    latest_plan(session.conversation.messages()).as_ref() == session.plan()
+        || already_noted(session, reminder)
+}
+
+/// Whether a copy of `reminder` is in the history.
+pub(crate) fn already_noted(session: &Session, reminder: &Message) -> bool {
     let note = reminder.text();
-    messages
+    session
+        .conversation
+        .messages()
         .iter()
         .any(|message| message.role == Role::User && message.text() == note)
 }

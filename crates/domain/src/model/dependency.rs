@@ -6,11 +6,20 @@
 //! question "is this file one of those?" is answered here, once, for every
 //! layer that asks it.
 //!
-//! Classification looks at the file name only, compared case-insensitively:
-//! a case-insensitive filesystem (macOS, Windows) opens `cargo.toml` as
+//! Classification looks at the file name, compared case-insensitively: a
+//! case-insensitive filesystem (macOS, Windows) opens `cargo.toml` as
 //! `Cargo.toml`, so a spelling that slips past the comparison would slip past
 //! the gate while still changing the real file. The directory does not
-//! matter either - a nested crate or a vendored package has a manifest too.
+//! matter either - a nested crate or a vendored package has a manifest too -
+//! with one exception: Cargo's configuration is called `config`, which is
+//! only a dependency file inside a `.cargo` directory.
+//!
+//! Besides the manifests and lockfiles, the files that decide *where*
+//! dependencies are fetched from count too (`.cargo/config.toml`,
+//! `.yarnrc.yml`, `pip.conf`, ...): pointing a registry or an index at
+//! another server changes what the next build runs as surely as adding a
+//! package does. `.npmrc` is absent on purpose - the access policy already
+//! refuses to read or write it, since it holds tokens.
 //!
 //! What a change *contains* is described by parsers in the application layer.
 //! The description is for the human; whether to ask at all never depends on
@@ -19,6 +28,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::model::tool::Before;
 use crate::model::workspace::WorkspacePath;
 
 /// A file that declares or pins dependencies.
@@ -44,16 +54,37 @@ pub enum ManifestKind {
     GemfileLock,
     ComposerJson,
     ComposerLock,
+    /// `.cargo/config.toml` / `.cargo/config`: registries, `[source]`
+    /// replacement, `[patch]`.
+    CargoConfig,
+    GoWork,
+    GoWorkSum,
+    /// `.yarnrc.yml` / `.yarnrc`: registry and plugins.
+    YarnConfig,
+    /// `.pnpmfile.cjs`: hooks that rewrite resolved packages.
+    PnpmHooks,
+    BunConfig,
+    PipConfig,
+    UvConfig,
 }
 
 impl ManifestKind {
     /// The kind of dependency file `path` names, if it names one.
     pub fn classify(path: &WorkspacePath) -> Option<Self> {
-        let name = path.as_path().file_name()?.to_string_lossy();
-        Self::classify_name(&name)
+        let file = path.as_path();
+        let name = file.file_name()?.to_string_lossy();
+        if let Some(kind) = Self::classify_name(&name) {
+            return Some(kind);
+        }
+        let directory = file.parent()?.file_name()?.to_string_lossy();
+        let in_cargo_directory = directory.eq_ignore_ascii_case(".cargo");
+        let is_cargo_config =
+            name.eq_ignore_ascii_case("config") || name.eq_ignore_ascii_case("config.toml");
+        (in_cargo_directory && is_cargo_config).then_some(Self::CargoConfig)
     }
 
-    /// Like [`Self::classify`], for a bare file name.
+    /// Like [`Self::classify`], for a bare file name - which cannot tell
+    /// [`Self::CargoConfig`], whose name only counts inside `.cargo`.
     pub fn classify_name(file_name: &str) -> Option<Self> {
         let name = file_name.to_ascii_lowercase();
         let kind = match name.as_str() {
@@ -76,6 +107,13 @@ impl ManifestKind {
             "gemfile.lock" => Self::GemfileLock,
             "composer.json" => Self::ComposerJson,
             "composer.lock" => Self::ComposerLock,
+            "go.work" => Self::GoWork,
+            "go.work.sum" => Self::GoWorkSum,
+            ".yarnrc.yml" | ".yarnrc" => Self::YarnConfig,
+            ".pnpmfile.cjs" => Self::PnpmHooks,
+            "bunfig.toml" => Self::BunConfig,
+            "pip.conf" => Self::PipConfig,
+            "uv.toml" => Self::UvConfig,
             // `requirements.txt`, `requirements-dev.txt`, ... - pip takes any
             // name with `-r`, but these are the ones a project commits.
             other if other.starts_with("requirements") && other.ends_with(".txt") => {
@@ -100,27 +138,47 @@ impl ManifestKind {
                 | Self::PoetryLock
                 | Self::UvLock
                 | Self::GoSum
+                | Self::GoWorkSum
                 | Self::GemfileLock
                 | Self::ComposerLock
         )
     }
 
+    /// Whether the file configures where and how dependencies are fetched,
+    /// rather than listing them.
+    pub fn is_config(self) -> bool {
+        matches!(
+            self,
+            Self::CargoConfig
+                | Self::YarnConfig
+                | Self::PnpmHooks
+                | Self::BunConfig
+                | Self::PipConfig
+                | Self::UvConfig
+        )
+    }
+
     pub fn ecosystem(self) -> &'static str {
         match self {
-            Self::CargoToml | Self::CargoLock => "cargo",
+            Self::CargoToml | Self::CargoLock | Self::CargoConfig => "cargo",
             Self::PackageJson
             | Self::PackageLock
             | Self::NpmShrinkwrap
             | Self::YarnLock
             | Self::PnpmLock
-            | Self::BunLock => "npm",
+            | Self::BunLock
+            | Self::YarnConfig
+            | Self::PnpmHooks
+            | Self::BunConfig => "npm",
             Self::Requirements
             | Self::Pyproject
             | Self::Pipfile
             | Self::PipfileLock
             | Self::PoetryLock
-            | Self::UvLock => "python",
-            Self::GoMod | Self::GoSum => "go",
+            | Self::UvLock
+            | Self::PipConfig
+            | Self::UvConfig => "python",
+            Self::GoMod | Self::GoSum | Self::GoWork | Self::GoWorkSum => "go",
             Self::Gemfile | Self::GemfileLock => "ruby",
             Self::ComposerJson | Self::ComposerLock => "php",
         }
@@ -129,6 +187,8 @@ impl ManifestKind {
     pub fn label(self) -> &'static str {
         if self.is_lockfile() {
             "lockfile"
+        } else if self.is_config() {
+            "config"
         } else {
             "manifest"
         }
@@ -243,10 +303,16 @@ pub enum DependencyChangeDescription {
 /// A planned write to one dependency file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestChange {
+    /// The path the call names.
     pub path: WorkspacePath,
+    /// The file actually written, when it is not `path` - a symbolic link
+    /// led elsewhere. Shown, because `deps.txt` is not a name anyone would
+    /// stop at.
+    pub target: Option<WorkspacePath>,
     pub kind: ManifestKind,
-    /// The file does not exist yet.
-    pub created: bool,
+    /// The file as it is now. Its text, if any, has already gone into
+    /// `description`; what matters here is which of the three cases it is.
+    pub before: Before,
     pub description: DependencyChangeDescription,
 }
 
@@ -368,5 +434,44 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert_eq!(shown, ["+ a 1", "- b 1", "~ c 1 -> 2"]);
+    }
+
+    #[test]
+    fn files_that_choose_where_dependencies_come_from_are_recognised_whatever_their_case() {
+        let configs = [
+            (".cargo/config.toml", ManifestKind::CargoConfig),
+            (".cargo/config", ManifestKind::CargoConfig),
+            ("crates/x/.CARGO/Config.TOML", ManifestKind::CargoConfig),
+            ("go.work", ManifestKind::GoWork),
+            ("Go.Work.Sum", ManifestKind::GoWorkSum),
+            (".yarnrc.yml", ManifestKind::YarnConfig),
+            (".YarnRC", ManifestKind::YarnConfig),
+            ("bunfig.toml", ManifestKind::BunConfig),
+            (".venv/PIP.CONF", ManifestKind::PipConfig),
+            ("uv.toml", ManifestKind::UvConfig),
+            (".pnpmfile.cjs", ManifestKind::PnpmHooks),
+        ];
+        for (name, kind) in configs {
+            assert_eq!(classify(name), Some(kind), "{name}");
+        }
+        assert_eq!(ManifestKind::CargoConfig.label(), "config");
+        assert_eq!(ManifestKind::GoWorkSum.label(), "lockfile");
+    }
+
+    #[test]
+    fn a_config_file_outside_cargo_is_not_a_dependency_file() {
+        for name in [
+            "config.toml",
+            "config",
+            "src/config.toml",
+            "cargo/config.toml",
+        ] {
+            assert_eq!(classify(name), None, "{name}");
+        }
+        assert_eq!(
+            ManifestKind::classify_name("config.toml"),
+            None,
+            "a bare name cannot know its directory"
+        );
     }
 }
