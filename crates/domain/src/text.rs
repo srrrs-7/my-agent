@@ -63,7 +63,12 @@ pub fn first_line(text: &str, max_bytes: usize) -> String {
 /// * the bidirectional controls, which make `gnp.exe` display as `exe.png`;
 /// * the invisible formatting characters, which make two different strings
 ///   look identical - `rm -rf /tmp/x` and `rm -rf /\u{200B}tmp/x` are not the
-///   same command;
+///   same command. The soft hyphen and the Arabic letter mark are among them;
+/// * the tag characters (`U+E0000`-`U+E007F`), which mirror ASCII invisibly:
+///   a whole sentence can ride along in text that shows as one word, and a
+///   model reads it all the same;
+/// * the variation selectors (`U+FE00`-`U+FE0F`, `U+E0100`-`U+E01EF`), which
+///   render as nothing on their own and can carry data the same way;
 /// * the Unicode line and paragraph separators, which some terminals break on.
 pub fn is_unprintable(c: char) -> bool {
     c.is_control()
@@ -76,7 +81,10 @@ pub fn is_unprintable(c: char) -> bool {
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{2069}'
+                | '\u{FE00}'..='\u{FE0F}'
                 | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
         )
 }
 
@@ -149,6 +157,31 @@ mod tests {
             printable("a\u{9B}b\tc\u{7F}d\u{200B}e\u{FEFF}f\u{2066}g\u{2028}h"),
             "a?b?c?d?e?f?g?h"
         );
+    }
+
+    #[test]
+    fn characters_that_hide_text_are_unprintable() {
+        for (what, c) in [
+            ("tag space", '\u{E0020}'),
+            ("tag letter", '\u{E0041}'),
+            ("cancel tag", '\u{E007F}'),
+            ("language tag", '\u{E0001}'),
+            ("variation selector 1", '\u{FE00}'),
+            ("variation selector 16", '\u{FE0F}'),
+            ("variation selector 17", '\u{E0100}'),
+            ("variation selector 256", '\u{E01EF}'),
+            ("line separator", '\u{2028}'),
+            ("paragraph separator", '\u{2029}'),
+            ("arabic letter mark", '\u{061C}'),
+            ("soft hyphen", '\u{00AD}'),
+        ] {
+            assert!(is_unprintable(c), "{what} (U+{:04X})", c as u32);
+            assert_eq!(printable(&format!("a{c}b")), "a?b", "{what}");
+        }
+        // The neighbours of those ranges are ordinary characters.
+        for c in ['\u{FDFF}', '\u{FE10}', '\u{E0080}', '\u{E01F0}', '\u{00AC}'] {
+            assert!(!is_unprintable(c), "U+{:04X}", c as u32);
+        }
     }
 
     #[test]

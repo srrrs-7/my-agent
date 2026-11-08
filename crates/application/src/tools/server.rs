@@ -17,6 +17,9 @@
 //! * **What the model reads.** Control and invisible formatting characters are
 //!   removed, the description is clipped and collapsed to one line with its
 //!   origin in front (`[MCP server <name>]`), and the schema is size-capped.
+//!   Inside the schema only prose (`description`, `title`) is reflowed; values
+//!   the server will compare against - `enum`, `const`, `pattern` - keep their
+//!   spacing, and a property name that would need changing fails startup.
 //!
 //! Each step is a plain function so it can be tested without a server.
 
@@ -26,7 +29,7 @@ use agent_domain::error::{ToolError, ToolServerError};
 use agent_domain::model::tool::{PlannedWrite, ToolDefinition, ToolName, ToolOutcome, ToolSafety};
 use agent_domain::ports::tool::Tool;
 use agent_domain::ports::tool_server::{RemoteContent, RemoteTool, RemoteToolOutput, ToolServer};
-use agent_domain::text::truncate;
+use agent_domain::text::{is_unprintable, truncate};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -96,6 +99,19 @@ pub enum ToolServerSetupError {
          `object`"
     )]
     InvalidSchema { server: String, raw: String },
+
+    #[error(
+        "the input schema of `{raw}` on the tool server `{server}` has a key containing control \
+         or invisible characters (shown as `{key}`). It cannot be passed on unchanged, and \
+         renaming it would change what the server receives. Fix the server's schema"
+    )]
+    UnprintableSchemaKey {
+        server: String,
+        raw: String,
+        /// The key with those characters removed - the raw one would carry
+        /// them into the operator's terminal.
+        key: String,
+    },
 }
 
 fn clash_detail(other: &Option<String>) -> String {
@@ -116,14 +132,19 @@ pub fn exposed_name(server: &str, raw: &str) -> Result<ToolName, ToolServerSetup
             server: server.to_string(),
         });
     }
-    let mut name = format!("{NAME_PREFIX}{server}{NAME_SEPARATOR}");
-    name.extend(raw.chars().map(|c| {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            c
-        } else {
-            '_'
-        }
-    }));
+    // The server's name is mapped too: the configuration only admits
+    // `[a-z0-9-]`, but nothing here can see that, and a non-ASCII byte left
+    // in would put the cut below inside a character.
+    let mut name: String = format!("{NAME_PREFIX}{server}{NAME_SEPARATOR}{raw}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     // Every character is ASCII by now, so a byte cut is a character cut.
     name.truncate(MAX_NAME_CHARS);
     ToolName::new(name).map_err(|_| ToolServerSetupError::EmptyToolName {
@@ -132,19 +153,11 @@ pub fn exposed_name(server: &str, raw: &str) -> Result<ToolName, ToolServerSetup
     })
 }
 
-/// Characters that change how text renders without being visible: bidi
-/// overrides and isolates, zero-width spaces and joiners, the BOM. Text the
-/// model reads should mean what a human reviewing it sees.
-fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
-    )
-}
-
 /// `raw` as one line of visible text: line breaks and tabs become spaces,
-/// other control and invisible formatting characters are removed, and runs
-/// of spaces are collapsed.
+/// other control and invisible formatting characters
+/// ([`agent_domain::text::is_unprintable`]) are removed, and runs of spaces
+/// are collapsed. Text the model reads should mean what a human reviewing it
+/// sees.
 ///
 /// One line because the system prompt lists each tool by the first line of
 /// its description: a server that could add lines could add what looks like
@@ -157,7 +170,7 @@ pub fn sanitize_text(raw: &str) -> String {
         } else {
             c
         };
-        if c.is_control() || is_invisible(c) {
+        if is_unprintable(c) {
             continue;
         }
         if c == ' ' && (clean.is_empty() || clean.ends_with(' ')) {
@@ -181,7 +194,7 @@ pub fn describe(server: &str, raw: &str) -> String {
 }
 
 /// The schema the model is given: a JSON object of type `object`, every
-/// string in it sanitized, no larger than [`MAX_SCHEMA_BYTES`].
+/// string in it cleaned (see [`Walk`]), no larger than [`MAX_SCHEMA_BYTES`].
 ///
 /// A missing `type` is filled in rather than refused - some servers omit it
 /// for tools without arguments, and the providers insist on it.
@@ -206,7 +219,13 @@ pub fn sanitize_schema(
         Some(_) => return Err(invalid()),
     }
 
-    let clean = sanitize_strings(Value::Object(object));
+    let clean = Walk::Schema.clean(Value::Object(object)).map_err(|key| {
+        ToolServerSetupError::UnprintableSchemaKey {
+            server: server.to_string(),
+            raw: raw_name.to_string(),
+            key,
+        }
+    })?;
     let bytes = serde_json::to_vec(&clean).map_or(usize::MAX, |bytes| bytes.len());
     if bytes > MAX_SCHEMA_BYTES {
         return Err(ToolServerSetupError::SchemaTooLarge {
@@ -219,20 +238,74 @@ pub fn sanitize_schema(
     Ok(clean)
 }
 
-/// Property descriptions inside a schema reach the model as surely as the
-/// tool's description does.
-fn sanitize_strings(value: Value) -> Value {
-    match value {
-        Value::String(text) => Value::String(sanitize_text(&text)),
-        Value::Array(items) => Value::Array(items.into_iter().map(sanitize_strings).collect()),
-        Value::Object(object) => Value::Object(
-            object
+/// What the part of a schema being cleaned is, which decides how its strings
+/// are treated.
+///
+/// Property descriptions reach the model as surely as the tool's description
+/// does, so prose gets the full [`sanitize_text`]. Everything else is a value
+/// the server compares against - an `enum` member, a `pattern`, a property
+/// name - and reflowing its whitespace would hand the model something the
+/// server then rejects, or merge two keys into one. Those only lose their
+/// unprintable characters; a key that would lose any is refused instead,
+/// because a renamed key is a different argument.
+#[derive(Clone, Copy)]
+enum Walk {
+    /// A schema object: its keys are keywords.
+    Schema,
+    /// The map under `properties` and its kin: its keys are argument names,
+    /// its values schemas.
+    Names,
+    /// An instance value (`default`, `const`, `enum`, `examples`): nothing in
+    /// it is a keyword, whatever it is called.
+    Data,
+}
+
+impl Walk {
+    /// The cleaned value, or the offending key with its unprintable
+    /// characters removed, so that the message naming it is safe to print.
+    fn clean(self, value: Value) -> Result<Value, String> {
+        match value {
+            Value::String(text) => Ok(Value::String(strip_unprintable(&text))),
+            Value::Array(items) => items
                 .into_iter()
-                .map(|(key, value)| (sanitize_text(&key), sanitize_strings(value)))
-                .collect(),
-        ),
-        other => other,
+                .map(|item| self.clean(item))
+                .collect::<Result<_, _>>()
+                .map(Value::Array),
+            Value::Object(object) => {
+                let mut clean = Map::with_capacity(object.len());
+                for (key, value) in object {
+                    let kept = strip_unprintable(&key);
+                    if kept != key {
+                        return Err(kept);
+                    }
+                    let value = match (self, key.as_str(), value) {
+                        (Self::Schema, "description" | "title", Value::String(text)) => {
+                            Value::String(sanitize_text(&text))
+                        }
+                        (
+                            Self::Schema,
+                            "properties" | "patternProperties" | "$defs" | "definitions"
+                            | "dependentSchemas",
+                            value @ Value::Object(_),
+                        ) => Self::Names.clean(value)?,
+                        (Self::Schema, "default" | "const" | "enum" | "examples", value) => {
+                            Self::Data.clean(value)?
+                        }
+                        (Self::Names, _, value) => Self::Schema.clean(value)?,
+                        (walk, _, value) => walk.clean(value)?,
+                    };
+                    clean.insert(key, value);
+                }
+                Ok(Value::Object(clean))
+            }
+            other => Ok(other),
+        }
     }
+}
+
+/// `text` without its unprintable characters, and otherwise as it was.
+fn strip_unprintable(text: &str) -> String {
+    text.chars().filter(|&c| !is_unprintable(c)).collect()
 }
 
 /// The text the model receives for a result. Only text is rendered; anything
@@ -459,6 +532,15 @@ mod tests {
     }
 
     #[test]
+    fn a_non_ascii_server_name_cannot_make_the_cut_panic() {
+        // Three bytes each, so byte 64 would fall inside one had they been
+        // kept.
+        let name = exposed_name(&"ファイル".repeat(20), "read").unwrap();
+        assert_eq!(name.as_str().len(), MAX_NAME_CHARS);
+        assert!(name.as_str().starts_with("mcp_____"), "{name:?}");
+    }
+
+    #[test]
     fn an_empty_tool_name_is_refused() {
         assert!(matches!(
             exposed_name("files", ""),
@@ -598,6 +680,88 @@ mod tests {
         .unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["path"]["description"], "a bc");
+    }
+
+    #[test]
+    fn values_the_server_compares_against_keep_their_spacing() {
+        let raw = json!({
+            "type": "object",
+            "title": "Search\n  options",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "description": "How  to\tmatch.",
+                    "enum": ["exact  match", " leading", "trailing "],
+                    "default": "exact  match",
+                    "pattern": "^a  b$",
+                },
+                "description": {"type": "string", "const": "a  b"},
+                "title": {"type": "object", "default": {"description": "x  y"}},
+            },
+            "required": ["mode"],
+        });
+        let schema = sanitize_schema("files", "t", &raw).unwrap();
+        let mode = &schema["properties"]["mode"];
+        assert_eq!(
+            mode["enum"],
+            json!(["exact  match", " leading", "trailing "])
+        );
+        assert_eq!(mode["default"], "exact  match");
+        assert_eq!(mode["pattern"], "^a  b$");
+        // Prose is still one line.
+        assert_eq!(mode["description"], "How to match.");
+        assert_eq!(schema["title"], "Search options");
+        // A property called `description` is a name, not prose.
+        assert_eq!(schema["properties"]["description"]["const"], "a  b");
+        // Inside a default nothing is a keyword.
+        assert_eq!(
+            schema["properties"]["title"]["default"]["description"],
+            "x  y"
+        );
+    }
+
+    #[test]
+    fn values_lose_invisible_characters_and_nothing_else() {
+        let schema = sanitize_schema(
+            "files",
+            "t",
+            &json!({"properties": {"m": {"enum": ["a\u{200B}  b\u{E0041}"]}}}),
+        )
+        .unwrap();
+        assert_eq!(schema["properties"]["m"]["enum"][0], "a  b");
+    }
+
+    #[test]
+    fn a_key_with_a_control_character_fails_rather_than_being_renamed() {
+        for key in ["pa\u{0007}th", "path\u{200B}", "\u{E0070}path"] {
+            let error = sanitize_schema(
+                "files",
+                "t",
+                &json!({"properties": {key: {"type": "string"}, "other": {"type": "string"}}}),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, ToolServerSetupError::UnprintableSchemaKey { key, .. } if key == "path"),
+                "{error:?}"
+            );
+            assert!(
+                !error.to_string().contains(key),
+                "the raw key is not printed"
+            );
+        }
+        // Keywords are keys too.
+        assert!(matches!(
+            sanitize_schema("files", "t", &json!({"descr\u{0000}iption": "x"})),
+            Err(ToolServerSetupError::UnprintableSchemaKey { .. })
+        ));
+    }
+
+    #[test]
+    fn descriptions_lose_tags_and_variation_selectors() {
+        assert_eq!(
+            describe("files", "Reads\u{E0020}\u{E0069}\u{FE0F}\u{E0100} a file."),
+            "[MCP server files] Reads a file."
+        );
     }
 
     #[test]
